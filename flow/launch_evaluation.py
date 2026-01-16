@@ -261,3 +261,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# accelerate launch  --config_file /home/liujunfeng/.cache/huggingface/accelerate/fast_evaluation.yaml -m flow.launch_evaluation --flow-config config.json 

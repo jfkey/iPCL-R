@@ -95,3 +95,5 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+# accelerate launch -m  --config_file /home/liujunfeng/.cache/huggingface/accelerate/fast_training.yaml  flow.launch_training --flow-config config.json 
