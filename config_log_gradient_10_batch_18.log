@@ -1,0 +1,121 @@
+
+// (pl) liujunfeng@DGX2-31:/mnt/local_data1/liujunfeng/code/iPCL-R$ accelerate launch -m  --config_file /home/liujunfeng/.cache/huggingface/accelerate/fast_training.yaml  flow.launch_training --flow-config config.json 
+// ipex flag is deprecated, will be removed in Accelerate v1.10. From 2.7.0, PyTorch has all needed optimizations for Intel CPU and XPU.
+// [2026-01-14 11:25:21,789] [INFO] [real_accelerator.py:239:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+// W0114 11:25:24.418000 3851798 site-packages/torch/distributed/run.py:774] 
+// W0114 11:25:24.418000 3851798 site-packages/torch/distributed/run.py:774] *****************************************
+// W0114 11:25:24.418000 3851798 site-packages/torch/distributed/run.py:774] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+// W0114 11:25:24.418000 3851798 site-packages/torch/distributed/run.py:774] *****************************************
+// 2026-01-14 11:25:35 [INFO] 🛠️  Logging is set up.
+// [2026-01-14 11:25:36,970] [INFO] [real_accelerator.py:239:get_accelerator] Setting ds_accelerator to cuda (auto detect)
+// [rank5]:[W114 11:25:37.215448149 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 5]  using GPU 5 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank3]:[W114 11:25:38.491862263 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 3]  using GPU 3 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank2]:[W114 11:25:38.493889248 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 2]  using GPU 2 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [2026-01-14 11:25:39,794] [INFO] [comm.py:669:init_distributed] cdb=None
+// [2026-01-14 11:25:39,795] [INFO] [comm.py:700:init_distributed] Initializing TorchBackend in DeepSpeed with backend nccl
+// [rank12]:[W114 11:25:40.963281479 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 12]  using GPU 12 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank10]:[W114 11:25:42.640415739 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 10]  using GPU 10 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank14]:[W114 11:25:42.794999498 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 14]  using GPU 14 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank6]:[W114 11:25:42.270765756 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 6]  using GPU 6 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank8]:[W114 11:25:42.354504704 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 8]  using GPU 8 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank11]:[W114 11:25:43.610004231 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 11]  using GPU 11 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank7]:[W114 11:25:43.698446087 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 7]  using GPU 7 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank13]:[W114 11:25:43.038829500 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 13]  using GPU 13 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank15]:[W114 11:25:43.181208163 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 15]  using GPU 15 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank1]:[W114 11:25:43.233734600 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 1]  using GPU 1 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank4]:[W114 11:25:43.315424796 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 4]  using GPU 4 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// 2026-01-14 11:25:43 [INFO] 🔧 Loading configuration from: config.json
+// 2026-01-14 11:25:43 [INFO] 🚀 Starting training pipeline
+// 2026-01-14 11:25:43 [INFO]    Token dataset: /mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_tokenization/token_dataset
+// 2026-01-14 11:25:43 [INFO]    Model save dir: /mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_training/model
+// 2026-01-14 11:25:43 [INFO]    Training epochs: 2
+// 2026-01-14 11:25:43 [INFO]    Batch size per device: 18
+// 2026-01-14 11:25:43 [INFO]    Learning rate: 0.0001
+// 2026-01-14 11:25:43 [INFO]    Optimizer: adafactor
+// 2026-01-14 11:25:43 [INFO] Starting model training pipeline
+// 2026-01-14 11:25:43 [INFO] Loading tokenizer from /mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_tokenization/tokenizer
+// 2026-01-14 11:25:43 [INFO] Tokenizer loaded from /mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_tokenization/tokenizer (vocab size: 220)
+// [rank9]:[W114 11:25:43.379402804 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 9]  using GPU 9 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// [rank0]:[W114 11:25:43.379807647 ProcessGroupNCCL.cpp:5023] [PG ID 0 PG GUID 0 Rank 0]  using GPU 0 as device used by this process is currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. You can specify device_id in init_process_group() to force use of a particular device.
+// 2026-01-14 11:25:53 [INFO] Loading pre-split dataset from /mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_training/split_dataset
+// 2026-01-14 11:25:53 [INFO] Loaded split dataset: 5712382 train, 634710 eval
+// 2026-01-14 11:25:53 [INFO] Initializing model for net routing generation
+// 2026-01-14 11:25:53 [INFO] vocab size: 220
+// 2026-01-14 11:26:02 [INFO] Model Parameters | Total: 314.08M | Trainable: 314.08M
+// 2026-01-14 11:26:03 [INFO] Training arguments configured.
+// 2026-01-14 11:26:03 [INFO] Optimizer: adafactor
+// 2026-01-14 11:26:03 [INFO] Scheduler: adafactor
+// 2026-01-14 11:26:03 [INFO] Seq2Seq trainer initialized
+// 2026-01-14 11:26:03 [INFO] Starting model training
+// 2026-01-14 11:26:03 [WARNING] Gradient accumulation steps mismatch: GradientAccumulationPlugin has 1, DeepSpeed config has 10. Using DeepSpeed's value.
+//   0%|                                                                                                                                                                                                                | 0/3968 [00:00<?, ?it/s]`loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+// `loss_type=ForMaskedLMLoss` was set in the config but it is unrecognised.Using the default loss: `ForCausalLMLoss`.
+//   2%|███▉                                                                                                                                                                                                 | 79/3968 [04:06<3:15:51,  3.02s/it]
+// {'loss': 5.9307, 'grad_norm': 1.4616868495941162, 'learning_rate': 0.0, 'epoch': 0.05}                                                                                                                                                        
+// {'loss': 2.6118, 'grad_norm': 1.050904393196106, 'learning_rate': 0.0, 'epoch': 0.1}                                                                                                                                                          
+//   6%|███▊                                                               | 224/3968 [11:09<2:54:58,  2.80s/it]                                                                                                             {'loss': 2.3937, 'grad_norm': 0.940727174282074, 'learning_rate': 0.0, 'epoch': 0.15}                        
+// {'loss': 2.2845, 'grad_norm': 0.8531461358070374, 'learning_rate': 0.0, 'epoch': 0.2}                        
+// {'loss': 2.212, 'grad_norm': 0.881736159324646, 'learning_rate': 0.0, 'epoch': 0.25}                         
+//  15%|█▍        | 584/3968 [28:50<2:53:28,  3.08s/it]                                                                                                                                                                      {'loss': 2.1556, 'grad_norm': 0.9707708358764648, 'learning_rate': 0.0, 'epoch': 0.3}                        
+// {'loss': 2.1116, 'grad_norm': 0.7944338917732239, 'learning_rate': 0.0, 'epoch': 0.35}                       
+// {'loss': 2.0773, 'grad_norm': 0.6054738163948059, 'learning_rate': 0.0, 'epoch': 0.4}                        
+// {'loss': 2.0476, 'grad_norm': 0.9002774953842163, 'learning_rate': 0.0, 'epoch': 0.45}                       
+// {'loss': 2.0232, 'grad_norm': 1.8760825395584106, 'learning_rate': 0.0, 'epoch': 0.5}                                                                                                                                                         
+// {'loss': 2.0026, 'grad_norm': 0.8827270269393921, 'learning_rate': 0.0, 'epoch': 0.55}                                                                                                                                                        
+// {'loss': 1.981, 'grad_norm': 1.141634464263916, 'learning_rate': 0.0, 'epoch': 0.6}                                                                                                                                                           
+// {'loss': 1.9653, 'grad_norm': 1.2458617687225342, 'learning_rate': 0.0, 'epoch': 0.66}                                                                                                                                                        
+// {'loss': 1.9451, 'grad_norm': 1.1967195272445679, 'learning_rate': 0.0, 'epoch': 0.71}                                                                                                                                                        
+// {'loss': 1.9276, 'grad_norm': 0.7946879863739014, 'learning_rate': 0.0, 'epoch': 0.76}                                                                                                                                                        
+// {'loss': 1.9168, 'grad_norm': 0.6976497769355774, 'learning_rate': 0.0, 'epoch': 0.81}                                                                                                                                                        
+// {'loss': 1.9006, 'grad_norm': 1.0691200494766235, 'learning_rate': 0.0, 'epoch': 0.86}                                                                                                                                                        
+// {'loss': 1.8871, 'grad_norm': 0.5757112503051758, 'learning_rate': 0.0, 'epoch': 0.91}                                                                                                                                                        
+// {'loss': 1.8784, 'grad_norm': 2.0105886459350586, 'learning_rate': 0.0, 'epoch': 0.96}                                                                                                                                                        
+// {'eval_loss': 1.8228394985198975, 'eval_runtime': 290.5896, 'eval_samples_per_second': 2184.215, 'eval_steps_per_second': 7.585, 'epoch': 1.0}                                                                                                
+// {'loss': 1.868, 'grad_norm': 1.9749470949172974, 'learning_rate': 0.0, 'epoch': 1.01}                                                                                                                                                         
+// {'loss': 1.857, 'grad_norm': 1.3209904432296753, 'learning_rate': 0.0, 'epoch': 1.06}                                                                                                                                                         
+// {'loss': 1.844, 'grad_norm': 1.3504364490509033, 'learning_rate': 0.0, 'epoch': 1.11}                                                                                                                                                         
+// {'loss': 1.8375, 'grad_norm': 0.9882862567901611, 'learning_rate': 0.0, 'epoch': 1.16}                                                                                                                                                        
+// {'loss': 1.8266, 'grad_norm': 2.0030713081359863, 'learning_rate': 0.0, 'epoch': 1.21}                                                                                                                                                        
+// {'loss': 1.8157, 'grad_norm': 0.7342804670333862, 'learning_rate': 0.0, 'epoch': 1.26}                                                                                                                                                        
+// {'loss': 1.8086, 'grad_norm': 2.0238025188446045, 'learning_rate': 0.0, 'epoch': 1.31}                                                                                                                                                        
+// {'loss': 1.799, 'grad_norm': 1.7550162076950073, 'learning_rate': 0.0, 'epoch': 1.36}                                                                                                                                                         
+// {'loss': 1.7893, 'grad_norm': 0.8603952527046204, 'learning_rate': 0.0, 'epoch': 1.41}                                                                                                                                                        
+// {'loss': 1.7834, 'grad_norm': 0.7910892963409424, 'learning_rate': 0.0, 'epoch': 1.46}                                                                                                                                                        
+// {'loss': 1.7774, 'grad_norm': 1.277858853340149, 'learning_rate': 0.0, 'epoch': 1.51}                                                                                                                                                         
+// {'loss': 1.7718, 'grad_norm': 1.2773178815841675, 'learning_rate': 0.0, 'epoch': 1.56}                                                                                                                                                        
+// {'loss': 1.7702, 'grad_norm': 1.562781810760498, 'learning_rate': 0.0, 'epoch': 1.61}                                                                                                                                                         
+// {'loss': 1.7566, 'grad_norm': 1.2188317775726318, 'learning_rate': 0.0, 'epoch': 1.66}                                                                                                                                                        
+// {'loss': 1.7536, 'grad_norm': 1.445547342300415, 'learning_rate': 0.0, 'epoch': 1.71}                                                                                                                                                         
+// {'loss': 1.7482, 'grad_norm': 0.9300519227981567, 'learning_rate': 0.0, 'epoch': 1.76}                                                                                                                                                        
+// {'loss': 1.743, 'grad_norm': 1.6386017799377441, 'learning_rate': 0.0, 'epoch': 1.81}                                                                                                                                                         
+// {'loss': 1.7352, 'grad_norm': 1.0278425216674805, 'learning_rate': 0.0, 'epoch': 1.87}                                                                                                                                                        
+// {'loss': 1.7277, 'grad_norm': 1.1997956037521362, 'learning_rate': 0.0, 'epoch': 1.92}                                                                                                                                                        
+// {'loss': 1.7235, 'grad_norm': 1.9306585788726807, 'learning_rate': 0.0, 'epoch': 1.97}                                                                                                                                                        
+// {'eval_loss': 1.6849281787872314, 'eval_runtime': 289.8046, 'eval_samples_per_second': 2190.131, 'eval_steps_per_second': 7.605, 'epoch': 2.0}                                                                                                
+// {'train_runtime': 12233.9052, 'train_samples_per_second': 933.861, 'train_steps_per_second': 0.324, 'train_loss': 2.020155124125942, 'epoch': 2.0}                                                                                            
+// 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 3968/3968 [3:23:53<00:00,  3.08s/it]
+// 2026-01-14 14:50:05 [INFO] Training completed. Final metrics: {'train_runtime': 12233.9052, 'train_samples_per_second': 933.861, 'train_steps_per_second': 0.324, 'total_flos': 2.940467175007191e+17, 'train_loss': 2.020155124125942, 'epoch': 2.0}
+// 2026-01-14 14:50:05 [INFO] Training pipeline completed in 12262.10s
+// 2026-01-14 14:50:05 [INFO] ✅ Training completed successfully!
+// 2026-01-14 14:50:05 [INFO]    Execution time: 12262.10 seconds
+// 2026-01-14 14:50:05 [INFO]    Model saved to: /mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_training/model
+// 2026-01-14 14:50:05 [INFO]    Split dataset saved to: /mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_training/split_dataset
+// 2026-01-14 14:50:05 [INFO]    Logs saved to: /mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_training/logs
+// 2026-01-14 14:50:05 [INFO] 💡 Next step: Run evaluation with:
+// 2026-01-14 14:50:05 [INFO]    accelerate launch -m flow.launch_evaluation --flow-config config.json
+// [rank0]:[W114 14:50:08.149290598 ProcessGroupNCCL.cpp:1538] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+

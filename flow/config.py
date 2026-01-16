@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass, field, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # =============================================================================
 #                              DATASET CONFIGURATION
@@ -199,6 +199,37 @@ class TrainingPaths:
 
 
 @dataclass
+class GeometricEmbeddingConfig:
+    """Configuration for geometry-aware embeddings.
+
+    Controls all geometric embedding components for GeoT5Gemma:
+    - Coordinate computation and scaling (Step 1)
+    - Fourier Position Embedding parameters (Step 2)
+    - Geometric Attention (LARA) parameters (Step 3)
+    """
+
+    # Step 1: Coordinate computation
+    compute_coordinates: bool = True
+    coordinate_scale: float = 1e-4
+    coordinate_offset: Tuple[int, int, int] = (0, 0, 0)
+
+    # Step 2: Fourier Position Embedding
+    enable_fourier_pe: bool = True
+    num_frequencies: int = 64
+    max_wavelength: float = 10000.0
+    min_wavelength: float = 1.0
+    learnable_fourier_coefficients: bool = True
+    separate_sin_cos_basis: bool = True
+    floor_freq_ratio: float = 1.0
+
+    # Step 3: Geometric Attention (LARA)
+    enable_geometric_attention: bool = False  # Start with just Fourier PE
+    use_quaternion_rotation: bool = True
+    use_geometric_bias: bool = True
+    bias_mlp_hidden: int = 64
+
+
+@dataclass
 class TrainingModel:
     """Training model configuration"""
 
@@ -212,6 +243,11 @@ class TrainingModel:
     max_position_embeddings: int = 512
     sliding_window: int = 256
     dropout_rate: float = 0.1
+
+    # Geometric embedding configuration
+    geometric_config: GeometricEmbeddingConfig = field(
+        default_factory=GeometricEmbeddingConfig
+    )
 
 
 @dataclass
@@ -290,9 +326,21 @@ class TrainingStageConfig:
             hyperparameters_dict = config_dict.get("hyperparameters", {})
             performance_dict = config_dict.get("performance", {})
 
+            # Handle nested geometric_config in model
+            geometric_config_dict = model_dict.pop("geometric_config", {})
+            if geometric_config_dict:
+                # Handle tuple conversion for coordinate_offset
+                if "coordinate_offset" in geometric_config_dict:
+                    offset = geometric_config_dict["coordinate_offset"]
+                    if isinstance(offset, list):
+                        geometric_config_dict["coordinate_offset"] = tuple(offset)
+                geometric_config = GeometricEmbeddingConfig(**geometric_config_dict)
+            else:
+                geometric_config = GeometricEmbeddingConfig()
+
             # Create nested config objects
             paths = TrainingPaths(**paths_dict)
-            model = TrainingModel(**model_dict)
+            model = TrainingModel(**model_dict, geometric_config=geometric_config)
             hyperparameters = TrainingHyperparameters(**hyperparameters_dict)
             performance = TrainingPerformance(**performance_dict)
 

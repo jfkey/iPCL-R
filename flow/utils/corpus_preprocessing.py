@@ -17,7 +17,6 @@ from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
 
 from flow.config import DatasetConfig
 
-
 def _select_split(
     dataset: Union[Dataset, DatasetDict], split: Optional[str]
 ) -> Dataset:

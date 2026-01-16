@@ -63,6 +63,7 @@ def parse_metadata(
         result_list = design.glob("*")
         metadata_type = None
         for result_path in result_list:
+            print (f"### result path name {result_path.name} ### design name {design.name}")
             if result_path.name == f"{design.name}_ground_truth.json":
                 metadata_type = MetadataType.GT
             elif result_path.name == f"{design.name}_predictions.json":
@@ -199,7 +200,7 @@ def main():
         "--metadata-dir",
         type=Path,
         default=Path(
-            "/mnt/local_data1/liweiguo/experiments/model_size_comparison/work_dir/Large-DecimalWordLevel/stage_evaluation/def_inference_metadata"
+            "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation/def_inference_metadata"
         ),
         help="Path to metadata directory, routing generation results at the design level",
     )
@@ -207,7 +208,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/mnt/local_data1/liweiguo/experiments/drc_analysis"),
+        default=Path("/mnt/local_data1/liujunfeng/exp/drc_analysis"),
         help="Path to output directory",
     )
 
@@ -257,3 +258,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python -m experiments.drc_analysis.main --mode convert

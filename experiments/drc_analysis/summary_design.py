@@ -1909,14 +1909,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--base",
         "-b",
-        default=Path("/data2/project_share/liweiguo/rt_gen/output"),
+        default=Path("/data2/project_share/liujunfeng/rt_gen/output"),
         type=Path,
         help="Base directory containing design folders (default: output)",
     )
     parser.add_argument(
         "--out",
         "-o",
-        default=Path("/data2/project_share/liweiguo/rt_gen/output"),
+        default=Path("/data2/project_share/liujunfeng/rt_gen/output"),
         type=Path,
         help="Output directory for generated CSV file (default: output)",
     )

@@ -383,14 +383,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--base",
         "-b",
-        default=Path("/data2/project_share/liweiguo/rt_gen/output"),
+        default=Path("/data2/project_share/liujunfeng/rt_gen/output"),
         type=Path,
         help="base output directory",
     )
     parser.add_argument(
         "--out",
         "-o",
-        default=Path("/data2/project_share/liweiguo/rt_gen/output"),
+        default=Path("/data2/project_share/liujunfeng/rt_gen/output"),
         type=Path,
         help="output path",
     )
