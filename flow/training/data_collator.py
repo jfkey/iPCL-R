@@ -21,22 +21,35 @@ from transformers import DataCollatorForSeq2Seq, PreTrainedTokenizerBase
 @dataclass
 class GeoDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     """
-    Data collator for sequence-to-sequence models with coordinate support.
+    Data collator for sequence-to-sequence models with position embedding support.
 
-    Extends DataCollatorForSeq2Seq to handle 3D coordinate tensors alongside
-    token sequences. Coordinates are padded to match the padded sequence length.
+    Extends DataCollatorForSeq2Seq to handle 3D position tensors alongside
+    token sequences. Positions are padded to match the padded sequence length.
+
+    Position Embedding Design:
+    - src_abs_pos: Absolute positions for source tokens
+      - <DRIVER> token gets driver's absolute position
+      - <LOAD> tokens get load's absolute position
+      - Other tokens get (0, 0, 0)
+    - src_rel_pos: Relative positions for source tokens
+      - <DRIVER> token gets (0, 0, 0)
+      - <LOAD> tokens get (load - driver) relative position
+      - Other tokens get (0, 0, 0)
+    - tgt_coords: Cumulative absolute positions for target tokens
 
     Expected input features:
     - input_ids: Encoder input token IDs
     - attention_mask: Encoder attention mask
     - labels: Decoder target token IDs
-    - source_coords: List of (x, y, z) tuples for encoder tokens
-    - target_coords: List of (x, y, z) tuples for decoder tokens
+    - src_abs_pos: List of (x, y, m) absolute positions for encoder tokens
+    - src_rel_pos: List of (dx, dy, dm) relative positions for encoder tokens
+    - tgt_coords: List of (x, y, m) cumulative positions for decoder tokens
 
     Output batch includes:
     - input_ids, attention_mask, labels (standard Seq2Seq)
-    - encoder_coordinates: Padded 3D coords (batch, src_len, 3)
-    - decoder_coordinates: Padded 3D coords (batch, tgt_len, 3)
+    - encoder_abs_positions: Padded absolute positions (batch, src_len, 3)
+    - encoder_rel_positions: Padded relative positions (batch, src_len, 3)
+    - decoder_coordinates: Padded cumulative positions (batch, tgt_len, 3)
 
     Args:
         tokenizer: Tokenizer for padding
@@ -57,60 +70,74 @@ class GeoDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         >>> batch = collator([sample1, sample2, sample3])
         >>> batch.keys()
         dict_keys(['input_ids', 'attention_mask', 'labels',
-                   'encoder_coordinates', 'decoder_coordinates'])
+                   'encoder_abs_positions', 'encoder_rel_positions',
+                   'decoder_coordinates'])
     """
 
     coord_pad_value: int = 0
 
     def __call__(self, features: List[Dict[str, Any]], return_tensors=None) -> Dict[str, Any]:
         """
-        Collate batch with coordinate handling.
+        Collate batch with position handling.
 
         Args:
             features: List of feature dictionaries from dataset
             return_tensors: Output tensor format
 
         Returns:
-            Batched dictionary with padded sequences and coordinates
+            Batched dictionary with padded sequences and positions
         """
-        # Extract coordinates before calling parent collator
-        # (parent doesn't know about coordinate fields)
-        source_coords_list = []
-        target_coords_list = []
-        has_source_coords = False
-        has_target_coords = False
+        # Extract positions before calling parent collator
+        # (parent doesn't know about position fields)
+        src_abs_pos_list = []
+        src_rel_pos_list = []
+        tgt_coords_list = []
+        has_src_abs_pos = False
+        has_src_rel_pos = False
+        has_tgt_coords = False
 
         for feature in features:
-            if "source_coords" in feature:
-                source_coords_list.append(feature.pop("source_coords"))
-                has_source_coords = True
-            if "target_coords" in feature:
-                target_coords_list.append(feature.pop("target_coords"))
-                has_target_coords = True
+            if "src_abs_pos" in feature:
+                src_abs_pos_list.append(feature.pop("src_abs_pos"))
+                has_src_abs_pos = True
+            if "src_rel_pos" in feature:
+                src_rel_pos_list.append(feature.pop("src_rel_pos"))
+                has_src_rel_pos = True
+            if "tgt_coords" in feature:
+                tgt_coords_list.append(feature.pop("tgt_coords"))
+                has_tgt_coords = True
 
         # Call parent collator for standard Seq2Seq processing
         batch = super().__call__(features, return_tensors=return_tensors)
 
-        # Pad and add coordinates to batch
-        if has_source_coords and source_coords_list:
-            # Get padded sequence length from input_ids
-            padded_src_len = batch["input_ids"].shape[1]
-            encoder_coords = self._pad_coordinates(
-                source_coords_list,
+        # Get padded sequence lengths
+        padded_src_len = batch["input_ids"].shape[1]
+        padded_tgt_len = batch["labels"].shape[1] if "labels" in batch else None
+
+        # Pad and add source absolute positions to batch
+        if has_src_abs_pos and src_abs_pos_list:
+            encoder_abs_pos = self._pad_coordinates(
+                src_abs_pos_list,
                 padded_src_len,
                 self.coord_pad_value
             )
-            batch["encoder_coordinates"] = encoder_coords
+            batch["encoder_abs_positions"] = encoder_abs_pos
 
-        if has_target_coords and target_coords_list:
-            # Get padded sequence length from labels
-            if "labels" in batch:
-                padded_tgt_len = batch["labels"].shape[1]
-            else:
-                # Fallback: compute from target_coords
-                padded_tgt_len = max(len(coords) for coords in target_coords_list)
+        # Pad and add source relative positions to batch
+        if has_src_rel_pos and src_rel_pos_list:
+            encoder_rel_pos = self._pad_coordinates(
+                src_rel_pos_list,
+                padded_src_len,
+                self.coord_pad_value
+            )
+            batch["encoder_rel_positions"] = encoder_rel_pos
+
+        # Pad and add target coordinates to batch
+        if has_tgt_coords and tgt_coords_list:
+            if padded_tgt_len is None:
+                padded_tgt_len = max(len(coords) for coords in tgt_coords_list)
             decoder_coords = self._pad_coordinates(
-                target_coords_list,
+                tgt_coords_list,
                 padded_tgt_len,
                 self.coord_pad_value
             )
@@ -194,10 +221,14 @@ def add_coordinates_to_dataset(
     dataset,
     source_col: str = "source_tokens",
     target_col: str = "target_tokens",
+    driver_col: str = "driver",
     num_workers: int = 16,
 ):
     """
     Add coordinate columns to a HuggingFace dataset.
+
+    NOTE: This function is DEPRECATED. Coordinates are now computed during
+    the tokenization pipeline stage. Use the tokenization pipeline instead.
 
     This function processes a dataset to compute and add source_coords
     and target_coords columns based on the token sequences.
@@ -206,6 +237,7 @@ def add_coordinates_to_dataset(
         dataset: HuggingFace Dataset with source_tokens and target_tokens
         source_col: Name of source tokens column
         target_col: Name of target tokens column
+        driver_col: Name of driver coordinate column
         num_workers: Number of parallel workers for processing
 
     Returns:
@@ -216,8 +248,17 @@ def add_coordinates_to_dataset(
         >>> dataset = add_coordinates_to_dataset(dataset)
         >>> # Now dataset has 'source_coords' and 'target_coords' columns
     """
+    import warnings
+    warnings.warn(
+        "add_coordinates_to_dataset is deprecated. "
+        "Coordinates are now computed during tokenization pipeline. "
+        "Re-run tokenization to include coordinates in the dataset.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     from flow.tokenization.coordinate_utils import (
-        compute_coordinates_for_sample,
+        compute_coordinates_for_tokenized_sample,
     )
 
     def compute_coords(batch):
@@ -225,11 +266,13 @@ def add_coordinates_to_dataset(
         source_coords_batch = []
         target_coords_batch = []
 
-        for source_tokens, target_tokens in zip(
-            batch[source_col], batch[target_col]
+        drivers = batch.get(driver_col, [None] * len(batch[source_col]))
+
+        for source_tokens, target_tokens, driver in zip(
+            batch[source_col], batch[target_col], drivers
         ):
-            source_coords, target_coords = compute_coordinates_for_sample(
-                source_tokens, target_tokens
+            source_coords, target_coords = compute_coordinates_for_tokenized_sample(
+                source_tokens, target_tokens, driver_str=driver
             )
             source_coords_batch.append(source_coords)
             target_coords_batch.append(target_coords)

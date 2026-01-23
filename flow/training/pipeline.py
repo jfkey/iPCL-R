@@ -41,7 +41,6 @@ from transformers.optimization import Adafactor, AdafactorSchedule
 from flow.config import FlowConfig
 from flow.models.geo_t5gemma import GeoT5GemmaForConditionalGeneration, GeoConfig
 from flow.training.data_collator import GeoDataCollatorForSeq2Seq
-from flow.tokenization.coordinate_utils import compute_coordinates_for_sample
 
 
 class TrainingPipeline:
@@ -141,10 +140,32 @@ class TrainingPipeline:
         # Check if geometry-aware mode is enabled
         use_geo = (
             hasattr(self.model_config, 'geometric_config')
-            and self.model_config.geometric_config.compute_coordinates
+            and (
+                self.model_config.geometric_config.enable_geometry_aware_pe
+                or self.model_config.geometric_config.enable_fourier_pe
+            )
         )
 
-        # Truncate dataset and optionally compute coordinates
+        # Check if pre-computed positions are available in the dataset
+        # New format: src_abs_pos, src_rel_pos, tgt_coords
+        has_precomputed_positions = (
+            "src_abs_pos" in dataset.column_names
+            and "src_rel_pos" in dataset.column_names
+            and "tgt_coords" in dataset.column_names
+        )
+
+        if use_geo and has_precomputed_positions:
+            logging.info("Using pre-computed positions from tokenization pipeline:")
+            logging.info("  - src_abs_pos: Absolute positions for <DRIVER>/<LOAD> tokens")
+            logging.info("  - src_rel_pos: Relative positions (load - driver) for <LOAD> tokens")
+            logging.info("  - tgt_coords: Cumulative absolute positions for target tokens")
+        elif use_geo and not has_precomputed_positions:
+            logging.warning(
+                "Geometry-aware mode enabled but dataset lacks pre-computed positions. "
+                "Please re-run tokenization pipeline to include positions."
+            )
+
+        # Truncate dataset and load pre-computed positions
         def tokenize_sample(batch):
             source_encs = self.tokenizer(
                 batch["source_tokens"],
@@ -169,31 +190,39 @@ class TrainingPipeline:
             batch["attention_mask"] = source_encs["attention_mask"]
             batch["labels"] = labels["input_ids"]
 
-            # Compute coordinates for geometry-aware training
-            if use_geo:
-                source_coords_batch = []
-                target_coords_batch = []
-                for src_tokens, tgt_tokens in zip(
-                    batch["source_tokens"], batch["target_tokens"]
+            # Load pre-computed positions for geometry-aware training
+            if use_geo and has_precomputed_positions:
+                src_abs_pos_batch = []
+                src_rel_pos_batch = []
+                tgt_coords_batch = []
+
+                for src_abs, src_rel, tgt_coords in zip(
+                    batch["src_abs_pos"],
+                    batch["src_rel_pos"],
+                    batch["tgt_coords"],
                 ):
-                    src_coords, tgt_coords = compute_coordinates_for_sample(
-                        src_tokens, tgt_tokens
-                    )
-                    # Truncate coordinates to match tokenized lengths
-                    src_coords = src_coords[:self.hyperparameters_config.max_src_len]
+                    # Truncate positions to match tokenized lengths
+                    src_abs = src_abs[:self.hyperparameters_config.max_src_len]
+                    src_rel = src_rel[:self.hyperparameters_config.max_src_len]
                     tgt_coords = tgt_coords[:self.hyperparameters_config.max_tgt_len]
-                    source_coords_batch.append(src_coords)
-                    target_coords_batch.append(tgt_coords)
-                batch["source_coords"] = source_coords_batch
-                batch["target_coords"] = target_coords_batch
+
+                    src_abs_pos_batch.append(src_abs)
+                    src_rel_pos_batch.append(src_rel)
+                    tgt_coords_batch.append(tgt_coords)
+
+                batch["src_abs_pos"] = src_abs_pos_batch
+                batch["src_rel_pos"] = src_rel_pos_batch
+                batch["tgt_coords"] = tgt_coords_batch
 
             return batch
 
         with PartialState().main_process_first():
-            # Keep source_tokens and target_tokens for coordinate computation
-            # They will be removed after processing
-            cols_to_remove = [c for c in dataset.column_names
-                              if c not in ("source_tokens", "target_tokens")]
+            # Keep source_tokens, target_tokens, and pre-computed positions if available
+            cols_to_keep = ["source_tokens", "target_tokens"]
+            if use_geo and has_precomputed_positions:
+                cols_to_keep.extend(["src_abs_pos", "src_rel_pos", "tgt_coords"])
+
+            cols_to_remove = [c for c in dataset.column_names if c not in cols_to_keep]
             tokenized_dataset = dataset.map(
                 tokenize_sample,
                 batched=True,
@@ -201,11 +230,11 @@ class TrainingPipeline:
                 remove_columns=cols_to_remove,
                 desc="Tokenizing dataset",
             )
-            # Remove the token columns after coordinate computation
-            tokenized_dataset = tokenized_dataset.remove_columns(
-                [c for c in ["source_tokens", "target_tokens"]
-                 if c in tokenized_dataset.column_names]
-            )
+            # Remove the token columns after processing (keep positions for geo training)
+            cols_to_remove_after = [c for c in ["source_tokens", "target_tokens"]
+                                    if c in tokenized_dataset.column_names]
+            if cols_to_remove_after:
+                tokenized_dataset = tokenized_dataset.remove_columns(cols_to_remove_after)
 
         # Create train/eval split
         shuffled_dataset = tokenized_dataset.shuffle(
@@ -247,10 +276,12 @@ class TrainingPipeline:
         logging.info("vocab size: %s", len(tokenizer.get_vocab()))
 
         # Check if geometry-aware mode is enabled
-        use_geo = (
-            hasattr(self.model_config, 'geometric_config')
-            and self.model_config.geometric_config.enable_fourier_pe
-        )
+        # Support both new (enable_geometry_aware_pe) and legacy (enable_fourier_pe) configs
+        use_geo = False
+        if hasattr(self.model_config, 'geometric_config'):
+            geo_cfg = self.model_config.geometric_config
+            use_geo = getattr(geo_cfg, 'enable_geometry_aware_pe', False) or \
+                      getattr(geo_cfg, 'enable_fourier_pe', False)
 
         encoder_config = T5GemmaModuleConfig(
             hidden_size=self.model_config.hidden_size,
@@ -309,22 +340,42 @@ class TrainingPipeline:
         # Create model (GeoT5Gemma or standard T5Gemma)
         if use_geo:
             geo_config = self.model_config.geometric_config
+            # Build GeoConfig with both legacy and new parameters
             geo_config_dict = GeoConfig(
-                enable_fourier_pe=geo_config.enable_fourier_pe,
-                enable_geometric_attention=geo_config.enable_geometric_attention,
-                coord_scale=geo_config.coordinate_scale,
-                num_frequencies=geo_config.num_frequencies,
-                max_wavelength=geo_config.max_wavelength,
-                min_wavelength=geo_config.min_wavelength,
-                learnable_fourier_coefficients=geo_config.learnable_fourier_coefficients,
-                separate_sin_cos_basis=geo_config.separate_sin_cos_basis,
-                floor_freq_ratio=geo_config.floor_freq_ratio,
+                # New: Geometry-Aware Position Embedding (recommended)
+                enable_geometry_aware_pe=getattr(geo_config, 'enable_geometry_aware_pe', False),
+                # Legacy: Simple Fourier Position Embedding
+                enable_fourier_pe=getattr(geo_config, 'enable_fourier_pe', False),
+                enable_geometric_attention=getattr(geo_config, 'enable_geometric_attention', False),
+                # Coordinate scaling
+                coord_scale=getattr(geo_config, 'coordinate_scale', 1e-5),
+                # Fourier / GeoPE parameters
+                num_frequencies=getattr(geo_config, 'num_frequencies', 32),
+                num_harmonics=getattr(geo_config, 'num_harmonics', 8),
+                max_metal_layers=getattr(geo_config, 'max_metal_layers', 16),
+                max_layer_delta=getattr(geo_config, 'max_layer_delta', 10),
+                max_wavelength=getattr(geo_config, 'max_wavelength', 10000.0),
+                min_wavelength=getattr(geo_config, 'min_wavelength', 1.0),
+                learnable_fourier_coefficients=getattr(geo_config, 'learnable_fourier_coefficients', True),
+                separate_sin_cos_basis=getattr(geo_config, 'separate_sin_cos_basis', True),
+                floor_freq_ratio=getattr(geo_config, 'floor_freq_ratio', 1.0),
                 max_sequence_length=self.hyperparameters_config.max_src_len,
-                use_geometric_bias=geo_config.use_geometric_bias,
-                bias_mlp_hidden=geo_config.bias_mlp_hidden,
+                pe_dropout=getattr(geo_config, 'pe_dropout', 0.1),
+                # Geometric Attention (LARA) parameters
+                use_geometric_bias=getattr(geo_config, 'use_geometric_bias', True),
+                bias_mlp_hidden=getattr(geo_config, 'bias_mlp_hidden', 64),
             )
             model = GeoT5GemmaForConditionalGeneration(config, geo_config_dict)
-            logging.info("Using GeoT5GemmaForConditionalGeneration with Fourier PE")
+
+            # Log which PE mode is being used
+            if geo_config_dict.enable_geometry_aware_pe:
+                logging.info("Using GeoT5GemmaForConditionalGeneration with Geometry-Aware PE")
+                logging.info("  - XY coordinates: Fourier encoding (multi-frequency)")
+                logging.info("  - Metal layer: Learnable embedding with direction awareness")
+                logging.info("  - Relative position: Polar + Circular Harmonics")
+                logging.info("  - Layer delta: Signed embedding for via traversal")
+            else:
+                logging.info("Using GeoT5GemmaForConditionalGeneration with Simple Fourier PE")
         else:
             model = T5GemmaForConditionalGeneration(config)
             logging.info("Using standard T5GemmaForConditionalGeneration")
@@ -489,7 +540,10 @@ class TrainingPipeline:
         # Check if geometry-aware mode is enabled
         use_geo = (
             hasattr(self.model_config, 'geometric_config')
-            and self.model_config.geometric_config.compute_coordinates
+            and (
+                self.model_config.geometric_config.enable_geometry_aware_pe
+                or self.model_config.geometric_config.enable_fourier_pe
+            )
         )
 
         # Initialize data collator (Geo-aware or standard)

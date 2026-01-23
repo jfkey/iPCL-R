@@ -203,28 +203,44 @@ class GeometricEmbeddingConfig:
     """Configuration for geometry-aware embeddings.
 
     Controls all geometric embedding components for GeoT5Gemma:
-    - Coordinate computation and scaling (Step 1)
-    - Fourier Position Embedding parameters (Step 2)
-    - Geometric Attention (LARA) parameters (Step 3)
+    - Coordinate computation and scaling
+    - Simple Fourier Position Embedding (3D uniform encoding)
+    - Geometry-Aware Position Embedding (XY Fourier + Metal Layer + Polar Relative)
+    - Geometric Attention (LARA) parameters
+
+    Position Embedding Design:
+    - Only semantic tokens (<DRIVER>, <LOAD>) receive position embeddings
+    - <DRIVER>: Absolute position encoding
+    - <LOAD>: Absolute position + Relative position (from driver)
+    - Other tokens: Zero position embedding
     """
 
-    # Step 1: Coordinate computation
-    compute_coordinates: bool = True
-    coordinate_scale: float = 1e-4
-    coordinate_offset: Tuple[int, int, int] = (0, 0, 0)
+    # Enable flags
+    enable_fourier_pe: bool = False  # Simple 3D Fourier PE (deprecated)
+    enable_geometry_aware_pe: bool = True  # Advanced Geometry-Aware PE (recommended)
+    enable_geometric_attention: bool = False  # LARA geometric attention
 
-    # Step 2: Fourier Position Embedding
-    enable_fourier_pe: bool = True
-    num_frequencies: int = 64
+    # Coordinate scaling
+    coord_scale: float = 1e-5  # Scale for large chip coordinates (e.g., 1e5 -> 1.0)
+
+    # Fourier Position Embedding parameters
+    num_frequencies: int = 32  # Number of frequency bands
+    num_harmonics: int = 8  # Circular harmonics for direction encoding
     max_wavelength: float = 10000.0
     min_wavelength: float = 1.0
     learnable_fourier_coefficients: bool = True
     separate_sin_cos_basis: bool = True
     floor_freq_ratio: float = 1.0
+    max_sequence_length: int = 512
 
-    # Step 3: Geometric Attention (LARA)
-    enable_geometric_attention: bool = False  # Start with just Fourier PE
-    use_quaternion_rotation: bool = True
+    # Metal layer encoding
+    max_metal_layers: int = 16  # Maximum metal layers (typically 10-15)
+    max_layer_delta: int = 10  # Maximum layer difference for via traversal
+
+    # Dropout
+    pe_dropout: float = 0.1  # Dropout rate for position embeddings
+
+    # Geometric Attention (LARA) parameters
     use_geometric_bias: bool = True
     bias_mlp_hidden: int = 64
 
@@ -329,11 +345,6 @@ class TrainingStageConfig:
             # Handle nested geometric_config in model
             geometric_config_dict = model_dict.pop("geometric_config", {})
             if geometric_config_dict:
-                # Handle tuple conversion for coordinate_offset
-                if "coordinate_offset" in geometric_config_dict:
-                    offset = geometric_config_dict["coordinate_offset"]
-                    if isinstance(offset, list):
-                        geometric_config_dict["coordinate_offset"] = tuple(offset)
                 geometric_config = GeometricEmbeddingConfig(**geometric_config_dict)
             else:
                 geometric_config = GeometricEmbeddingConfig()

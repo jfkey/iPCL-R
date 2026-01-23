@@ -15,7 +15,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -26,6 +26,15 @@ from flow.config import FlowConfig
 from flow.utils import load_corpus_dataset
 
 from .tokenizer import UnifiedTokenizer
+from .coordinate_utils import (
+    CoordinateTracker,
+    extract_source_positions_from_raw_data,
+    compute_target_coordinates_from_tokens,
+    parse_coordinate_string,
+    SPECIAL_POS,
+    BRANCH_POS,
+    END_POS,
+)
 
 
 class TokenizationPipeline:
@@ -49,6 +58,10 @@ class TokenizationPipeline:
 
         # Step 1: Read data_synthesis results
         corpus_dataset = self.read_data_synthesis()
+
+        # DEBUG: Only use top 10000 samples for testing
+        corpus_dataset = corpus_dataset.select(range(min(10000, len(corpus_dataset))))
+        logging.info(f"DEBUG: Using only {len(corpus_dataset)} samples for testing")
 
         # Step 2: Preprocess and refine tree_seq in corpus dataset
         corpus_dataset = self.preprocess_corpus(corpus_dataset)
@@ -363,40 +376,94 @@ class TokenizationPipeline:
     def build_token_dataset(
         self, corpus_dataset: Dataset, remove_columns: bool = True
     ) -> Dataset:
-        """Create token ID datasets"""
-        logging.info("Creating token ID datasets")
+        """Create token ID datasets with absolute coordinates for geometry-aware training.
 
-        def add_tokens(batch):
+        Position Embedding Design:
+        - src_abs_pos: Absolute positions extracted directly from raw data (driver, loads)
+          - <DRIVER> token gets driver's absolute position
+          - <LOAD> tokens get load's absolute position
+          - Other tokens get SPECIAL_POS (0, 0, 0)
+        - src_rel_pos: Relative positions (load - driver)
+          - <DRIVER> token gets (0, 0, 0)
+          - <LOAD> tokens get (load - driver) relative position
+          - Other tokens get SPECIAL_POS (0, 0, 0)
+        - tgt_coords: Cumulative absolute positions computed from target tokens
+        """
+        logging.info("Creating token ID datasets with absolute coordinates")
+
+        def add_tokens_and_coords(batch):
             batch_driver, batch_loads = batch["driver"], batch["loads"]
             batch_overlap_info = batch.get("overlap_info", [{}] * len(batch_driver))
             batch_connected_info = batch.get("connected_info", [{}] * len(batch_driver))
 
-            batch_source_tokens = [
-                self.unified_tokenizer.convert_source_to_directional_token(
+            batch_source_tokens = []
+            batch_target_tokens = []
+            # Source: absolute and relative positions from raw data
+            batch_src_abs_pos = []
+            batch_src_rel_pos = []
+            # Target: cumulative positions from tokens
+            batch_tgt_coords = []
+
+            for i, (driver, loads, overlap_info, connected_info, relative_tree_seq) in enumerate(
+                zip(
+                    batch_driver,
+                    batch_loads,
+                    batch_overlap_info,
+                    batch_connected_info,
+                    batch["relative_tree_seq"],
+                )
+            ):
+                # Convert to directional tokens
+                source_tokens = self.unified_tokenizer.convert_source_to_directional_token(
                     driver, loads, overlap_info, connected_info
                 )
-                for driver, loads, overlap_info, connected_info in zip(
-                    batch_driver, batch_loads, batch_overlap_info, batch_connected_info
-                )
-            ]
-
-            batch_relative_tree_seq = batch["relative_tree_seq"]
-            batch_target_tokens = [
-                self.unified_tokenizer.convert_relative_target_to_directional_token(
+                target_tokens = self.unified_tokenizer.convert_relative_target_to_directional_token(
                     relative_tree_seq
                 )
-                for relative_tree_seq in batch_relative_tree_seq
-            ]
+
+                batch_source_tokens.append(source_tokens)
+                batch_target_tokens.append(target_tokens)
+
+                # 1. Extract source positions directly from raw data (NOT from tokens)
+                try:
+                    src_abs_pos, src_rel_pos = extract_source_positions_from_raw_data(
+                        driver_str=driver,
+                        loads=loads,
+                        source_tokens=source_tokens,
+                    )
+                    batch_src_abs_pos.append(src_abs_pos)
+                    batch_src_rel_pos.append(src_rel_pos)
+                except Exception as e:
+                    logging.warning(f"Failed to extract source positions for sample {i}: {e}")
+                    src_len = len(source_tokens.split())
+                    batch_src_abs_pos.append([SPECIAL_POS] * src_len)
+                    batch_src_rel_pos.append([SPECIAL_POS] * src_len)
+
+                # 2. Compute target positions from tokenized target tokens
+                try:
+                    driver_coord = parse_coordinate_string(driver)
+                    tgt_coords = compute_target_coordinates_from_tokens(
+                        target_tokens, driver_coord
+                    )
+                    batch_tgt_coords.append(tgt_coords)
+                except Exception as e:
+                    logging.warning(f"Failed to compute target coordinates for sample {i}: {e}")
+                    tgt_len = len(target_tokens.split())
+                    batch_tgt_coords.append([SPECIAL_POS] * tgt_len)
+
             return {
                 "source_tokens": batch_source_tokens,
                 "target_tokens": batch_target_tokens,
+                "src_abs_pos": batch_src_abs_pos,
+                "src_rel_pos": batch_src_rel_pos,
+                "tgt_coords": batch_tgt_coords,
             }
 
         corpus_dataset = corpus_dataset.map(
-            add_tokens,
+            add_tokens_and_coords,
             batched=True,
             num_proc=self.performance_config.num_workers,
-            desc="Convert coordinate sequences to directional tokens",
+            desc="Convert coordinate sequences to directional tokens with coordinates",
         )
 
         # Compute statistics using pyarrow.compute
@@ -455,9 +522,16 @@ class TokenizationPipeline:
         # Remove columns if needed
         if remove_columns:
             # For training and evaluation, we only need the relevant columns
+            # Include position columns for geometry-aware training:
+            # - src_abs_pos: absolute positions for <DRIVER>/<LOAD> tokens
+            # - src_rel_pos: relative positions (load - driver) for <LOAD> tokens
+            # - tgt_coords: cumulative absolute positions for target tokens
             remaining_columns = [
                 "source_tokens",
                 "target_tokens",
+                "src_abs_pos",
+                "src_rel_pos",
+                "tgt_coords",
                 "net_name",
                 "driver",
                 "loads",
@@ -471,6 +545,35 @@ class TokenizationPipeline:
                 if col not in remaining_columns
             ]
             corpus_dataset = corpus_dataset.remove_columns(columns_to_remove)
+
+        # Log coordinate statistics
+        logging.info("=== COORDINATE STATISTICS ===")
+        logging.info("Position embedding columns:")
+        logging.info("  - src_abs_pos: Absolute positions for <DRIVER>/<LOAD> tokens")
+        logging.info("  - src_rel_pos: Relative positions (load - driver) for <LOAD> tokens")
+        logging.info("  - tgt_coords: Cumulative absolute positions for target tokens")
+
+        if "src_abs_pos" in corpus_dataset.column_names:
+            sample = corpus_dataset[0]
+            sample_src_tokens = sample["source_tokens"]
+            sample_tgt_tokens = sample["target_tokens"]
+            sample_src_abs_pos = sample["src_abs_pos"]
+            sample_src_rel_pos = sample["src_rel_pos"]
+            sample_tgt_coords = sample["tgt_coords"]
+
+            logging.info(f"\nSample 0:")
+            logging.info(f"  source_tokens ({len(sample_src_tokens.split())} tokens): {sample_src_tokens[:100]}...")
+            logging.info(f"  target_tokens ({len(sample_tgt_tokens.split())} tokens): {sample_tgt_tokens[:100]}...")
+            logging.info(f"  src_abs_pos ({len(sample_src_abs_pos)} positions): {sample_src_abs_pos[:5]}...")
+            logging.info(f"  src_rel_pos ({len(sample_src_rel_pos)} positions): {sample_src_rel_pos[:5]}...")
+            logging.info(f"  tgt_coords ({len(sample_tgt_coords)} positions): {sample_tgt_coords[:5]}...")
+
+            # Verify alignment
+            src_token_count = len(sample_src_tokens.split())
+            tgt_token_count = len(sample_tgt_tokens.split())
+            logging.info(f"\n  Alignment check:")
+            logging.info(f"    src_tokens: {src_token_count}, src_abs_pos: {len(sample_src_abs_pos)}, src_rel_pos: {len(sample_src_rel_pos)}")
+            logging.info(f"    tgt_tokens: {tgt_token_count}, tgt_coords: {len(sample_tgt_coords)}")
 
         return corpus_dataset
 

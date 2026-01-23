@@ -102,3 +102,5 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+#  python -m flow.launch_tokenization --flow-config config.json

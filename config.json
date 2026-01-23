@@ -51,7 +51,26 @@
             "head_dim": 64,
             "max_position_embeddings": 256,
             "sliding_window": 128,
-            "dropout_rate": 0.1
+            "dropout_rate": 0.1,
+            "geometric_config": {
+                "enable_fourier_pe": false,
+                "enable_geometry_aware_pe": true,
+                "enable_geometric_attention": false,
+                "coord_scale": 1e-5,
+                "num_frequencies": 32,
+                "num_harmonics": 8,
+                "max_wavelength": 10000.0,
+                "min_wavelength": 1.0,
+                "learnable_fourier_coefficients": true,
+                "separate_sin_cos_basis": true,
+                "floor_freq_ratio": 1.0,
+                "max_sequence_length": 512,
+                "max_metal_layers": 16,
+                "max_layer_delta": 10,
+                "pe_dropout": 0.1,
+                "use_geometric_bias": true,
+                "bias_mlp_hidden": 64
+            }
         },
         "hyperparameters": {
             "max_src_len": 128,

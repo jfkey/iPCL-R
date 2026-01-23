@@ -31,7 +31,11 @@ from transformers import (
 )
 from transformers.modeling_outputs import Seq2SeqLMOutput
 
-from .position_embedding import FourierPositionEmbedding
+from .position_embedding import (
+    FourierPositionEmbedding,
+    GeometryAwarePositionEmbedding,
+    GeoPEConfig,
+)
 from .geometric_attention import LieAlgebraRelativeAttention
 
 
@@ -42,37 +46,54 @@ class GeoConfig:
 
     This configuration controls all geometric embedding components:
     - Coordinate handling and scaling
-    - Fourier Position Embedding parameters
+    - Fourier Position Embedding parameters (simple 3D Fourier)
+    - Geometry-Aware Position Embedding parameters (advanced: XY Fourier + Metal Layer + Polar Rel)
     - Geometric Attention (LARA) parameters
 
+    Position Embedding Design:
+    - Only semantic tokens (<DRIVER>, <LOAD>) receive position embeddings
+    - <DRIVER>: Absolute position encoding via Fourier
+    - <LOAD>: Absolute position + Relative position (from driver)
+    - Other tokens: Zero position embedding
+
     Attributes:
-        enable_fourier_pe: Whether to use Fourier Position Embedding
+        enable_fourier_pe: Whether to use simple Fourier Position Embedding
+        enable_geometry_aware_pe: Whether to use advanced Geometry-Aware PE (overrides enable_fourier_pe)
         enable_geometric_attention: Whether to use LARA geometric attention
         coord_scale: Scaling factor for coordinates (chip coords are large)
         num_frequencies: Number of frequency bands for Fourier embedding
+        num_harmonics: Number of circular harmonics for direction encoding
+        max_metal_layers: Maximum number of metal layers
+        max_layer_delta: Maximum layer difference for relative encoding
         max_wavelength: Maximum wavelength for frequency bands
         min_wavelength: Minimum wavelength for frequency bands
         learnable_fourier_coefficients: Whether Fourier coefficients are learnable
         separate_sin_cos_basis: Whether to use separate sin/cos coefficient matrices
         floor_freq_ratio: Ratio for clipping low frequencies
         max_sequence_length: Maximum sequence length for frequency clipping
+        pe_dropout: Dropout rate for position embeddings
         use_geometric_bias: Whether to use MLP bias in LARA
         bias_mlp_hidden: Hidden dimension for geometric bias MLP
     """
 
     # General settings
-    enable_fourier_pe: bool = True
-    enable_geometric_attention: bool = False  # Start with just Fourier PE
-    coord_scale: float = 1e-4
+    enable_fourier_pe: bool = False  # Simple 3D Fourier (deprecated)
+    enable_geometry_aware_pe: bool = True  # Advanced Geometry-Aware PE (recommended)
+    enable_geometric_attention: bool = False  # Start with just PE, no LARA
+    coord_scale: float = 1e-5  # Smaller scale for large chip coordinates
 
-    # Fourier Position Embedding settings (Step 2)
-    num_frequencies: int = 64
+    # Fourier / Geometry-Aware Position Embedding settings
+    num_frequencies: int = 32  # Frequency bands for Fourier encoding
+    num_harmonics: int = 8  # Circular harmonics for direction encoding
+    max_metal_layers: int = 16  # Maximum metal layers (typically 10-15)
+    max_layer_delta: int = 10  # Maximum layer difference
     max_wavelength: float = 10000.0
     min_wavelength: float = 1.0
     learnable_fourier_coefficients: bool = True
     separate_sin_cos_basis: bool = True
     floor_freq_ratio: float = 1.0
     max_sequence_length: int = 512
+    pe_dropout: float = 0.1  # Dropout for position embeddings
 
     # Geometric Attention settings (Step 3)
     use_geometric_bias: bool = True
@@ -93,6 +114,21 @@ class GeoConfig:
             for field_name in self.__dataclass_fields__
         }
 
+    def to_geope_config(self, hidden_size: int) -> GeoPEConfig:
+        """Convert to GeoPEConfig for GeometryAwarePositionEmbedding."""
+        return GeoPEConfig(
+            hidden_size=hidden_size,
+            num_frequencies=self.num_frequencies,
+            num_harmonics=self.num_harmonics,
+            max_metal_layers=self.max_metal_layers,
+            max_layer_delta=self.max_layer_delta,
+            coord_scale=self.coord_scale,
+            max_wavelength=self.max_wavelength,
+            min_wavelength=self.min_wavelength,
+            learnable_frequencies=self.learnable_fourier_coefficients,
+            dropout=self.pe_dropout,
+        )
+
 
 class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
     """
@@ -100,19 +136,34 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
 
     This model extends the base T5GemmaForConditionalGeneration with:
 
-    1. **Fourier Position Embedding (Step 2)**:
-       - Maps 3D chip coordinates (x, y, z) to sinusoidal features
-       - Added to token embeddings before encoder/decoder processing
-       - Enables the model to perceive absolute positions in chip space
+    1. **Geometry-Aware Position Embedding (Recommended)**:
+       - Only semantic tokens (<DRIVER>, <LOAD>) receive position embeddings
+       - XY coordinates: Fourier encoding for continuous 2D positions
+       - Metal layer: Learnable embedding with direction awareness
+       - Relative position: Polar + Circular Harmonics for (Δx, Δy)
+       - Layer delta: Signed embedding for via traversal direction
 
-    2. **Geometric Attention (Step 3, optional)**:
+    2. **Simple Fourier Position Embedding (Alternative)**:
+       - Maps all 3D coordinates (x, y, z) uniformly to sinusoidal features
+       - Less sophisticated but simpler
+
+    3. **Geometric Attention (Step 3, optional)**:
        - LARA (Lie Algebra Relative Attention) for geometry-aware attention
        - Combines semantic similarity with geometric displacement
-       - Can replace standard attention in encoder/decoder layers
+
+    Position Embedding Design:
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  Token Type        │  Position Embedding                                 │
+    │  ──────────────────┼───────────────────────────────────────────────────  │
+    │  <DRIVER>          │  Abs_PE(driver_x, driver_y, driver_m)               │
+    │  <LOAD_i>          │  Abs_PE(load_i) + Rel_PE(load_i - driver)           │
+    │  Other tokens      │  Zero (no position embedding)                       │
+    └─────────────────────────────────────────────────────────────────────────┘
 
     The model accepts additional inputs:
-    - encoder_coordinates: 3D coordinates for encoder input tokens
-    - decoder_coordinates: 3D coordinates for decoder input tokens
+    - encoder_abs_positions: Absolute 3D coordinates (batch, src_len, 3)
+    - encoder_rel_positions: Relative 3D coordinates (batch, src_len, 3)
+    - decoder_coordinates: 3D coordinates for decoder tokens (batch, tgt_len, 3)
 
     Args:
         config: T5GemmaConfig for the base model
@@ -121,16 +172,17 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
     Example:
         >>> from transformers import T5GemmaConfig
         >>> config = T5GemmaConfig(hidden_size=256, num_hidden_layers=4)
-        >>> geo_config = GeoConfig(enable_fourier_pe=True)
+        >>> geo_config = GeoConfig(enable_geometry_aware_pe=True)
         >>> model = GeoT5GemmaForConditionalGeneration(config, geo_config)
         >>>
         >>> # Forward pass with coordinates
         >>> outputs = model(
         ...     input_ids=input_ids,
         ...     attention_mask=attention_mask,
-        ...     encoder_coordinates=encoder_coords,  # (batch, src_len, 3)
+        ...     encoder_abs_positions=encoder_abs_pos,  # (batch, src_len, 3)
+        ...     encoder_rel_positions=encoder_rel_pos,  # (batch, src_len, 3)
         ...     labels=labels,
-        ...     decoder_coordinates=decoder_coords,  # (batch, tgt_len, 3)
+        ...     decoder_coordinates=decoder_coords,     # (batch, tgt_len, 3)
         ... )
     """
 
@@ -149,8 +201,33 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         else:
             self.geo_config = geo_config
 
-        # Initialize Fourier Position Embedding (Step 2)
-        if self.geo_config.enable_fourier_pe:
+        # Initialize Position Embedding modules
+        self.encoder_geo_pe = None
+        self.decoder_geo_pe = None
+        self.encoder_fourier_pe = None
+        self.decoder_fourier_pe = None
+
+        # Option 1: Geometry-Aware Position Embedding (Recommended)
+        # Uses separate encodings for XY (Fourier), Metal Layer (Learnable),
+        # Relative Position (Polar + Harmonics), and Layer Delta (Signed)
+        if self.geo_config.enable_geometry_aware_pe:
+            geope_config = self.geo_config.to_geope_config(config.hidden_size)
+            self.encoder_geo_pe = GeometryAwarePositionEmbedding(geope_config)
+            # Decoder uses simple Fourier since it only has cumulative positions
+            self.decoder_fourier_pe = FourierPositionEmbedding(
+                hidden_size=config.hidden_size,
+                num_frequencies=self.geo_config.num_frequencies,
+                max_wavelength=self.geo_config.max_wavelength,
+                min_wavelength=self.geo_config.min_wavelength,
+                coord_scale=self.geo_config.coord_scale,
+                learnable_coefficients=self.geo_config.learnable_fourier_coefficients,
+                separate_basis=self.geo_config.separate_sin_cos_basis,
+                floor_freq_ratio=self.geo_config.floor_freq_ratio,
+                max_sequence_length=self.geo_config.max_sequence_length,
+            )
+
+        # Option 2: Simple Fourier Position Embedding (Alternative)
+        elif self.geo_config.enable_fourier_pe:
             self.encoder_fourier_pe = FourierPositionEmbedding(
                 hidden_size=config.hidden_size,
                 num_frequencies=self.geo_config.num_frequencies,
@@ -173,9 +250,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 floor_freq_ratio=self.geo_config.floor_freq_ratio,
                 max_sequence_length=self.geo_config.max_sequence_length,
             )
-        else:
-            self.encoder_fourier_pe = None
-            self.decoder_fourier_pe = None
 
         # Note: Geometric Attention (Step 3) integration would require
         # modifying the attention layers. For now, we provide LARA as a
@@ -185,30 +259,79 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         # Post-initialization
         self.post_init()
 
-    def _add_geometric_embeddings(
+    def _add_encoder_geometric_embeddings(
         self,
         inputs_embeds: torch.Tensor,
-        coordinates: Optional[torch.Tensor],
-        fourier_pe: Optional[FourierPositionEmbedding],
+        abs_positions: Optional[torch.Tensor],
+        rel_positions: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Add geometric (Fourier) position embeddings to input embeddings.
+        Add geometry-aware position embeddings to encoder input embeddings.
+
+        This method handles two cases:
+        1. Geometry-Aware PE: Uses abs_positions + rel_positions with separate
+           encodings for XY, metal layer, relative polar, and layer delta.
+        2. Simple Fourier PE: Uses only abs_positions with uniform Fourier encoding.
+
+        Position Embedding Design:
+        - <DRIVER> token: abs_pos = driver position, rel_pos = (0, 0, 0)
+        - <LOAD> tokens: abs_pos = load position, rel_pos = (load - driver)
+        - Other tokens: abs_pos = (0, 0, 0), rel_pos = (0, 0, 0) → Zero PE
 
         Args:
             inputs_embeds: Token embeddings (batch, seq_len, hidden_size)
-            coordinates: 3D coordinates (batch, seq_len, 3)
-            fourier_pe: Fourier position embedding module
+            abs_positions: Absolute 3D coordinates (batch, seq_len, 3)
+            rel_positions: Relative 3D coordinates (batch, seq_len, 3)
             attention_mask: Optional attention mask
 
         Returns:
             Enhanced embeddings with geometric information
         """
-        if fourier_pe is None or coordinates is None:
+        # Case 1: Geometry-Aware Position Embedding (Recommended)
+        if self.encoder_geo_pe is not None:
+            if abs_positions is None or rel_positions is None:
+                return inputs_embeds
+            # GeometryAwarePositionEmbedding expects (abs_pos, rel_pos)
+            geo_embeds = self.encoder_geo_pe(
+                abs_positions.float(),
+                rel_positions.float(),
+                attention_mask
+            )
+            return inputs_embeds + geo_embeds
+
+        # Case 2: Simple Fourier Position Embedding
+        if self.encoder_fourier_pe is not None and abs_positions is not None:
+            geo_embeds = self.encoder_fourier_pe(abs_positions.float(), attention_mask)
+            return inputs_embeds + geo_embeds
+
+        return inputs_embeds
+
+    def _add_decoder_geometric_embeddings(
+        self,
+        inputs_embeds: torch.Tensor,
+        coordinates: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Add position embeddings to decoder input embeddings.
+
+        Decoder uses simple Fourier PE since it only has cumulative absolute
+        positions (traced from direction tokens), not separate abs/rel.
+
+        Args:
+            inputs_embeds: Token embeddings (batch, seq_len, hidden_size)
+            coordinates: 3D coordinates (batch, seq_len, 3)
+            attention_mask: Optional attention mask
+
+        Returns:
+            Enhanced embeddings with geometric information
+        """
+        if self.decoder_fourier_pe is None or coordinates is None:
             return inputs_embeds
 
         # Compute Fourier position embeddings
-        geo_embeds = fourier_pe(coordinates, attention_mask)
+        geo_embeds = self.decoder_fourier_pe(coordinates.float(), attention_mask)
 
         # Add to input embeddings
         return inputs_embeds + geo_embeds
@@ -231,50 +354,77 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        # New geometric inputs
-        encoder_coordinates: Optional[torch.Tensor] = None,
+        # Geometry-Aware Position Embedding inputs (Recommended)
+        encoder_abs_positions: Optional[torch.Tensor] = None,
+        encoder_rel_positions: Optional[torch.Tensor] = None,
         decoder_coordinates: Optional[torch.Tensor] = None,
+        # Legacy input (for backward compatibility with simple Fourier PE)
+        encoder_coordinates: Optional[torch.Tensor] = None,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
         """
         Forward pass with geometry-aware position embeddings.
 
         This extends the base T5Gemma forward pass by:
         1. Computing token embeddings from input_ids
-        2. Adding Fourier position embeddings based on coordinates
+        2. Adding position embeddings based on coordinates:
+           - Geometry-Aware PE: Uses abs_positions + rel_positions
+           - Simple Fourier PE: Uses encoder_coordinates only
         3. Passing enhanced embeddings to encoder/decoder
 
+        Position Embedding Design (Geometry-Aware PE):
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │  Token Type        │  Position Embedding                            │
+        │  ──────────────────┼──────────────────────────────────────────────  │
+        │  <DRIVER>          │  GeoPE(abs_pos, rel_pos=(0,0,0))               │
+        │  <LOAD_i>          │  GeoPE(abs_pos, rel_pos=(load - driver))       │
+        │  Other tokens      │  Zero PE (abs_pos=(0,0,0), rel_pos=(0,0,0))    │
+        └─────────────────────────────────────────────────────────────────────┘
+
         New Args:
-            encoder_coordinates: 3D coordinates for encoder tokens (batch, src_len, 3)
-            decoder_coordinates: 3D coordinates for decoder tokens (batch, tgt_len, 3)
+            encoder_abs_positions: Absolute 3D positions (batch, src_len, 3)
+                - <DRIVER>: driver's (x, y, m)
+                - <LOAD>: load's (x, y, m)
+                - Others: (0, 0, 0)
+            encoder_rel_positions: Relative 3D positions (batch, src_len, 3)
+                - <DRIVER>: (0, 0, 0)
+                - <LOAD>: (load - driver) = (Δx, Δy, Δm)
+                - Others: (0, 0, 0)
+            decoder_coordinates: Cumulative 3D positions for decoder (batch, tgt_len, 3)
+            encoder_coordinates: Legacy input for simple Fourier PE (batch, src_len, 3)
 
         Returns:
             Seq2SeqLMOutput with loss, logits, and other outputs
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # Handle legacy encoder_coordinates input
+        # If encoder_abs_positions not provided but encoder_coordinates is,
+        # use encoder_coordinates as abs_positions (backward compatibility)
+        if encoder_abs_positions is None and encoder_coordinates is not None:
+            encoder_abs_positions = encoder_coordinates
+
         # Get token embeddings if not provided
         if inputs_embeds is None and input_ids is not None:
-            inputs_embeds = self.shared(input_ids)
+            inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        # Add Fourier position embeddings to encoder inputs
-        if inputs_embeds is not None and self.encoder_fourier_pe is not None:
-            inputs_embeds = self._add_geometric_embeddings(
+        # Add position embeddings to encoder inputs
+        if inputs_embeds is not None:
+            inputs_embeds = self._add_encoder_geometric_embeddings(
                 inputs_embeds,
-                encoder_coordinates,
-                self.encoder_fourier_pe,
+                encoder_abs_positions,
+                encoder_rel_positions,
                 attention_mask,
             )
 
         # Get decoder token embeddings if needed
         if decoder_inputs_embeds is None and decoder_input_ids is not None:
-            decoder_inputs_embeds = self.shared(decoder_input_ids)
+            decoder_inputs_embeds = self.get_input_embeddings()(decoder_input_ids)
 
-        # Add Fourier position embeddings to decoder inputs
-        if decoder_inputs_embeds is not None and self.decoder_fourier_pe is not None:
-            decoder_inputs_embeds = self._add_geometric_embeddings(
+        # Add position embeddings to decoder inputs
+        if decoder_inputs_embeds is not None:
+            decoder_inputs_embeds = self._add_decoder_geometric_embeddings(
                 decoder_inputs_embeds,
                 decoder_coordinates,
-                self.decoder_fourier_pe,
                 decoder_attention_mask,
             )
 
@@ -315,6 +465,12 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
 
         This extends the base prepare_inputs_for_generation to pass through
         coordinate information during autoregressive generation.
+
+        Coordinate inputs handled:
+        - encoder_abs_positions: Absolute positions for encoder (new)
+        - encoder_rel_positions: Relative positions for encoder (new)
+        - decoder_coordinates: Cumulative positions for decoder
+        - encoder_coordinates: Legacy input for simple Fourier PE
         """
         # Get base preparation
         model_inputs = super().prepare_inputs_for_generation(
@@ -329,11 +485,17 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             **kwargs
         )
 
-        # Pass through coordinate information
-        if "encoder_coordinates" in kwargs:
-            model_inputs["encoder_coordinates"] = kwargs["encoder_coordinates"]
+        # Pass through coordinate information (Geometry-Aware PE)
+        if "encoder_abs_positions" in kwargs:
+            model_inputs["encoder_abs_positions"] = kwargs["encoder_abs_positions"]
+        if "encoder_rel_positions" in kwargs:
+            model_inputs["encoder_rel_positions"] = kwargs["encoder_rel_positions"]
         if "decoder_coordinates" in kwargs:
             model_inputs["decoder_coordinates"] = kwargs["decoder_coordinates"]
+
+        # Legacy support for simple Fourier PE
+        if "encoder_coordinates" in kwargs:
+            model_inputs["encoder_coordinates"] = kwargs["encoder_coordinates"]
 
         return model_inputs
 
