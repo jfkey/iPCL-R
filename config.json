@@ -55,7 +55,7 @@
             "geometric_config": {
                 "enable_fourier_pe": false,
                 "enable_geometry_aware_pe": true,
-                "enable_geometric_attention": false,
+                "enable_geometric_attention": true,
                 "coord_scale": 1e-5,
                 "num_frequencies": 32,
                 "num_harmonics": 8,

@@ -314,27 +314,25 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Add position embeddings to decoder input embeddings.
+        Decoder geometric embeddings are intentionally disabled.
 
-        Decoder uses simple Fourier PE since it only has cumulative absolute
-        positions (traced from direction tokens), not separate abs/rel.
+        In autoregressive EDA routing, the decoder predicts the next token
+        given previous tokens. Adding Fourier PE from ground-truth absolute
+        coordinates (decoder_coordinates) would leak label information into
+        the decoder input, causing data leakage.
+
+        The decoder relies solely on token embeddings + cross-attention to
+        the geometry-aware encoder representations.
 
         Args:
             inputs_embeds: Token embeddings (batch, seq_len, hidden_size)
-            coordinates: 3D coordinates (batch, seq_len, 3)
-            attention_mask: Optional attention mask
+            coordinates: 3D coordinates (unused, kept for interface compat)
+            attention_mask: Optional attention mask (unused)
 
         Returns:
-            Enhanced embeddings with geometric information
+            Original input embeddings without geometric modification
         """
-        if self.decoder_fourier_pe is None or coordinates is None:
-            return inputs_embeds
-
-        # Compute Fourier position embeddings
-        geo_embeds = self.decoder_fourier_pe(coordinates.float(), attention_mask)
-
-        # Add to input embeddings
-        return inputs_embeds + geo_embeds
+        return inputs_embeds
 
     def forward(
         self,
