@@ -32,11 +32,11 @@ from flow.utils.constants import DIRECTION_MAP, DIRECTION_TOKEN_PATTERN, COORDIN
 # Position marker for special tokens (BOS, EOS, SRC_END, etc.)
 SPECIAL_POS = (0, 0, 0)
 
-# Position marker for branch point (<PUSH>)
-BRANCH_POS = (1, 1, 1)
-
-# Position marker for end of branch (<POP>)
-END_POS = (2, 2, 2)
+# DEPRECATED: These special markers are no longer used for LARA compatibility
+# <PUSH> and <POP> now inherit real spatial positions instead of using markers
+# Kept for backward compatibility with older datasets
+BRANCH_POS = (1, 1, 1)  # DEPRECATED
+END_POS = (2, 2, 2)     # DEPRECATED
 
 
 # =============================================================================
@@ -93,22 +93,40 @@ class CoordinateTracker:
         """
         Handle <PUSH> token (branch point).
 
+        MODIFIED BEHAVIOR (for LARA compatibility):
         1. Save current REAL position to stack for later retrieval.
-        2. Record the SPECIAL branch position marker for the dataset.
+        2. Record the CURRENT REAL position (not a special marker).
+
+        This ensures <PUSH> inherits the current spatial position,
+        allowing LARA to compute meaningful geometric biases.
+        The <PUSH> token will have zero spatial distance to its parent,
+        resulting in high attention weights (spatially coherent).
         """
         self.stack.append(self.current_pos.copy())
-        self.positions.append(BRANCH_POS)
+        # KEY CHANGE: Record current position instead of BRANCH_POS
+        self.positions.append(tuple(self.current_pos))
 
     def pop(self):
         """
         Handle <POP> token (end of branch).
 
+        MODIFIED BEHAVIOR (for LARA compatibility):
         1. Restore REAL position from stack.
-        2. Record the SPECIAL end position marker for the dataset.
+        2. Record the PARENT position (not a special marker).
+
+        This ensures <POP> inherits the parent's spatial position,
+        allowing LARA to understand the path returns to the branch point.
+        The <POP> token will have the same coordinates as the corresponding
+        <PUSH>, maintaining spatial consistency in the routing tree.
         """
         if self.stack:
-            self.current_pos = self.stack.pop()
-        self.positions.append(END_POS)
+            parent_pos = self.stack.pop()
+            self.current_pos = parent_pos.copy()
+            # KEY CHANGE: Record parent position instead of END_POS
+            self.positions.append(tuple(parent_pos))
+        else:
+            # Fallback: no parent to return to
+            self.positions.append(tuple(self.current_pos))
 
     def get_positions(self) -> List[Tuple[int, int, int]]:
         """Get all recorded positions."""

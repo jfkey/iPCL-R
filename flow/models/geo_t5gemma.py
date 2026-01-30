@@ -36,14 +36,18 @@ from transformers.models.t5gemma.modeling_t5gemma import (
     T5GemmaDecoder,
     T5GemmaRMSNorm,
 )
-from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
+from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput, BaseModelOutputWithPastAndCrossAttentions
 
 from .position_embedding import (
     FourierPositionEmbedding,
     GeometryAwarePositionEmbedding,
     GeoPEConfig,
 )
-from .geometric_attention import LieAlgebraRelativeAttention, T5GemmaLARAAttention
+from .geometric_attention import (
+    LieAlgebraRelativeAttention,
+    T5GemmaLARAAttention,
+    CrossLARAAttention,
+)
 
 
 @dataclass
@@ -86,7 +90,9 @@ class GeoConfig:
     # General settings
     enable_fourier_pe: bool = False  # Simple 3D Fourier (deprecated)
     enable_geometry_aware_pe: bool = True  # Advanced Geometry-Aware PE (recommended)
-    enable_geometric_attention: bool = False  # Start with just PE, no LARA
+    enable_geometric_attention: bool = False  # Enable LARA for decoder self-attention
+    enable_geometric_cross_attention: bool = False  # Enable LARA for cross-attention
+    enable_encoder_lara: bool = False  # Enable LARA for encoder (usually not recommended)
     coord_scale: float = 1e-5  # Smaller scale for large chip coordinates
 
     # Fourier / Geometry-Aware Position Embedding settings
@@ -251,23 +257,26 @@ class GeoT5GemmaEncoder(T5GemmaEncoder):
         # Call nn.Module.__init__ directly (skip T5GemmaEncoder.__init__)
         nn.Module.__init__(self)
 
-        self.config = config
-
         # Get encoder config (handle both T5GemmaConfig and T5GemmaModuleConfig)
         if hasattr(config, 'encoder'):
             encoder_config = config.encoder
         else:
             encoder_config = config
 
+        # Store encoder config (not full config) - required by parent methods
+        self.config = encoder_config
+        # Also store full config for access to geometric_config, vocab_size, etc.
+        self._full_config = config
+
         # Embedding layer
         self.embed_tokens = nn.Embedding(
-            config.vocab_size,
+            self._full_config.vocab_size,
             encoder_config.hidden_size,
-            padding_idx=config.pad_token_id,
+            padding_idx=self._full_config.pad_token_id,
         )
 
         # Create custom encoder layers with optional LARA support
-        geo_config_dict = getattr(config, 'geometric_config', {})
+        geo_config_dict = getattr(self._full_config, 'geometric_config', {})
         enable_geo_attn = geo_config_dict.get('enable_geometric_attention', False)
 
         # Pass encoder_config to layers (not the full config)
@@ -286,7 +295,7 @@ class GeoT5GemmaEncoder(T5GemmaEncoder):
             eps=getattr(encoder_config, 'rms_norm_eps', 1e-6)
         )
 
-        self.dropout = nn.Dropout(config.dropout_rate)
+        self.dropout = nn.Dropout(self._full_config.dropout_rate)
 
         # Rotary embeddings (needed for position_embeddings computation)
         self.rotary_emb = self._init_rotary_emb(encoder_config)
@@ -405,6 +414,346 @@ class GeoT5GemmaEncoder(T5GemmaEncoder):
         )
 
 
+class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
+    """
+    T5GemmaDecoderLayer with optional LARA for self-attention and cross-attention.
+
+    Extends the base T5GemmaDecoderLayer to:
+    1. Optionally replace self_attn with LARA
+    2. Optionally replace cross_attn with CrossLARAAttention
+    3. Accept and pass decoder coordinates to attention layers
+
+    This is critical for EDA routing where:
+    - Decoder self-attention benefits from spatial path continuity
+    - Cross-attention benefits from spatial proximity to source loads
+    """
+
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        enable_geometric_self_attention: bool = False,
+        enable_geometric_cross_attention: bool = False,
+        geo_config_dict: Optional[Dict[str, Any]] = None,
+    ):
+        # Initialize base layer
+        super().__init__(config, layer_idx)
+
+        if geo_config_dict is None:
+            geo_config_dict = {}
+
+        # Replace self-attention with LARA if enabled
+        if enable_geometric_self_attention:
+            self.self_attn = T5GemmaLARAAttention(
+                config,
+                layer_idx=layer_idx,
+                coord_scale=geo_config_dict.get('coord_scale', 1e-5),
+                use_geometric_bias=geo_config_dict.get('use_geometric_bias', True),
+                bias_mlp_hidden=geo_config_dict.get('bias_mlp_hidden', 64),
+            )
+
+        # Replace cross-attention with CrossLARAAttention if enabled
+        if enable_geometric_cross_attention:
+            self.cross_attn = CrossLARAAttention(
+                config,
+                layer_idx=layer_idx,
+                coord_scale=geo_config_dict.get('coord_scale', 1e-5),
+                use_geometric_bias=geo_config_dict.get('use_geometric_bias', True),
+                bias_mlp_hidden=geo_config_dict.get('bias_mlp_hidden', 64),
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        decoder_coordinates: Optional[torch.Tensor] = None,      # NEW
+        encoder_coordinates: Optional[torch.Tensor] = None,      # NEW
+        **kwargs
+    ):
+        """
+        Decoder layer forward with coordinate support.
+
+        Args:
+            decoder_coordinates: Decoder token coordinates (batch, seq_len, 3)
+            encoder_coordinates: Encoder token coordinates (batch, src_len, 3)
+        """
+
+        # Self-Attention
+        residual = hidden_states
+        hidden_states = self.pre_self_attn_layernorm(hidden_states)
+
+        # Pass coordinates to self-attention if it's LARA
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            coordinates=decoder_coordinates,  # Pass decoder coords
+            output_attentions=output_attentions,
+            **kwargs
+        )
+
+        hidden_states = self.post_self_attn_layernorm(hidden_states)
+        hidden_states = residual + self.dropout(hidden_states)
+
+        # Cross-Attention (if encoder_hidden_states provided)
+        cross_attn_weights = None
+        if encoder_hidden_states is not None:
+            residual = hidden_states
+            hidden_states = self.pre_cross_attn_layernorm(hidden_states)
+
+            # Check if cross_attn is CrossLARAAttention
+            if isinstance(self.cross_attn, CrossLARAAttention):
+                # Use CrossLARAAttention with coordinates
+                hidden_states, cross_attn_weights, _ = self.cross_attn(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=encoder_attention_mask,
+                    query_coordinates=decoder_coordinates,    # Decoder coords
+                    key_coordinates=encoder_coordinates,      # Encoder coords
+                    output_attentions=output_attentions,
+                )
+            else:
+                # Standard cross-attention
+                hidden_states, cross_attn_weights, _ = self.cross_attn(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=encoder_attention_mask,
+                    output_attentions=output_attentions,
+                )
+
+            hidden_states = self.post_cross_attn_layernorm(hidden_states)
+            hidden_states = residual + self.dropout(hidden_states)
+
+        # MLP
+        residual = hidden_states
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + self.dropout(hidden_states)
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights, cross_attn_weights)
+        if use_cache:
+            outputs += (present_key_value,)
+
+        return outputs
+
+
+class GeoT5GemmaDecoder(T5GemmaDecoder):
+    """
+    T5GemmaDecoder with LARA geometric attention support.
+
+    Extends the base T5GemmaDecoder to:
+    1. Use GeoT5GemmaDecoderLayer with optional LARA
+    2. Accept and pass decoder coordinates through layer stack
+    """
+
+    def __init__(self, config):
+        # Call nn.Module.__init__ directly
+        nn.Module.__init__(self)
+
+        # Get decoder config
+        if hasattr(config, 'decoder'):
+            decoder_config = config.decoder
+        else:
+            decoder_config = config
+
+        # Store decoder config (not full config) - required by parent forward()
+        self.config = decoder_config
+        # Also store full config for access to geometric_config, vocab_size, etc.
+        self._full_config = config
+
+        # Embedding layer
+        self.embed_tokens = nn.Embedding(
+            self._full_config.vocab_size,
+            decoder_config.hidden_size,
+            padding_idx=self._full_config.pad_token_id,
+        )
+
+        # Create custom decoder layers with optional LARA
+        geo_config_dict = getattr(self._full_config, 'geometric_config', {})
+        enable_geo_self_attn = geo_config_dict.get('enable_geometric_attention', False)
+        enable_geo_cross_attn = geo_config_dict.get('enable_geometric_cross_attention', False)
+
+        self.layers = nn.ModuleList([
+            GeoT5GemmaDecoderLayer(
+                decoder_config,
+                layer_idx=layer_idx,
+                enable_geometric_self_attention=enable_geo_self_attn,
+                enable_geometric_cross_attention=enable_geo_cross_attn,
+                geo_config_dict=geo_config_dict,
+            )
+            for layer_idx in range(decoder_config.num_hidden_layers)
+        ])
+
+        self.final_layer_norm = T5GemmaRMSNorm(
+            decoder_config.hidden_size,
+            eps=getattr(decoder_config, 'rms_norm_eps', 1e-6)
+        )
+
+        self.dropout = nn.Dropout(self._full_config.dropout_rate)
+
+        # Rotary embeddings
+        self.rotary_emb = self._init_rotary_emb(decoder_config)
+
+        self.gradient_checkpointing = False
+
+    def _init_rotary_emb(self, decoder_config):
+        """Initialize rotary embeddings."""
+        from transformers.models.t5gemma.modeling_t5gemma import T5GemmaRotaryEmbedding
+        return T5GemmaRotaryEmbedding(decoder_config)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        decoder_coordinates: Optional[torch.Tensor] = None,       # NEW
+        encoder_coordinates: Optional[torch.Tensor] = None,       # NEW
+        **kwargs
+    ):
+        """
+        Decoder forward with coordinate support.
+
+        Args:
+            decoder_coordinates: (batch, seq_len, 3)
+            encoder_coordinates: (batch, src_len, 3)
+            **kwargs: Additional arguments (may contain coordinates from parent calls)
+        """
+
+        # Extract coordinates from kwargs if not provided directly
+        if decoder_coordinates is None and 'decoder_coordinates' in kwargs:
+            decoder_coordinates = kwargs.pop('decoder_coordinates')
+        if encoder_coordinates is None and 'encoder_coordinates' in kwargs:
+            encoder_coordinates = kwargs.pop('encoder_coordinates')
+        # Also check for encoder_abs_positions (alternative name)
+        if encoder_coordinates is None and 'encoder_abs_positions' in kwargs:
+            encoder_coordinates = kwargs.pop('encoder_abs_positions')
+        """
+        Decoder forward with coordinate support.
+
+        Args:
+            decoder_coordinates: (batch, seq_len, 3)
+            encoder_coordinates: (batch, src_len, 3)
+        """
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        # Get embeddings
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("You have to specify either input_ids or inputs_embeds")
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        hidden_states = self.dropout(inputs_embeds)
+
+        batch_size, seq_length = hidden_states.shape[:2]
+
+        # Prepare position IDs
+        if position_ids is None:
+            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+
+        # Compute position embeddings (RoPE)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        # Prepare attention masks
+        if attention_mask is not None and attention_mask.dim() == 2:
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+            attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+            attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
+
+        # Layer stack
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        all_cross_attentions = () if output_attentions and encoder_hidden_states is not None else None
+        next_decoder_cache = () if use_cache else None
+
+        for idx, decoder_layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            past_key_value = past_key_values[idx] if past_key_values is not None else None
+
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    hidden_states,
+                    position_embeddings,
+                    attention_mask,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                    position_ids,
+                    past_key_value,
+                    output_attentions,
+                    use_cache,
+                    decoder_coordinates,   # Pass coords
+                    encoder_coordinates,   # Pass coords
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attention_mask,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    decoder_coordinates=decoder_coordinates,   # Pass coords
+                    encoder_coordinates=encoder_coordinates,   # Pass coords
+                )
+
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_decoder_cache += (layer_outputs[-1],)
+
+            if output_attentions:
+                all_self_attns = all_self_attns + (layer_outputs[1],)
+                if encoder_hidden_states is not None:
+                    all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
+
+        # Final layer norm
+        hidden_states = self.final_layer_norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        # Return with past_key_values for caching support
+        next_cache = next_decoder_cache if use_cache else None
+
+        return BaseModelOutputWithPastAndCrossAttentions(
+            last_hidden_state=hidden_states,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+            cross_attentions=all_cross_attentions,
+        )
+
+
 class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
     """
     T5Gemma with Geometry-Aware Position Embeddings for EDA routing.
@@ -480,12 +829,18 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         # Initialize base model
         super().__init__(config)
 
-        # Replace encoder with GeoT5GemmaEncoder if LARA is enabled
+        # Replace encoder/decoder with Geo versions if LARA is enabled
+        # Note: T5GemmaForConditionalGeneration stores encoder/decoder in self.model
         if self.geo_config.enable_geometric_attention:
-            self.encoder = GeoT5GemmaEncoder(config)
-            # Note: Decoder can also be replaced similarly if needed
-            # For now, we only replace encoder as decoder is autoregressive
-            # and may not benefit as much from geometric attention
+            # Encoder: only use LARA if explicitly enabled for encoder
+            # (by default we don't use LARA in encoder due to sparse coordinates)
+            enable_encoder_lara = config.geometric_config.get('enable_encoder_lara', False)
+            if enable_encoder_lara:
+                self.model.encoder = GeoT5GemmaEncoder(config)
+
+            # Decoder: always use LARA when geometric_attention is enabled
+            # This is the most important part for EDA routing
+            self.model.decoder = GeoT5GemmaDecoder(config)
 
         # Initialize Position Embedding modules
         self.encoder_geo_pe = None
@@ -708,19 +1063,98 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             )
 
         # === KEY CHANGE: Handle encoder call with coordinates ===
-        # If using GeoT5GemmaEncoder and encoder_outputs not cached,
-        # call encoder explicitly to pass coordinates
-        if encoder_outputs is None and isinstance(self.encoder, GeoT5GemmaEncoder):
-            encoder_outputs = self.encoder(
-                input_ids=None,  # Already have inputs_embeds
-                attention_mask=attention_mask,
-                inputs_embeds=inputs_embeds,
+        # If encoder_outputs not cached, call encoder explicitly
+        encoder = self.get_encoder()
+        if encoder_outputs is None:
+            if isinstance(encoder, GeoT5GemmaEncoder):
+                # GeoT5GemmaEncoder - pass coordinates for LARA
+                encoder_outputs = encoder(
+                    input_ids=None,  # Already have inputs_embeds
+                    attention_mask=attention_mask,
+                    inputs_embeds=inputs_embeds,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    coordinates=encoder_abs_positions,  # Pass coordinates to LARA layers
+                )
+            else:
+                # Standard encoder
+                encoder_outputs = encoder(
+                    input_ids=None,
+                    attention_mask=attention_mask,
+                    inputs_embeds=inputs_embeds,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                )
+
+        # === KEY FIX: Call decoder explicitly if using GeoT5GemmaDecoder ===
+        # The base class forward doesn't pass decoder_coordinates through,
+        # so we need to handle the decoder call ourselves
+        decoder = self.get_decoder()
+        if isinstance(decoder, GeoT5GemmaDecoder):
+            # Prepare decoder input ids (shifted labels for training)
+            if labels is not None and decoder_inputs_embeds is None:
+                decoder_input_ids = self._shift_right(labels)
+                decoder_inputs_embeds = self.get_input_embeddings()(decoder_input_ids)
+                # Apply decoder position embeddings (no-op in current impl)
+                decoder_inputs_embeds = self._add_decoder_geometric_embeddings(
+                    decoder_inputs_embeds,
+                    decoder_coordinates,
+                    decoder_attention_mask,
+                )
+
+            # Prepare encoder attention mask
+            if attention_mask is not None and attention_mask.dim() == 2:
+                # Use encoder outputs dtype as reference since decoder_inputs_embeds may be None in edge cases
+                dtype = encoder_outputs[0].dtype if hasattr(encoder_outputs[0], 'dtype') else inputs_embeds.dtype
+                encoder_attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+                encoder_attention_mask = encoder_attention_mask.to(dtype=dtype)
+                encoder_attention_mask = (1.0 - encoder_attention_mask) * torch.finfo(dtype).min
+            else:
+                encoder_attention_mask = attention_mask
+
+            # Call GeoT5GemmaDecoder with coordinates
+            decoder_outputs = decoder(
+                input_ids=None,
+                attention_mask=decoder_attention_mask,
+                inputs_embeds=decoder_inputs_embeds,
+                encoder_hidden_states=encoder_outputs[0],
+                encoder_attention_mask=encoder_attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
-                coordinates=encoder_abs_positions,  # Pass coordinates to LARA layers
+                decoder_coordinates=decoder_coordinates,  # Pass decoder coords to LARA
+                encoder_coordinates=encoder_abs_positions,  # Pass encoder coords for cross-LARA
             )
 
-        # Call parent forward with enhanced embeddings and encoder outputs
+            # Compute logits and loss
+            lm_logits = self.lm_head(decoder_outputs[0])
+
+            loss = None
+            if labels is not None:
+                loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+                loss = loss_fct(
+                    lm_logits.view(-1, lm_logits.size(-1)),
+                    labels.view(-1)
+                )
+
+            if not return_dict:
+                output = (lm_logits,) + decoder_outputs[1:]
+                return ((loss,) + output) if loss is not None else output
+
+            return Seq2SeqLMOutput(
+                loss=loss,
+                logits=lm_logits,
+                past_key_values=decoder_outputs.past_key_values,
+                decoder_hidden_states=decoder_outputs.hidden_states,
+                decoder_attentions=decoder_outputs.attentions,
+                cross_attentions=decoder_outputs.cross_attentions,
+                encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+                encoder_hidden_states=encoder_outputs.hidden_states,
+                encoder_attentions=encoder_outputs.attentions,
+            )
+
+        # Fallback: Standard decoder (no LARA) - use parent forward
         return super().forward(
             input_ids=None,  # Use inputs_embeds instead
             attention_mask=attention_mask,
@@ -755,14 +1189,20 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         """
         Prepare inputs for generation, handling geometric coordinates.
 
-        This extends the base prepare_inputs_for_generation to pass through
-        coordinate information during autoregressive generation.
+        This extends the base prepare_inputs_for_generation to:
+        1. Pass through encoder coordinate information
+        2. Track decoder coordinates in real-time using CoordinateTracker
+
+        Coordinate tracking strategy:
+        - For training: decoder_coordinates provided as input
+        - For inference: Use _coordinate_tracker to parse generated tokens
+                        and update coordinates incrementally
 
         Coordinate inputs handled:
-        - encoder_abs_positions: Absolute positions for encoder (new)
-        - encoder_rel_positions: Relative positions for encoder (new)
-        - decoder_coordinates: Cumulative positions for decoder
-        - encoder_coordinates: Legacy input for simple Fourier PE
+        - encoder_abs_positions: Absolute positions for encoder (static)
+        - encoder_rel_positions: Relative positions for encoder (static)
+        - decoder_coordinates: Cumulative positions for decoder (dynamic)
+        - _coordinate_tracker: InferenceCoordinateTracker instance (inference only)
         """
         # Get base preparation
         model_inputs = super().prepare_inputs_for_generation(
@@ -777,19 +1217,104 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             **kwargs
         )
 
-        # Pass through coordinate information (Geometry-Aware PE)
+        # Pass through encoder coordinate information (static during generation)
         if "encoder_abs_positions" in kwargs:
             model_inputs["encoder_abs_positions"] = kwargs["encoder_abs_positions"]
         if "encoder_rel_positions" in kwargs:
             model_inputs["encoder_rel_positions"] = kwargs["encoder_rel_positions"]
-        if "decoder_coordinates" in kwargs:
-            model_inputs["decoder_coordinates"] = kwargs["decoder_coordinates"]
-
-        # Legacy support for simple Fourier PE
         if "encoder_coordinates" in kwargs:
             model_inputs["encoder_coordinates"] = kwargs["encoder_coordinates"]
 
+        # Handle decoder coordinates
+        if "decoder_coordinates" in kwargs:
+            # Explicit decoder_coordinates provided (training mode)
+            model_inputs["decoder_coordinates"] = kwargs["decoder_coordinates"]
+        elif hasattr(self, '_coordinate_tracker') and self._coordinate_tracker is not None:
+            # Inference mode with coordinate tracker
+            # Parse the last generated token and update tracker
+            if decoder_input_ids.shape[1] > self._last_decoder_length:
+                # New token was generated
+                last_token_id = decoder_input_ids[0, -1].item()
+                last_token_str = self._tokenizer.decode(
+                    [last_token_id], skip_special_tokens=False
+                )
+                # Update tracker with new token
+                self._coordinate_tracker.update(last_token_str)
+                self._last_decoder_length = decoder_input_ids.shape[1]
+
+            # Get current coordinates from tracker
+            decoder_coords = self._coordinate_tracker.get_batch_coords_tensor(
+                batch_size=decoder_input_ids.shape[0],
+                device=decoder_input_ids.device
+            )
+            model_inputs["decoder_coordinates"] = decoder_coords
+
         return model_inputs
+
+    def generate(
+        self,
+        input_ids=None,
+        encoder_abs_positions=None,
+        encoder_rel_positions=None,
+        driver_pos=(0, 0, 0),
+        use_coordinate_tracking=True,
+        **kwargs
+    ):
+        """
+        Generate with optional real-time coordinate tracking.
+
+        Args:
+            input_ids: Encoder input token IDs
+            encoder_abs_positions: Encoder absolute positions
+            encoder_rel_positions: Encoder relative positions
+            driver_pos: Starting position for decoder (driver coordinate)
+            use_coordinate_tracking: Whether to use real-time coordinate tracking
+            **kwargs: Additional arguments for parent generate()
+
+        Returns:
+            Generated token IDs
+
+        Example:
+            >>> outputs = model.generate(
+            ...     input_ids=input_ids,
+            ...     encoder_abs_positions=encoder_abs_pos,
+            ...     driver_pos=(2382120, 691600, 2),
+            ...     max_length=512,
+            ... )
+        """
+        # Check if LARA is enabled for decoder
+        decoder = self.get_decoder()
+        if use_coordinate_tracking and isinstance(decoder, GeoT5GemmaDecoder):
+            # Initialize coordinate tracker for inference
+            from .coordinate_tracker import InferenceCoordinateTracker
+
+            self._coordinate_tracker = InferenceCoordinateTracker(driver_pos=driver_pos)
+            self._last_decoder_length = 1  # BOS token
+
+            # Store tokenizer for token decoding
+            if not hasattr(self, '_tokenizer'):
+                raise ValueError(
+                    "Tokenizer not found. Please set model._tokenizer before calling generate()."
+                )
+        else:
+            self._coordinate_tracker = None
+
+        # Add encoder positions to kwargs
+        if encoder_abs_positions is not None:
+            kwargs['encoder_abs_positions'] = encoder_abs_positions
+        if encoder_rel_positions is not None:
+            kwargs['encoder_rel_positions'] = encoder_rel_positions
+
+        try:
+            # Call parent generate
+            outputs = super().generate(input_ids=input_ids, **kwargs)
+            return outputs
+        finally:
+            # Clean up tracker
+            if hasattr(self, '_coordinate_tracker'):
+                delattr(self, '_coordinate_tracker')
+            if hasattr(self, '_last_decoder_length'):
+                delattr(self, '_last_decoder_length')
 
     @classmethod
     def from_pretrained_with_geo(

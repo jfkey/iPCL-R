@@ -283,6 +283,8 @@ class TrainingPipeline:
             use_geo = getattr(geo_cfg, 'enable_geometry_aware_pe', False) or \
                       getattr(geo_cfg, 'enable_fourier_pe', False)
 
+        vocab_size = len(tokenizer.get_vocab())
+
         encoder_config = T5GemmaModuleConfig(
             hidden_size=self.model_config.hidden_size,
             intermediate_size=self.model_config.intermediate_size,
@@ -293,6 +295,7 @@ class TrainingPipeline:
             max_position_embeddings=self.model_config.max_position_embeddings,
             sliding_window=self.model_config.sliding_window,
             tie_word_embeddings=True,
+            vocab_size=vocab_size,  # Must set vocab_size in module config
             bos_token_id=tokenizer.bos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
@@ -311,6 +314,7 @@ class TrainingPipeline:
             max_position_embeddings=self.model_config.max_position_embeddings,
             sliding_window=self.model_config.sliding_window,
             tie_word_embeddings=True,
+            vocab_size=vocab_size,  # Must set vocab_size in module config
             bos_token_id=tokenizer.bos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
@@ -328,7 +332,7 @@ class TrainingPipeline:
             is_encoder_decoder=True,
             dropout_rate=self.model_config.dropout_rate,
             tie_word_embeddings=True,
-            vocab_size=len(tokenizer.get_vocab()),
+            vocab_size=vocab_size,
             bos_token_id=tokenizer.bos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
@@ -346,9 +350,12 @@ class TrainingPipeline:
                 enable_geometry_aware_pe=getattr(geo_config, 'enable_geometry_aware_pe', False),
                 # Legacy: Simple Fourier Position Embedding
                 enable_fourier_pe=getattr(geo_config, 'enable_fourier_pe', False),
+                # LARA (Lie Algebra Relative Attention) configuration
                 enable_geometric_attention=getattr(geo_config, 'enable_geometric_attention', False),
+                enable_geometric_cross_attention=getattr(geo_config, 'enable_geometric_cross_attention', False),
+                enable_encoder_lara=getattr(geo_config, 'enable_encoder_lara', False),
                 # Coordinate scaling
-                coord_scale=getattr(geo_config, 'coordinate_scale', 1e-5),
+                coord_scale=getattr(geo_config, 'coord_scale', 1e-5),
                 # Fourier / GeoPE parameters
                 num_frequencies=getattr(geo_config, 'num_frequencies', 32),
                 num_harmonics=getattr(geo_config, 'num_harmonics', 8),
@@ -376,6 +383,12 @@ class TrainingPipeline:
                 logging.info("  - Layer delta: Signed embedding for via traversal")
             else:
                 logging.info("Using GeoT5GemmaForConditionalGeneration with Simple Fourier PE")
+
+            # Log LARA configuration
+            logging.info("LARA (Lie Algebra Relative Attention) Configuration:")
+            logging.info(f"  - Encoder: {'LARA' if geo_config_dict.enable_encoder_lara else 'Standard Attention'}")
+            logging.info(f"  - Decoder Self-Attention: {'LARA' if geo_config_dict.enable_geometric_attention else 'Standard Attention'}")
+            logging.info(f"  - Cross-Attention: {'LARA' if geo_config_dict.enable_geometric_cross_attention else 'Standard Attention'}")
         else:
             model = T5GemmaForConditionalGeneration(config)
             logging.info("Using standard T5GemmaForConditionalGeneration")
@@ -394,9 +407,17 @@ class TrainingPipeline:
 
     def _setup_training_arguments(self) -> Seq2SeqTrainingArguments:
         """Setup training arguments for the model"""
+
+        use_geo = False
+        if hasattr(self.model_config, 'geometric_config'):
+            geo_cfg = self.model_config.geometric_config
+            use_geo = getattr(geo_cfg, 'enable_geometry_aware_pe', False) or \
+                      getattr(geo_cfg, 'enable_fourier_pe', False)
+            
         args = Seq2SeqTrainingArguments(
             output_dir=self.paths_config.model_save_dir,
             overwrite_output_dir=True,
+            remove_unused_columns= not use_geo,
             # Training hyperparameters
             num_train_epochs=self.hyperparameters_config.num_train_epochs,
             per_device_train_batch_size=self.hyperparameters_config.batch_size_per_device,
@@ -425,7 +446,8 @@ class TrainingPipeline:
             dataloader_num_workers=self.performance_config.dataloader_num_workers,
             dataloader_pin_memory=self.performance_config.dataloader_pin_memory,
             # Mixed precision and optimization
-            fp16=torch.cuda.is_available(),
+            # fp16=torch.cuda.is_available(),
+            fp16 =False, 
             report_to=["tensorboard"],
             # Reproducibility
             seed=self.hyperparameters_config.seed,

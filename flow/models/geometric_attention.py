@@ -630,3 +630,221 @@ class T5GemmaLARAAttention(nn.Module):
             f"head_dim={self.head_dim}, "
             f"coord_scale={self.coord_scale}"
         )
+
+
+class CrossLARAAttention(nn.Module):
+    """
+    Cross-Attention with LARA for geometry-aware encoding-decoding.
+
+    Extends LARA to cross-attention scenario where:
+    - Query: from decoder (with decoder coordinates)
+    - Key/Value: from encoder (with encoder coordinates)
+    - Geometric bias: computed based on spatial distance between q and k positions
+
+    This is crucial for EDA routing where the decoder (current path position)
+    should attend more to spatially nearby source loads/drivers.
+
+    Args:
+        config: Model config with hidden_size, num_heads, etc.
+        layer_idx: Layer index
+        coord_scale: Coordinate scaling factor
+        use_geometric_bias: Whether to use MLP-based geometric bias
+        bias_mlp_hidden: Hidden dimension for bias MLP
+        cross_attention_hidden_size: Encoder hidden size (if different from decoder)
+    """
+
+    def __init__(
+        self,
+        config,
+        layer_idx: int = 0,
+        coord_scale: float = 1e-5,
+        use_geometric_bias: bool = True,
+        bias_mlp_hidden: int = 64,
+        cross_attention_hidden_size: Optional[int] = None,
+    ):
+        super().__init__()
+
+        # Extract config parameters
+        if hasattr(config, 'hidden_size'):
+            self.hidden_size = config.hidden_size
+            self.num_heads = config.num_attention_heads
+            self.head_dim = config.head_dim
+            dropout_rate = getattr(config, 'dropout_rate', 0.1)
+        elif hasattr(config, 'decoder'):
+            decoder_config = config.decoder
+            self.hidden_size = decoder_config.hidden_size
+            self.num_heads = decoder_config.num_attention_heads
+            self.head_dim = decoder_config.head_dim
+            dropout_rate = config.dropout_rate
+        else:
+            raise ValueError(f"Unexpected config type: {type(config)}")
+
+        self.layer_idx = layer_idx
+        self.coord_scale = coord_scale
+        self.use_geometric_bias = use_geometric_bias
+
+        # Cross-attention may have different hidden sizes for encoder/decoder
+        self.cross_attention_hidden_size = cross_attention_hidden_size or self.hidden_size
+
+        # Projection layers
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim)
+        self.k_proj = nn.Linear(self.cross_attention_hidden_size, self.num_heads * self.head_dim)
+        self.v_proj = nn.Linear(self.cross_attention_hidden_size, self.num_heads * self.head_dim)
+        self.out_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size)
+
+        # Geometric position embedding (for Q and K)
+        self.geo_pe = GeometricPositionEmbedding(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            coord_scale=coord_scale,
+        )
+
+        # Geometric bias MLP
+        if use_geometric_bias:
+            self.geo_bias_mlp = nn.Sequential(
+                nn.Linear(3, bias_mlp_hidden),
+                nn.GELU(),
+                nn.Linear(bias_mlp_hidden, self.num_heads),
+            )
+
+        self.dropout = nn.Dropout(dropout_rate)
+        self.scale = self.head_dim ** -0.5
+
+    def compute_cross_geometric_bias(
+        self,
+        query_coords: torch.Tensor,
+        key_coords: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute geometric bias for cross-attention.
+
+        Args:
+            query_coords: Decoder coordinates (batch, query_len, 3)
+            key_coords: Encoder coordinates (batch, key_len, 3)
+
+        Returns:
+            Geometric bias (batch, num_heads, query_len, key_len)
+        """
+        batch_size, query_len, _ = query_coords.shape
+        _, key_len, _ = key_coords.shape
+
+        # Compute pairwise relative displacement
+        # Δp_ij = query_i - key_j
+        q_coords = query_coords.unsqueeze(2)  # (batch, query_len, 1, 3)
+        k_coords = key_coords.unsqueeze(1)    # (batch, 1, key_len, 3)
+        rel_disp = q_coords - k_coords         # (batch, query_len, key_len, 3)
+
+        # Scale
+        rel_disp = rel_disp.float() * self.coord_scale
+
+        # MLP to compute per-head bias
+        bias = self.geo_bias_mlp(rel_disp)  # (batch, query_len, key_len, num_heads)
+        bias = bias.permute(0, 3, 1, 2)      # (batch, num_heads, query_len, key_len)
+
+        return bias
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        query_coordinates: Optional[torch.Tensor] = None,
+        key_coordinates: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Any] = None,
+        output_attentions: bool = False,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """
+        Cross-attention with geometric awareness.
+
+        Args:
+            hidden_states: Decoder hidden states (batch, query_len, hidden_size)
+            encoder_hidden_states: Encoder hidden states (batch, key_len, hidden_size)
+            attention_mask: Attention mask
+            query_coordinates: Decoder coordinates (batch, query_len, 3)
+            key_coordinates: Encoder coordinates (batch, key_len, 3)
+            past_key_value: KV cache
+            output_attentions: Whether to return attention weights
+
+        Returns:
+            (output, attention_weights, present_key_value)
+        """
+        batch_size, query_len, _ = hidden_states.shape
+        _, key_len, _ = encoder_hidden_states.shape
+
+        # Validate coordinates
+        if query_coordinates is None or key_coordinates is None:
+            raise ValueError(
+                "CrossLARAAttention requires both query_coordinates and key_coordinates. "
+                f"Got query_coordinates={query_coordinates is not None}, "
+                f"key_coordinates={key_coordinates is not None}"
+            )
+
+        # Check unsupported features
+        if past_key_value is not None:
+            raise NotImplementedError("KV caching not yet supported in CrossLARAAttention")
+
+        # Project to Q, K, V
+        query = self.q_proj(hidden_states).view(
+            batch_size, query_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)  # (batch, num_heads, query_len, head_dim)
+
+        key = self.k_proj(encoder_hidden_states).view(
+            batch_size, key_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)  # (batch, num_heads, key_len, head_dim)
+
+        value = self.v_proj(encoder_hidden_states).view(
+            batch_size, key_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)  # (batch, num_heads, key_len, head_dim)
+
+        # NOTE: In cross-attention, query_len != key_len, so we cannot use GeoPE
+        # rotation directly (it assumes same seq_len for Q and K).
+        # Instead, we rely on geometric_bias to capture spatial relationships.
+        # The geometric bias already models the distance between decoder positions
+        # (query_coordinates) and encoder positions (key_coordinates).
+
+        # Compute attention scores (without GeoPE rotation)
+        attn_scores = torch.matmul(query, key.transpose(-2, -1)) * self.scale
+        # (batch, num_heads, query_len, key_len)
+
+        # Add geometric bias
+        if self.use_geometric_bias:
+            geo_bias = self.compute_cross_geometric_bias(
+                query_coordinates, key_coordinates
+            )
+            attn_scores = attn_scores + geo_bias
+
+        # Apply attention mask
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                # (batch, key_len) → (batch, 1, 1, key_len)
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+            elif attention_mask.dim() == 3:
+                # (batch, query_len, key_len) → (batch, 1, query_len, key_len)
+                attention_mask = attention_mask.unsqueeze(1)
+            elif attention_mask.dim() == 4:
+                # Already 4D
+                pass
+
+            attn_scores = attn_scores.masked_fill(
+                attention_mask == 0, float('-inf')
+            )
+
+        # Softmax and dropout
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+
+        # Apply attention to values
+        context = torch.matmul(attn_probs, value)  # (batch, num_heads, query_len, head_dim)
+
+        # Reshape and project output
+        context = context.transpose(1, 2).contiguous().view(
+            batch_size, query_len, self.num_heads * self.head_dim
+        )
+        output = self.out_proj(context)
+
+        present_key_value = None
+        attn_weights = attn_probs if output_attentions else None
+
+        return output, attn_weights, present_key_value

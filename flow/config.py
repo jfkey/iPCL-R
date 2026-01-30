@@ -213,12 +213,19 @@ class GeometricEmbeddingConfig:
     - <DRIVER>: Absolute position encoding
     - <LOAD>: Absolute position + Relative position (from driver)
     - Other tokens: Zero position embedding
+
+    LARA (Lie Algebra Relative Attention) Configuration:
+    - Encoder: Standard Attention (enable_encoder_lara=False, default)
+    - Decoder Self-Attention: LARA (enable_geometric_attention=True)
+    - Cross-Attention: LARA (enable_geometric_cross_attention=True)
     """
 
     # Enable flags
     enable_fourier_pe: bool = False  # Simple 3D Fourier PE (deprecated)
     enable_geometry_aware_pe: bool = True  # Advanced Geometry-Aware PE (recommended)
-    enable_geometric_attention: bool = False  # LARA geometric attention
+    enable_geometric_attention: bool = False  # LARA for Decoder Self-Attention
+    enable_geometric_cross_attention: bool = False  # LARA for Cross-Attention
+    enable_encoder_lara: bool = False  # LARA for Encoder (usually not recommended)
 
     # Coordinate scaling
     coord_scale: float = 1e-5  # Scale for large chip coordinates (e.g., 1e5 -> 1.0)
