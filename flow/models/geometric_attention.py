@@ -20,7 +20,7 @@
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 
 import torch
 import torch.nn as nn
@@ -476,4 +476,157 @@ class LieAlgebraRelativeAttention(nn.Module):
             f"num_heads={self.num_heads}, "
             f"head_dim={self.head_dim}, "
             f"use_geometric_bias={self.use_geometric_bias}"
+        )
+
+
+class T5GemmaLARAAttention(nn.Module):
+    """
+    LARA Attention wrapper compatible with T5GemmaSelfAttention interface.
+
+    This wrapper adapts LieAlgebraRelativeAttention to work as a drop-in
+    replacement for T5GemmaSelfAttention in T5Gemma encoder/decoder layers.
+
+    Key adaptations:
+    - Accepts position_embeddings parameter (ignored) for interface compatibility
+    - Accepts coordinates via kwargs for geometric attention
+    - Returns format: (attn_output, attn_weights, present_key_value)
+    - Supports output_attentions flag
+
+    Args:
+        config: T5GemmaConfig or T5GemmaModuleConfig
+        layer_idx: Layer index in the model
+        coord_scale: Scaling factor for input coordinates
+        use_geometric_bias: Whether to use MLP-based geometric bias
+        bias_mlp_hidden: Hidden dimension for geometric bias MLP
+
+    Note:
+        - KV caching (past_key_value) is not yet supported
+        - Flash Attention is not yet supported
+        - Coordinates parameter is required in forward pass
+    """
+
+    def __init__(
+        self,
+        config,
+        layer_idx: int = 0,
+        coord_scale: float = 1e-5,
+        use_geometric_bias: bool = True,
+        bias_mlp_hidden: int = 64,
+    ):
+        super().__init__()
+
+        # Extract config parameters
+        if hasattr(config, 'hidden_size'):
+            # Full model config
+            self.hidden_size = config.hidden_size
+            self.num_heads = config.num_attention_heads
+            self.head_dim = config.head_dim
+            dropout_rate = getattr(config, 'dropout_rate', 0.1)
+        elif hasattr(config, 'encoder'):
+            # T5GemmaConfig with encoder/decoder subconfigs
+            encoder_config = config.encoder
+            self.hidden_size = encoder_config.hidden_size
+            self.num_heads = encoder_config.num_attention_heads
+            self.head_dim = encoder_config.head_dim
+            dropout_rate = config.dropout_rate
+        else:
+            raise ValueError(f"Unexpected config type: {type(config)}")
+
+        self.layer_idx = layer_idx
+        self.coord_scale = coord_scale
+
+        # Core LARA module
+        self.lara = LieAlgebraRelativeAttention(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            dropout=dropout_rate,
+            use_geometric_bias=use_geometric_bias,
+            bias_mlp_hidden=bias_mlp_hidden,
+            coord_scale=coord_scale,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Any] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        output_attentions: bool = False,
+        coordinates: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """
+        Forward pass compatible with T5GemmaSelfAttention interface.
+
+        Args:
+            hidden_states: Input hidden states (batch, seq_len, hidden_size)
+            position_embeddings: RoPE embeddings (cos, sin) - Ignored by LARA
+            attention_mask: Attention mask (batch, seq_len) or (batch, seq_len, seq_len)
+            past_key_value: KV cache - Not yet supported
+            cache_position: Cache position indices - Not yet supported
+            output_attentions: Whether to return attention weights
+            coordinates: 3D coordinates (batch, seq_len, 3) - REQUIRED for LARA
+
+        Returns:
+            Tuple of (attn_output, attn_weights, present_key_value)
+            - attn_output: (batch, seq_len, hidden_size)
+            - attn_weights: (batch, num_heads, seq_len, seq_len) if output_attentions else None
+            - present_key_value: None (caching not supported)
+
+        Raises:
+            ValueError: If coordinates is None
+            NotImplementedError: If past_key_value is provided
+        """
+
+        # Validate required parameters
+        if coordinates is None:
+            raise ValueError(
+                "T5GemmaLARAAttention requires 'coordinates' parameter. "
+                "Make sure to pass encoder_abs_positions through the model forward pass. "
+                f"Layer index: {self.layer_idx}"
+            )
+
+        # Check for unsupported features
+        if past_key_value is not None:
+            raise NotImplementedError(
+                f"KV caching not yet supported in T5GemmaLARAAttention (layer {self.layer_idx}). "
+                "Set use_cache=False in model.generate() or model.forward()."
+            )
+
+        # Process attention mask
+        # T5Gemma may pass 4D mask (batch, 1, seq_len, seq_len)
+        # LARA expects 2D (batch, seq_len) or 3D (batch, seq_len, seq_len)
+        if attention_mask is not None and attention_mask.dim() == 4:
+            attention_mask = attention_mask.squeeze(1)  # (batch, seq_len, seq_len)
+
+        # Call LARA forward
+        lara_output = self.lara(
+            hidden_states=hidden_states,
+            coordinates=coordinates,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+        )
+
+        # Parse output
+        if output_attentions:
+            attn_output, attn_weights = lara_output
+        else:
+            attn_output = lara_output[0]
+            attn_weights = None
+
+        # Return format compatible with T5GemmaSelfAttention
+        # (attn_output, attn_weights, present_key_value)
+        present_key_value = None  # No caching support
+        return attn_output, attn_weights, present_key_value
+
+    def extra_repr(self) -> str:
+        """Extra representation for printing."""
+        return (
+            f"layer_idx={self.layer_idx}, "
+            f"hidden_size={self.hidden_size}, "
+            f"num_heads={self.num_heads}, "
+            f"head_dim={self.head_dim}, "
+            f"coord_scale={self.coord_scale}"
         )

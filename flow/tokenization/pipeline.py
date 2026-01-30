@@ -562,11 +562,11 @@ class TokenizationPipeline:
             sample_tgt_coords = sample["tgt_coords"]
 
             logging.info(f"\nSample 0:")
-            logging.info(f"  source_tokens ({len(sample_src_tokens.split())} tokens): {sample_src_tokens[:100]}...")
-            logging.info(f"  target_tokens ({len(sample_tgt_tokens.split())} tokens): {sample_tgt_tokens[:100]}...")
-            logging.info(f"  src_abs_pos ({len(sample_src_abs_pos)} positions): {sample_src_abs_pos[:5]}...")
-            logging.info(f"  src_rel_pos ({len(sample_src_rel_pos)} positions): {sample_src_rel_pos[:5]}...")
-            logging.info(f"  tgt_coords ({len(sample_tgt_coords)} positions): {sample_tgt_coords[:5]}...")
+            logging.info(f"  source_tokens ({len(sample_src_tokens.split())} tokens): {sample_src_tokens[:300]}...")
+            logging.info(f"  target_tokens ({len(sample_tgt_tokens.split())} tokens): {sample_tgt_tokens[:300]}...")
+            logging.info(f"  src_abs_pos ({len(sample_src_abs_pos)} positions): {sample_src_abs_pos[:50]}...")
+            logging.info(f"  src_rel_pos ({len(sample_src_rel_pos)} positions): {sample_src_rel_pos[:50]}...")
+            logging.info(f"  tgt_coords ({len(sample_tgt_coords)} positions): {sample_tgt_coords[:50]}...")
 
             # Verify alignment
             src_token_count = len(sample_src_tokens.split())

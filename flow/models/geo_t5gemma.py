@@ -29,14 +29,21 @@ from transformers import (
     T5GemmaForConditionalGeneration,
     T5GemmaModuleConfig,
 )
-from transformers.modeling_outputs import Seq2SeqLMOutput
+from transformers.models.t5gemma.modeling_t5gemma import (
+    T5GemmaEncoderLayer,
+    T5GemmaEncoder,
+    T5GemmaDecoderLayer,
+    T5GemmaDecoder,
+    T5GemmaRMSNorm,
+)
+from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
 
 from .position_embedding import (
     FourierPositionEmbedding,
     GeometryAwarePositionEmbedding,
     GeoPEConfig,
 )
-from .geometric_attention import LieAlgebraRelativeAttention
+from .geometric_attention import LieAlgebraRelativeAttention, T5GemmaLARAAttention
 
 
 @dataclass
@@ -130,6 +137,274 @@ class GeoConfig:
         )
 
 
+class GeoT5GemmaEncoderLayer(T5GemmaEncoderLayer):
+    """
+    T5GemmaEncoderLayer with optional LARA geometric attention.
+
+    Extends the base T5GemmaEncoderLayer to:
+    1. Optionally replace self_attn with T5GemmaLARAAttention
+    2. Accept and pass coordinates parameter to attention layer
+
+    The layer structure remains the same:
+    - Pre-LayerNorm → Self-Attention → Post-LayerNorm → Residual
+    - Pre-LayerNorm → MLP → Post-LayerNorm → Residual
+
+    Args:
+        config: T5GemmaConfig or T5GemmaModuleConfig
+        layer_idx: Layer index in the encoder
+        enable_geometric_attention: Whether to use LARA instead of standard attention
+    """
+
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        enable_geometric_attention: bool = False,
+        geo_config_dict: Optional[Dict[str, Any]] = None,
+    ):
+        # Initialize base layer (creates standard self_attn)
+        super().__init__(config, layer_idx)
+
+        # Replace self-attention with LARA if enabled
+        if enable_geometric_attention:
+            # Get geometric config parameters
+            if geo_config_dict is None:
+                geo_config_dict = {}
+
+            self.self_attn = T5GemmaLARAAttention(
+                config,
+                layer_idx=layer_idx,
+                coord_scale=geo_config_dict.get('coord_scale', 1e-5),
+                use_geometric_bias=geo_config_dict.get('use_geometric_bias', True),
+                bias_mlp_hidden=geo_config_dict.get('bias_mlp_hidden', 64),
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = False,
+        coordinates: Optional[torch.Tensor] = None,  # NEW parameter
+        **kwargs
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        """
+        Forward pass with coordinate support for LARA.
+
+        Args:
+            hidden_states: Input hidden states (batch, seq_len, hidden_size)
+            position_embeddings: RoPE embeddings (cos, sin tuples)
+            attention_mask: Attention mask
+            position_ids: Position indices
+            output_attentions: Whether to return attention weights
+            coordinates: 3D coordinates (batch, seq_len, 3) - Used by LARA
+
+        Returns:
+            Tuple of (hidden_states, attention_weights)
+        """
+
+        # Self-Attention Block
+        residual = hidden_states
+        hidden_states = self.pre_self_attn_layernorm(hidden_states)
+
+        # Pass coordinates to attention layer (used by LARA, ignored by standard attention)
+        hidden_states, self_attn_weights, _ = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            coordinates=coordinates,  # Pass coordinates
+            output_attentions=output_attentions,
+            **kwargs
+        )
+
+        hidden_states = self.post_self_attn_layernorm(hidden_states)
+        hidden_states = residual + self.dropout(hidden_states)
+
+        # MLP Block (unchanged from base class)
+        residual = hidden_states
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + self.dropout(hidden_states)
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        return outputs
+
+
+class GeoT5GemmaEncoder(T5GemmaEncoder):
+    """
+    T5GemmaEncoder with LARA geometric attention support.
+
+    Extends the base T5GemmaEncoder to:
+    1. Use GeoT5GemmaEncoderLayer instead of T5GemmaEncoderLayer
+    2. Accept and pass coordinates parameter through the layer stack
+
+    Args:
+        config: T5GemmaConfig with geometric_config attribute
+    """
+
+    def __init__(self, config):
+        # Call nn.Module.__init__ directly (skip T5GemmaEncoder.__init__)
+        nn.Module.__init__(self)
+
+        self.config = config
+
+        # Get encoder config (handle both T5GemmaConfig and T5GemmaModuleConfig)
+        if hasattr(config, 'encoder'):
+            encoder_config = config.encoder
+        else:
+            encoder_config = config
+
+        # Embedding layer
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size,
+            encoder_config.hidden_size,
+            padding_idx=config.pad_token_id,
+        )
+
+        # Create custom encoder layers with optional LARA support
+        geo_config_dict = getattr(config, 'geometric_config', {})
+        enable_geo_attn = geo_config_dict.get('enable_geometric_attention', False)
+
+        # Pass encoder_config to layers (not the full config)
+        self.layers = nn.ModuleList([
+            GeoT5GemmaEncoderLayer(
+                encoder_config,  # Pass encoder_config, not full config
+                layer_idx=layer_idx,
+                enable_geometric_attention=enable_geo_attn,
+                geo_config_dict=geo_config_dict,  # Pass geo_config_dict
+            )
+            for layer_idx in range(encoder_config.num_hidden_layers)
+        ])
+
+        self.final_layer_norm = T5GemmaRMSNorm(
+            encoder_config.hidden_size,
+            eps=getattr(encoder_config, 'rms_norm_eps', 1e-6)
+        )
+
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+        # Rotary embeddings (needed for position_embeddings computation)
+        self.rotary_emb = self._init_rotary_emb(encoder_config)
+
+        self.gradient_checkpointing = False
+
+    def _init_rotary_emb(self, encoder_config):
+        """Initialize rotary embeddings (copied from T5GemmaEncoder)."""
+        from transformers.models.t5gemma.modeling_t5gemma import T5GemmaRotaryEmbedding
+
+        return T5GemmaRotaryEmbedding(encoder_config)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        coordinates: Optional[torch.Tensor] = None,  # NEW parameter
+        **flash_attn_kwargs
+    ) -> BaseModelOutput:
+        """
+        Forward pass with coordinate support for LARA.
+
+        Args:
+            input_ids: Input token IDs (batch, seq_len)
+            attention_mask: Attention mask (batch, seq_len)
+            position_ids: Position indices for RoPE
+            inputs_embeds: Pre-computed embeddings (batch, seq_len, hidden_size)
+            output_attentions: Whether to return attention weights
+            output_hidden_states: Whether to return all hidden states
+            coordinates: 3D coordinates (batch, seq_len, 3) - Passed to each layer
+
+        Returns:
+            BaseModelOutput with last_hidden_state, hidden_states, attentions
+        """
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        # Get embeddings
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("You have to specify either input_ids or inputs_embeds")
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        hidden_states = self.dropout(inputs_embeds)
+
+        batch_size, seq_length = hidden_states.shape[:2]
+
+        # Prepare position IDs
+        if position_ids is None:
+            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+
+        # Compute position embeddings (RoPE)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        # Prepare attention mask (expand to 4D if needed)
+        if attention_mask is not None and attention_mask.dim() == 2:
+            # Expand to 4D: (batch, 1, 1, seq_len)
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+            # Convert to float and create causal mask
+            attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+            attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
+
+        # Layer stack
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+
+        for encoder_layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            if self.gradient_checkpointing and self.training:
+                # Gradient checkpointing
+                layer_outputs = self._gradient_checkpointing_func(
+                    encoder_layer.__call__,
+                    hidden_states,
+                    position_embeddings,
+                    attention_mask,
+                    position_ids,
+                    output_attentions,
+                    coordinates,  # Pass coordinates
+                )
+            else:
+                layer_outputs = encoder_layer(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    output_attentions=output_attentions,
+                    coordinates=coordinates,  # Pass coordinates
+                )
+
+            hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_self_attns = all_self_attns + (layer_outputs[1],)
+
+        # Final layer norm
+        hidden_states = self.final_layer_norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+
+
 class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
     """
     T5Gemma with Geometry-Aware Position Embeddings for EDA routing.
@@ -191,15 +466,26 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         config: T5GemmaConfig,
         geo_config: Optional[Union[GeoConfig, Dict[str, Any]]] = None
     ):
-        super().__init__(config)
-
-        # Parse geo_config
+        # Parse geo_config first (before calling super().__init__)
         if geo_config is None:
             self.geo_config = GeoConfig()
         elif isinstance(geo_config, dict):
             self.geo_config = GeoConfig.from_dict(geo_config)
         else:
             self.geo_config = geo_config
+
+        # Store geometric config in model config for layer access
+        config.geometric_config = self.geo_config.to_dict()
+
+        # Initialize base model
+        super().__init__(config)
+
+        # Replace encoder with GeoT5GemmaEncoder if LARA is enabled
+        if self.geo_config.enable_geometric_attention:
+            self.encoder = GeoT5GemmaEncoder(config)
+            # Note: Decoder can also be replaced similarly if needed
+            # For now, we only replace encoder as decoder is autoregressive
+            # and may not benefit as much from geometric attention
 
         # Initialize Position Embedding modules
         self.encoder_geo_pe = None
@@ -250,11 +536,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 floor_freq_ratio=self.geo_config.floor_freq_ratio,
                 max_sequence_length=self.geo_config.max_sequence_length,
             )
-
-        # Note: Geometric Attention (Step 3) integration would require
-        # modifying the attention layers. For now, we provide LARA as a
-        # standalone module that can be used to replace attention layers
-        # if enable_geometric_attention is True.
 
         # Post-initialization
         self.post_init()
@@ -426,7 +707,20 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 decoder_attention_mask,
             )
 
-        # Call parent forward with enhanced embeddings
+        # === KEY CHANGE: Handle encoder call with coordinates ===
+        # If using GeoT5GemmaEncoder and encoder_outputs not cached,
+        # call encoder explicitly to pass coordinates
+        if encoder_outputs is None and isinstance(self.encoder, GeoT5GemmaEncoder):
+            encoder_outputs = self.encoder(
+                input_ids=None,  # Already have inputs_embeds
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                coordinates=encoder_abs_positions,  # Pass coordinates to LARA layers
+            )
+
+        # Call parent forward with enhanced embeddings and encoder outputs
         return super().forward(
             input_ids=None,  # Use inputs_embeds instead
             attention_mask=attention_mask,
