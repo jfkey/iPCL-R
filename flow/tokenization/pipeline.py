@@ -60,8 +60,8 @@ class TokenizationPipeline:
         corpus_dataset = self.read_data_synthesis()
 
         # DEBUG: Only use top 10000 samples for testing
-        corpus_dataset = corpus_dataset.select(range(min(15000, len(corpus_dataset))))
-        logging.info(f"DEBUG: Using only {len(corpus_dataset)} samples for testing")
+        # corpus_dataset = corpus_dataset.select(range(min(15000, len(corpus_dataset))))
+        # logging.info(f"DEBUG: Using only {len(corpus_dataset)} samples for testing")
 
         # Step 2: Preprocess and refine tree_seq in corpus dataset
         corpus_dataset = self.preprocess_corpus(corpus_dataset)

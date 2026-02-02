@@ -54,7 +54,7 @@
             "dropout_rate": 0.1,
             "geometric_config": {
                 "enable_fourier_pe": false,
-                "enable_geometry_aware_pe": false,           
+                "enable_geometry_aware_pe": true,           
                 "enable_geometric_attention": true, 
                 "enable_geometric_cross_attention": true, 
                 "enable_encoder_lara": false,       
