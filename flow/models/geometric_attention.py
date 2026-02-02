@@ -443,16 +443,12 @@ class LieAlgebraRelativeAttention(nn.Module):
             geo_bias = self.compute_geometric_bias(coordinates)
             attn_scores = attn_scores + geo_bias
 
-        # Apply attention mask
+        # Apply attention mask (additive mask format: 0=valid, large_negative=invalid)
         if attention_mask is not None:
-            # Expand mask: (B, 1, 1, T) for 2D mask or (B, 1, T, T) for 3D mask
-            if attention_mask.dim() == 2:
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
-            elif attention_mask.dim() == 3:
-                attention_mask = attention_mask.unsqueeze(1)
-            attn_scores = attn_scores.masked_fill(
-                attention_mask == 0, float('-inf')
-            )
+            # attention_mask is already in additive format from HuggingFace
+            # Shape: (batch, 1, 1, seq_len) or (batch, 1, seq_len, seq_len)
+            # Just add it directly to attn_scores
+            attn_scores = attn_scores + attention_mask
 
         # Softmax and dropout
         attn_probs = F.softmax(attn_scores, dim=-1)
@@ -596,10 +592,9 @@ class T5GemmaLARAAttention(nn.Module):
             )
 
         # Process attention mask
-        # T5Gemma may pass 4D mask (batch, 1, seq_len, seq_len)
-        # LARA expects 2D (batch, seq_len) or 3D (batch, seq_len, seq_len)
-        if attention_mask is not None and attention_mask.dim() == 4:
-            attention_mask = attention_mask.squeeze(1)  # (batch, seq_len, seq_len)
+        # T5Gemma passes 4D additive mask (batch, 1, seq_len, seq_len)
+        # LARA now expects 4D additive mask for direct addition to attn_scores
+        # Keep 4D format, no squeeze needed
 
         # Call LARA forward
         lara_output = self.lara(
@@ -806,7 +801,6 @@ class CrossLARAAttention(nn.Module):
 
         # Compute attention scores (without GeoPE rotation)
         attn_scores = torch.matmul(query, key.transpose(-2, -1)) * self.scale
-        # (batch, num_heads, query_len, key_len)
 
         # Add geometric bias
         if self.use_geometric_bias:
@@ -815,21 +809,11 @@ class CrossLARAAttention(nn.Module):
             )
             attn_scores = attn_scores + geo_bias
 
-        # Apply attention mask
+        # Apply attention mask (additive mask format: 0=valid, large_negative=invalid)
         if attention_mask is not None:
-            if attention_mask.dim() == 2:
-                # (batch, key_len) → (batch, 1, 1, key_len)
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
-            elif attention_mask.dim() == 3:
-                # (batch, query_len, key_len) → (batch, 1, query_len, key_len)
-                attention_mask = attention_mask.unsqueeze(1)
-            elif attention_mask.dim() == 4:
-                # Already 4D
-                pass
-
-            attn_scores = attn_scores.masked_fill(
-                attention_mask == 0, float('-inf')
-            )
+            # attention_mask is already in additive format from HuggingFace
+            # Just add it directly to attn_scores
+            attn_scores = attn_scores + attention_mask
 
         # Softmax and dropout
         attn_probs = F.softmax(attn_scores, dim=-1)
