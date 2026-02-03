@@ -690,11 +690,28 @@ class GeoT5GemmaDecoder(T5GemmaDecoder):
         all_cross_attentions = () if output_attentions and encoder_hidden_states is not None else None
         next_decoder_cache = () if use_cache else None
 
+        # Handle different cache formats (tuple vs Cache object)
+        # In newer transformers versions, past_key_values can be a Cache object
+        # Check if it's an empty Cache object and treat it as None
+        if past_key_values is not None:
+            if hasattr(past_key_values, '__len__') and not isinstance(past_key_values, (tuple, list)):
+                # It's a Cache object - check if it has any cached layers
+                if len(past_key_values) == 0:
+                    # Empty cache, treat as None
+                    past_key_values = None
+
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
+            # Get past_key_value for this layer
+            # Use try/except to safely handle different cache formats
+            past_key_value = None
+            if past_key_values is not None:
+                try:
+                    past_key_value = past_key_values[idx]
+                except (KeyError, IndexError, TypeError):
+                    past_key_value = None
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -994,6 +1011,9 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         decoder_coordinates: Optional[torch.Tensor] = None,
         # Legacy input (for backward compatibility with simple Fourier PE)
         encoder_coordinates: Optional[torch.Tensor] = None,
+        # Accept additional kwargs for compatibility with newer transformers versions
+        # (e.g., cache_position added in transformers >= 4.43.0)
+        **kwargs,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
         """
         Forward pass with geometry-aware position embeddings.
@@ -1172,6 +1192,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            **kwargs,  # Pass through additional args like cache_position
         )
 
     def prepare_inputs_for_generation(
@@ -1316,6 +1337,186 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             if hasattr(self, '_last_decoder_length'):
                 delattr(self, '_last_decoder_length')
 
+    def _reorder_cache(
+        self, past_key_values, beam_idx: torch.Tensor
+    ):
+        """
+        Reorder past key values for beam search.
+
+        This method is required for beam search to work properly. It reorders
+        the cached key-value pairs according to the beam indices selected at
+        each generation step.
+
+        Args:
+            past_key_values: The cached key-value pairs from previous steps.
+                Can be a tuple of tuples or a Cache object.
+            beam_idx: Tensor of beam indices to reorder by.
+
+        Returns:
+            Reordered past_key_values in the same format as input.
+        """
+        # Handle None case
+        if past_key_values is None:
+            return None
+
+        # Handle Cache object (newer transformers versions)
+        if hasattr(past_key_values, 'reorder_cache'):
+            # Cache object has its own reorder method
+            past_key_values.reorder_cache(beam_idx)
+            return past_key_values
+
+        # Handle legacy tuple format
+        reordered_past = ()
+        for layer_past in past_key_values:
+            if layer_past is None:
+                reordered_past = reordered_past + (None,)
+            else:
+                # Each layer_past is a tuple of (key, value) tensors
+                # Reorder along the batch dimension (dim 0)
+                reordered_layer = tuple(
+                    past_state.index_select(0, beam_idx.to(past_state.device))
+                    for past_state in layer_past
+                )
+                reordered_past = reordered_past + (reordered_layer,)
+
+        return reordered_past
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args,
+        geo_config: Optional[Union[GeoConfig, Dict[str, Any]]] = None,
+        **kwargs
+    ) -> "GeoT5GemmaForConditionalGeneration":
+        """
+        Load pretrained GeoT5GemmaForConditionalGeneration model.
+
+        This method properly handles the geometric_config that was saved
+        with the model. If geo_config is not provided, it will be loaded
+        from the saved config.json.
+
+        Args:
+            pretrained_model_name_or_path: Path to pretrained model or checkpoint
+            geo_config: Optional geometric config (if None, loads from saved config)
+            **kwargs: Additional arguments for from_pretrained
+
+        Returns:
+            GeoT5GemmaForConditionalGeneration with all weights loaded
+        """
+        import json
+        from pathlib import Path
+
+        # Load config first to get geometric_config
+        config = T5GemmaConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+        # Try to get geometric_config from saved config
+        saved_geo_config = getattr(config, 'geometric_config', None)
+
+        # Use provided geo_config, or fall back to saved, or default
+        if geo_config is not None:
+            # User provided geo_config
+            if isinstance(geo_config, dict):
+                final_geo_config = GeoConfig.from_dict(geo_config)
+            else:
+                final_geo_config = geo_config
+        elif saved_geo_config is not None:
+            # Load from saved config
+            if isinstance(saved_geo_config, dict):
+                final_geo_config = GeoConfig.from_dict(saved_geo_config)
+            else:
+                final_geo_config = saved_geo_config
+        else:
+            # Default config
+            final_geo_config = GeoConfig()
+
+        # Store in config for model initialization
+        config.geometric_config = final_geo_config.to_dict()
+
+        # Create model with the geo config
+        model = cls.__new__(cls)
+
+        # Initialize geo_config before calling parent __init__
+        model.geo_config = final_geo_config
+
+        # Call parent __init__ which sets up the base model
+        T5GemmaForConditionalGeneration.__init__(model, config)
+
+        # Replace encoder/decoder with Geo versions if LARA is enabled
+        if model.geo_config.enable_geometric_attention:
+            enable_encoder_lara = config.geometric_config.get('enable_encoder_lara', False)
+            if enable_encoder_lara:
+                model.model.encoder = GeoT5GemmaEncoder(config)
+            model.model.decoder = GeoT5GemmaDecoder(config)
+
+        # Initialize Position Embedding modules
+        model.encoder_geo_pe = None
+        model.decoder_geo_pe = None
+        model.encoder_fourier_pe = None
+        model.decoder_fourier_pe = None
+
+        if model.geo_config.enable_geometry_aware_pe:
+            geope_config = model.geo_config.to_geope_config(config.hidden_size)
+            model.encoder_geo_pe = GeometryAwarePositionEmbedding(geope_config)
+            model.decoder_fourier_pe = FourierPositionEmbedding(
+                hidden_size=config.hidden_size,
+                num_frequencies=model.geo_config.num_frequencies,
+                max_wavelength=model.geo_config.max_wavelength,
+                min_wavelength=model.geo_config.min_wavelength,
+                coord_scale=model.geo_config.coord_scale,
+                learnable_coefficients=model.geo_config.learnable_fourier_coefficients,
+                separate_basis=model.geo_config.separate_sin_cos_basis,
+                floor_freq_ratio=model.geo_config.floor_freq_ratio,
+                max_sequence_length=model.geo_config.max_sequence_length,
+            )
+        elif model.geo_config.enable_fourier_pe:
+            model.encoder_fourier_pe = FourierPositionEmbedding(
+                hidden_size=config.hidden_size,
+                num_frequencies=model.geo_config.num_frequencies,
+                max_wavelength=model.geo_config.max_wavelength,
+                min_wavelength=model.geo_config.min_wavelength,
+                coord_scale=model.geo_config.coord_scale,
+                learnable_coefficients=model.geo_config.learnable_fourier_coefficients,
+                separate_basis=model.geo_config.separate_sin_cos_basis,
+                floor_freq_ratio=model.geo_config.floor_freq_ratio,
+                max_sequence_length=model.geo_config.max_sequence_length,
+            )
+            model.decoder_fourier_pe = FourierPositionEmbedding(
+                hidden_size=config.hidden_size,
+                num_frequencies=model.geo_config.num_frequencies,
+                max_wavelength=model.geo_config.max_wavelength,
+                min_wavelength=model.geo_config.min_wavelength,
+                coord_scale=model.geo_config.coord_scale,
+                learnable_coefficients=model.geo_config.learnable_fourier_coefficients,
+                separate_basis=model.geo_config.separate_sin_cos_basis,
+                floor_freq_ratio=model.geo_config.floor_freq_ratio,
+                max_sequence_length=model.geo_config.max_sequence_length,
+            )
+
+        # Now load the state dict with all weights
+        model_path = Path(pretrained_model_name_or_path)
+        if (model_path / "model.safetensors").exists():
+            from safetensors.torch import load_file
+            state_dict = load_file(model_path / "model.safetensors")
+        elif (model_path / "pytorch_model.bin").exists():
+            import torch
+            state_dict = torch.load(model_path / "pytorch_model.bin", map_location="cpu")
+        else:
+            # Try loading with parent method for other formats
+            state_dict = None
+
+        if state_dict is not None:
+            # Load all weights (including geo_pe weights)
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            if missing_keys:
+                import logging
+                logging.warning(f"Missing keys when loading model: {missing_keys}")
+            if unexpected_keys:
+                import logging
+                logging.warning(f"Unexpected keys when loading model: {unexpected_keys}")
+
+        return model
+
     @classmethod
     def from_pretrained_with_geo(
         cls,
@@ -1325,6 +1526,8 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
     ) -> "GeoT5GemmaForConditionalGeneration":
         """
         Load pretrained T5Gemma and add geometric embeddings.
+
+        DEPRECATED: Use from_pretrained() instead, which now handles geo_config properly.
 
         This method loads a pretrained T5Gemma model and adds the geometric
         embedding components (Fourier PE) on top.
@@ -1337,6 +1540,13 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         Returns:
             GeoT5GemmaForConditionalGeneration with pretrained weights
         """
+        import warnings
+        warnings.warn(
+            "from_pretrained_with_geo is deprecated. Use from_pretrained() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
         # Load base model config
         config = T5GemmaConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
 

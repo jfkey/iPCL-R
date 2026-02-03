@@ -229,8 +229,35 @@ class GeometricPositionEmbedding(nn.Module):
         """
         batch_size, num_heads, seq_len, head_dim = query.shape
 
+        # Handle shape mismatches between query and coordinates
+        # This can happen during beam search (batch expansion) or incremental decoding (seq_len mismatch)
+        coords = coordinates.float()
+        coord_batch, coord_seq, _ = coords.shape
+
+        # Handle batch dimension mismatch (beam search expands batch by num_beams)
+        if coord_batch != batch_size:
+            if batch_size % coord_batch == 0:
+                # Expand coordinates for beam search: (B, T, 3) -> (B*num_beams, T, 3)
+                num_beams = batch_size // coord_batch
+                coords = coords.unsqueeze(1).expand(-1, num_beams, -1, -1)
+                coords = coords.reshape(batch_size, coord_seq, 3)
+            else:
+                raise ValueError(
+                    f"Batch size mismatch: query has {batch_size}, coordinates has {coord_batch}"
+                )
+
+        # Handle seq_len mismatch (incremental decoding uses only current token)
+        if coord_seq != seq_len:
+            if coord_seq > seq_len:
+                # Take the last seq_len positions (for incremental decoding)
+                coords = coords[:, -seq_len:, :]
+            else:
+                raise ValueError(
+                    f"Seq len mismatch: query has {seq_len}, coordinates has {coord_seq}"
+                )
+
         # Scale coordinates to reasonable range
-        coords = coordinates.float() * self.coord_scale  # (B, T, 3)
+        coords = coords * self.coord_scale  # (B, T, 3)
         x_pos = coords[:, :, 0]  # (B, T)
         y_pos = coords[:, :, 1]  # (B, T)
         z_pos = coords[:, :, 2]  # (B, T)

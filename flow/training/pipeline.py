@@ -280,7 +280,7 @@ class TrainingPipeline:
         use_geo = False
         if hasattr(self.model_config, 'geometric_config'):
             geo_cfg = self.model_config.geometric_config
-            use_geo = getattr(geo_cfg, 'enable_geometry_aware_pe', False) and \
+            use_geo = getattr(geo_cfg, 'enable_geometry_aware_pe', False) or \
                       getattr(geo_cfg, 'enable_fourier_pe', False)
 
         vocab_size = len(tokenizer.get_vocab())
@@ -411,8 +411,8 @@ class TrainingPipeline:
         use_geo = False
         if hasattr(self.model_config, 'geometric_config'):
             geo_cfg = self.model_config.geometric_config
-            use_geo = getattr(geo_cfg, 'enable_geometry_aware_pe', False) and \
-                      getattr(geo_cfg, 'enable_fourier_pe', False)
+            use_geo = getattr(geo_cfg, 'enable_geometry_aware_pe', False) or \
+                      getattr(geo_cfg, 'enable_geometric_attention', False)
             
         args = Seq2SeqTrainingArguments(
             output_dir=self.paths_config.model_save_dir,
