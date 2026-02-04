@@ -27,6 +27,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def rotate_half(x):
+    """Rotates half the hidden dims of the input (for RoPE)."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """
+    Applies Rotary Position Embedding (RoPE) to query and key tensors.
+
+    Args:
+        q: Query tensor (batch, num_heads, seq_len, head_dim)
+        k: Key tensor (batch, num_heads, seq_len, head_dim)
+        cos: Cosine part of RoPE (batch, seq_len, head_dim)
+        sin: Sine part of RoPE (batch, seq_len, head_dim)
+        unsqueeze_dim: Dimension to unsqueeze cos/sin for broadcasting
+
+    Returns:
+        Tuple of (q_rotated, k_rotated)
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
 class GeometricPositionEmbedding(nn.Module):
     """
     Geometric Position Embedding using quaternions and Lie algebra.
@@ -73,7 +101,7 @@ class GeometricPositionEmbedding(nn.Module):
         hidden_size: int = 256,
         num_heads: int = 4,
         head_dim: int = 63,  # Must be divisible by 3
-        base: float = 100.0,
+        base: float = 32.0,
         coord_scale: float = 1e-4,
     ):
         super().__init__()
@@ -427,15 +455,20 @@ class LieAlgebraRelativeAttention(nn.Module):
         coordinates: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, ...]:
         """
-        Geometry-aware attention forward pass.
+        Geometry-aware attention forward pass with RoPE + GeoPE.
+
+        The rotation order is: RoPE (sequence position) → GeoPE (3D geometry)
+        This allows the model to encode both sequential and spatial relationships.
 
         Args:
             hidden_states: Input hidden states (batch, seq_len, hidden_size)
             coordinates: 3D coordinates (batch, seq_len, 3)
             attention_mask: Optional attention mask (batch, seq_len) or (batch, seq_len, seq_len)
             output_attentions: Whether to return attention weights
+            position_embeddings: RoPE embeddings tuple (cos, sin), each (batch, seq_len, head_dim)
 
         Returns:
             Tuple of (output,) or (output, attention_weights)
@@ -458,7 +491,12 @@ class LieAlgebraRelativeAttention(nn.Module):
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-        # Apply geometric rotation (GeoPE)
+        # Step 1: Apply RoPE (Rotary Position Embedding) for sequence position
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+
+        # Step 2: Apply GeoPE (Geometric Position Embedding) for 3D spatial position
         query_rot, key_rot = self.geo_pe(query, key, coordinates)
 
         # Compute attention scores with rotated Q, K
@@ -510,10 +548,15 @@ class T5GemmaLARAAttention(nn.Module):
     replacement for T5GemmaSelfAttention in T5Gemma encoder/decoder layers.
 
     Key adaptations:
-    - Accepts position_embeddings parameter (ignored) for interface compatibility
+    - Accepts position_embeddings (RoPE cos/sin) and applies both RoPE and GeoPE
     - Accepts coordinates via kwargs for geometric attention
     - Returns format: (attn_output, attn_weights, present_key_value)
     - Supports output_attentions flag
+
+    Position Encoding Strategy (RoPE + GeoPE):
+    - RoPE: Encodes sequential token positions (order in sequence)
+    - GeoPE: Encodes 3D spatial positions (chip coordinates)
+    - Both are applied as rotations: Q, K → RoPE rotation → GeoPE rotation → attention
 
     Args:
         config: T5GemmaConfig or T5GemmaModuleConfig
@@ -585,7 +628,7 @@ class T5GemmaLARAAttention(nn.Module):
 
         Args:
             hidden_states: Input hidden states (batch, seq_len, hidden_size)
-            position_embeddings: RoPE embeddings (cos, sin) - Ignored by LARA
+            position_embeddings: RoPE embeddings (cos, sin) - Applied before GeoPE
             attention_mask: Attention mask (batch, seq_len) or (batch, seq_len, seq_len)
             past_key_value: KV cache - Not yet supported
             cache_position: Cache position indices - Not yet supported
@@ -623,12 +666,14 @@ class T5GemmaLARAAttention(nn.Module):
         # LARA now expects 4D additive mask for direct addition to attn_scores
         # Keep 4D format, no squeeze needed
 
-        # Call LARA forward
+        # Call LARA forward with both RoPE and GeoPE
+        # Rotation order: RoPE (sequence position) → GeoPE (3D geometry)
         lara_output = self.lara(
             hidden_states=hidden_states,
             coordinates=coordinates,
             attention_mask=attention_mask,
             output_attentions=output_attentions,
+            position_embeddings=position_embeddings,  # Pass RoPE to LARA
         )
 
         # Parse output
