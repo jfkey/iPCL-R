@@ -103,4 +103,5 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 
-#  python -m flow.launch_tokenization --flow-config config.json
+# Usage:
+# python -m flow.launch_tokenization --flow-config /mnt/local_data1/liujunfeng/exp/universal_token/config.json

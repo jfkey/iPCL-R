@@ -1603,6 +1603,11 @@ def construct_rectilinear_edges(
         if tree_node != pred_relative_tree.coord
     ]
 
+    # from commit 2d7e355
+    # If no tree_nodes but driver exists, use driver as the connection point 
+    if not tree_nodes and pred_relative_tree.coord:
+        tree_nodes = [pred_relative_tree.coord]
+
     tree_node_layers = set(node.m for node in tree_nodes)
 
     # Re-check prohibited layers, if all tree node in prohibited layer, make prohibited layer is empty

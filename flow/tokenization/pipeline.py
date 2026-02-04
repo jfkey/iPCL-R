@@ -59,8 +59,8 @@ class TokenizationPipeline:
         # Step 1: Read data_synthesis results
         corpus_dataset = self.read_data_synthesis()
 
-        # DEBUG: Only use top 10000 samples for testing
-        # corpus_dataset = corpus_dataset.select(range(min(15000, len(corpus_dataset))))
+        # # DEBUG: Only use top 100000 samples for testing
+        # corpus_dataset = corpus_dataset.select(range(min(100000, len(corpus_dataset))))
         # logging.info(f"DEBUG: Using only {len(corpus_dataset)} samples for testing")
 
         # Step 2: Preprocess and refine tree_seq in corpus dataset
@@ -403,6 +403,13 @@ class TokenizationPipeline:
             batch_src_rel_pos = []
             # Target: cumulative positions from tokens
             batch_tgt_coords = []
+            # Per-sample coordinate stats for aggregation
+            batch_src_min_x, batch_src_max_x = [], []
+            batch_src_min_y, batch_src_max_y = [], []
+            batch_src_min_z, batch_src_max_z = [], []
+            batch_tgt_min_x, batch_tgt_max_x = [], []
+            batch_tgt_min_y, batch_tgt_max_y = [], []
+            batch_tgt_min_z, batch_tgt_max_z = [], []
 
             for i, (driver, loads, overlap_info, connected_info, relative_tree_seq) in enumerate(
                 zip(
@@ -436,8 +443,10 @@ class TokenizationPipeline:
                 except Exception as e:
                     logging.warning(f"Failed to extract source positions for sample {i}: {e}")
                     src_len = len(source_tokens.split())
-                    batch_src_abs_pos.append([SPECIAL_POS] * src_len)
-                    batch_src_rel_pos.append([SPECIAL_POS] * src_len)
+                    src_abs_pos = [SPECIAL_POS] * src_len
+                    src_rel_pos = [SPECIAL_POS] * src_len
+                    batch_src_abs_pos.append(src_abs_pos)
+                    batch_src_rel_pos.append(src_rel_pos)
 
                 # 2. Compute target positions from tokenized target tokens
                 try:
@@ -449,7 +458,31 @@ class TokenizationPipeline:
                 except Exception as e:
                     logging.warning(f"Failed to compute target coordinates for sample {i}: {e}")
                     tgt_len = len(target_tokens.split())
-                    batch_tgt_coords.append([SPECIAL_POS] * tgt_len)
+                    tgt_coords = [SPECIAL_POS] * tgt_len
+                    batch_tgt_coords.append(tgt_coords)
+
+                # 3. Compute per-sample min/max coordinates for aggregation
+                # src_abs_pos stats
+                src_xs = [p[0] for p in src_abs_pos if isinstance(p, (list, tuple)) and len(p) >= 3]
+                src_ys = [p[1] for p in src_abs_pos if isinstance(p, (list, tuple)) and len(p) >= 3]
+                src_zs = [p[2] for p in src_abs_pos if isinstance(p, (list, tuple)) and len(p) >= 3]
+                batch_src_min_x.append(min(src_xs) if src_xs else 0)
+                batch_src_max_x.append(max(src_xs) if src_xs else 0)
+                batch_src_min_y.append(min(src_ys) if src_ys else 0)
+                batch_src_max_y.append(max(src_ys) if src_ys else 0)
+                batch_src_min_z.append(min(src_zs) if src_zs else 0)
+                batch_src_max_z.append(max(src_zs) if src_zs else 0)
+
+                # tgt_coords stats
+                tgt_xs = [p[0] for p in tgt_coords if isinstance(p, (list, tuple)) and len(p) >= 3]
+                tgt_ys = [p[1] for p in tgt_coords if isinstance(p, (list, tuple)) and len(p) >= 3]
+                tgt_zs = [p[2] for p in tgt_coords if isinstance(p, (list, tuple)) and len(p) >= 3]
+                batch_tgt_min_x.append(min(tgt_xs) if tgt_xs else 0)
+                batch_tgt_max_x.append(max(tgt_xs) if tgt_xs else 0)
+                batch_tgt_min_y.append(min(tgt_ys) if tgt_ys else 0)
+                batch_tgt_max_y.append(max(tgt_ys) if tgt_ys else 0)
+                batch_tgt_min_z.append(min(tgt_zs) if tgt_zs else 0)
+                batch_tgt_max_z.append(max(tgt_zs) if tgt_zs else 0)
 
             return {
                 "source_tokens": batch_source_tokens,
@@ -457,6 +490,13 @@ class TokenizationPipeline:
                 "src_abs_pos": batch_src_abs_pos,
                 "src_rel_pos": batch_src_rel_pos,
                 "tgt_coords": batch_tgt_coords,
+                # Coordinate stats columns (temporary, for aggregation)
+                "_src_min_x": batch_src_min_x, "_src_max_x": batch_src_max_x,
+                "_src_min_y": batch_src_min_y, "_src_max_y": batch_src_max_y,
+                "_src_min_z": batch_src_min_z, "_src_max_z": batch_src_max_z,
+                "_tgt_min_x": batch_tgt_min_x, "_tgt_max_x": batch_tgt_max_x,
+                "_tgt_min_y": batch_tgt_min_y, "_tgt_max_y": batch_tgt_max_y,
+                "_tgt_min_z": batch_tgt_min_z, "_tgt_max_z": batch_tgt_max_z,
             }
 
         corpus_dataset = corpus_dataset.map(
@@ -518,6 +558,48 @@ class TokenizationPipeline:
             f"Median: {pc.approximate_median(target_lengths_array).as_py():.2f}, "
             f"95% Quantile: {pc.quantile(target_lengths_array, q=[0.95])[0].as_py():.2f}"
         )
+
+        # Compute max coordinates for src_abs_pos and tgt_coords using pyarrow (fast aggregation)
+        logging.info("=== MAX COORDINATE STATISTICS ===")
+        try:
+            # Aggregate min/max from temporary columns using pyarrow
+            min_src_abs_x = pc.min(table.column("_src_min_x")).as_py()
+            max_src_abs_x = pc.max(table.column("_src_max_x")).as_py()
+            min_src_abs_y = pc.min(table.column("_src_min_y")).as_py()
+            max_src_abs_y = pc.max(table.column("_src_max_y")).as_py()
+            min_src_abs_z = pc.min(table.column("_src_min_z")).as_py()
+            max_src_abs_z = pc.max(table.column("_src_max_z")).as_py()
+
+            min_tgt_x = pc.min(table.column("_tgt_min_x")).as_py()
+            max_tgt_x = pc.max(table.column("_tgt_max_x")).as_py()
+            min_tgt_y = pc.min(table.column("_tgt_min_y")).as_py()
+            max_tgt_y = pc.max(table.column("_tgt_max_y")).as_py()
+            min_tgt_z = pc.min(table.column("_tgt_min_z")).as_py()
+            max_tgt_z = pc.max(table.column("_tgt_max_z")).as_py()
+
+            logging.info("src_abs_pos coordinate range:")
+            logging.info(f"  X: min={min_src_abs_x}, max={max_src_abs_x}")
+            logging.info(f"  Y: min={min_src_abs_y}, max={max_src_abs_y}")
+            logging.info(f"  Z: min={min_src_abs_z}, max={max_src_abs_z}")
+            logging.info(f"  Max absolute value: {max(abs(max_src_abs_x), abs(min_src_abs_x), abs(max_src_abs_y), abs(min_src_abs_y), abs(max_src_abs_z), abs(min_src_abs_z))}")
+
+            logging.info("tgt_coords coordinate range:")
+            logging.info(f"  X: min={min_tgt_x}, max={max_tgt_x}")
+            logging.info(f"  Y: min={min_tgt_y}, max={max_tgt_y}")
+            logging.info(f"  Z: min={min_tgt_z}, max={max_tgt_z}")
+            logging.info(f"  Max absolute value: {max(abs(max_tgt_x), abs(min_tgt_x), abs(max_tgt_y), abs(min_tgt_y), abs(max_tgt_z), abs(min_tgt_z))}")
+
+            # Remove temporary coordinate stats columns
+            corpus_dataset = corpus_dataset.remove_columns([
+                "_src_min_x", "_src_max_x", "_src_min_y", "_src_max_y", "_src_min_z", "_src_max_z",
+                "_tgt_min_x", "_tgt_max_x", "_tgt_min_y", "_tgt_max_y", "_tgt_min_z", "_tgt_max_z",
+            ])
+        except Exception as e:
+            logging.warning(f"Failed to compute max coordinate statistics: {e}")
+            # Still try to remove temporary columns if they exist
+            temp_cols = [c for c in corpus_dataset.column_names if c.startswith("_")]
+            if temp_cols:
+                corpus_dataset = corpus_dataset.remove_columns(temp_cols)
 
         # Remove columns if needed
         if remove_columns:
