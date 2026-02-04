@@ -76,8 +76,8 @@ def load_components(
     target_split = dataset_config.validation_split
     dataset = load_corpus_dataset(dataset_config, split=target_split)
 
-    dataset = dataset.select(range(min(100, len(dataset))))
-    logging.info(f"DEBUG: Using only {len(dataset)} samples for evaluation")
+    # dataset = dataset.select(range(min(100, len(dataset))))
+    # logging.info(f"DEBUG: Using only {len(dataset)} samples for evaluation")
 
     tokenization_pipeline = TokenizationPipeline(config)
     dataset = tokenization_pipeline.preprocess_corpus(dataset)
@@ -383,6 +383,10 @@ def run_evaluation(config: FlowConfig):
     model, dataloader = accelerator.prepare(model, dataloader)
 
     # Configure generation parameters
+    # NOTE: use_cache=False is REQUIRED for LARA attention because:
+    # - LARA recomputes K,V from hidden_states each pass (no KV caching support)
+    # - With use_cache=True, HuggingFace passes only the last token's hidden_states
+    #   but attention_mask covers all tokens, causing shape mismatch in matmul
     model_generation_config = GenerationConfig(
         max_new_tokens=generation_config.max_new_tokens,
         num_beams=generation_config.num_beams,
@@ -396,6 +400,7 @@ def run_evaluation(config: FlowConfig):
         eos_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,
         decoder_start_token_id=tokenizer.bos_token_id,
+        use_cache=False,  # Required for LARA - no KV caching support
     )
 
     logging.info("🎯 Generation parameters:")
