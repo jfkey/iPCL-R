@@ -13,9 +13,9 @@
     },
     "tokenization": {
         "paths": {
-            "token_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_tokenization/token_dataset",
-            "tokenizer_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_tokenization/tokenizer",
-            "output_metadata_path": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_tokenization/output_metadata.json"
+            "token_dataset_dir": "/mnt/local_data1/liujunfeng/exp/universal_token/token_dataset",
+            "tokenizer_save_dir": "/mnt/local_data1/liujunfeng/exp/universal_token/tokenizer",
+            "output_metadata_path": "/mnt/local_data1/liujunfeng/exp/universal_token/output_metadata.json"
         },
         "workflow": {
             "tokenizer_algorithm": "DecimalWordLevel",
@@ -38,9 +38,9 @@
     },
     "training": {
         "paths": {
-            "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_training/split_dataset",
-            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_training/model",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_training/logs"
+            "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/split_dataset",
+            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/logs"
         },
         "model": {
             "hidden_size": 512,
@@ -75,12 +75,13 @@
             }
         },
         "hyperparameters": {
+            "quick_training": 0.01,
             "max_src_len": 128,
             "max_tgt_len": 256,
             "train_split_ratio": 0.9,
-            "num_train_epochs": 2,
-            "batch_size_per_device": 18,
-            "gradient_accumulation_steps": 10,
+            "num_train_epochs": 20,
+            "batch_size_per_device": 128,
+            "gradient_accumulation_steps": 1,
             "learning_rate": 0.0001,
             "weight_decay": 0.005,
             "warmup_ratio": 0.05,

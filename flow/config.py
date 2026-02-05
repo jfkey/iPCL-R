@@ -277,6 +277,7 @@ class TrainingModel:
 class TrainingHyperparameters:
     """Training hyperparameters configuration"""
 
+    quick_training: float = 0.01  # Ratio of data to use (1.0 = full data, 0.01 = 1%)
     max_src_len: int = 512
     max_tgt_len: int = 512
     train_split_ratio: float = 0.9

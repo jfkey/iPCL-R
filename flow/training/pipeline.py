@@ -110,18 +110,39 @@ class TrainingPipeline:
 
     def _load_or_create_dataset(self) -> Tuple[Dataset, Dataset]:
         """Split dataset into train and validation sets"""
-        split_dataset_dir = Path(self.paths_config.split_dataset_dir)
+        # Check if geometry-aware mode is enabled
+        use_geo = (
+            hasattr(self.model_config, 'geometric_config')
+            and (
+                self.model_config.geometric_config.enable_geometry_aware_pe
+                or self.model_config.geometric_config.enable_fourier_pe
+            )
+        )
+        split_dataset_dir = Path(self.paths_config.split_dataset_dir) 
+
+        if use_geo:
+            split_dataset_dir = split_dataset_dir.with_name(split_dataset_dir.name + "_geo")
+         
         if split_dataset_dir.exists():
             try:
                 logging.info(f"Loading pre-split dataset from {split_dataset_dir}")
 
                 with PartialState().main_process_first():
                     split_dataset = load_from_disk(split_dataset_dir)
+  
                 train_dataset = split_dataset["train"]
                 eval_dataset = split_dataset["test"]
                 logging.info(
                     f"Loaded split dataset: {len(train_dataset)} train, {len(eval_dataset)} eval"
                 )
+                # Quick training: use a ratio of samples for fast validation
+                quick_ratio = getattr(self.hyperparameters_config, 'quick_training', 1.0)
+                if quick_ratio < 1.0:
+                    train_size = max(1, int(len(train_dataset) * quick_ratio))
+                    eval_size = max(1, int(len(eval_dataset) * quick_ratio))
+                    train_dataset = train_dataset.select(range(train_size))
+                    eval_dataset = eval_dataset.select(range(eval_size))
+                    logging.info(f"[Quick training] Using {quick_ratio*100:.1f}% data: {len(train_dataset)} train, {len(eval_dataset)} eval")
                 return train_dataset, eval_dataset
             except Exception as e:
                 logging.warning(
@@ -136,15 +157,7 @@ class TrainingPipeline:
             logging.info(
                 f"Splitting dataset (ratio: {self.hyperparameters_config.train_split_ratio})"
             )
-
-        # Check if geometry-aware mode is enabled
-        use_geo = (
-            hasattr(self.model_config, 'geometric_config')
-            and (
-                self.model_config.geometric_config.enable_geometry_aware_pe
-                or self.model_config.geometric_config.enable_fourier_pe
-            )
-        )
+ 
 
         # Check if pre-computed positions are available in the dataset
         # New format: src_abs_pos, src_rel_pos, tgt_coords
@@ -252,11 +265,20 @@ class TrainingPipeline:
             f"Dataset split: {len(train_dataset)} train, {len(eval_dataset)} eval"
         )
 
-        # Save split datasets if configured
+        # Quick training: use a ratio of samples for fast validation
+        quick_ratio = getattr(self.hyperparameters_config, 'quick_training', 1.0)
+        if quick_ratio < 1.0:
+            train_size = max(1, int(len(train_dataset) * quick_ratio))
+            eval_size = max(1, int(len(eval_dataset) * quick_ratio))
+            train_dataset = train_dataset.select(range(train_size))
+            eval_dataset = eval_dataset.select(range(eval_size))
+            logging.info(f"[Quick training] Using {quick_ratio*100:.1f}% data: {len(train_dataset)} train, {len(eval_dataset)} eval")
+
+        # Save split datasets if configured (use the geo-aware path if applicable)
         if self.accelerator.is_main_process and self.paths_config.split_dataset_dir:
-            split_dataset.save_to_disk(self.paths_config.split_dataset_dir)
+            split_dataset.save_to_disk(str(split_dataset_dir))
             logging.info(
-                f"Saved split dataset to {self.paths_config.split_dataset_dir}"
+                f"Saved split dataset to {split_dataset_dir}"
             )
 
         self.accelerator.wait_for_everyone()
@@ -432,6 +454,7 @@ class TrainingPipeline:
             # Evaluation and saving
             eval_strategy=self.hyperparameters_config.eval_strategy,
             save_strategy=self.hyperparameters_config.save_strategy,
+            # average_tokens_across_devices= True,
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             greater_is_better=False,
@@ -446,8 +469,7 @@ class TrainingPipeline:
             dataloader_num_workers=self.performance_config.dataloader_num_workers,
             dataloader_pin_memory=self.performance_config.dataloader_pin_memory,
             # Mixed precision and optimization
-            # fp16=torch.cuda.is_available(),
-            fp16 =False, 
+            fp16=torch.cuda.is_available(),
             report_to=["tensorboard"],
             # Reproducibility
             seed=self.hyperparameters_config.seed,
