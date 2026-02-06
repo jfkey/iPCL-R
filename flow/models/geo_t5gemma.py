@@ -49,6 +49,9 @@ from .geometric_attention import (
     CrossLARAAttention,
 )
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class GeoConfig:
@@ -945,17 +948,37 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         if self.encoder_geo_pe is not None:
             if abs_positions is None or rel_positions is None:
                 return inputs_embeds
+            # DEBUG: Log dtypes before geo_pe
+            logger.debug(f"[GeoT5Gemma] Before encoder_geo_pe: inputs_embeds.dtype={inputs_embeds.dtype}, "
+                        f"abs_positions.dtype={abs_positions.dtype}, rel_positions.dtype={rel_positions.dtype}")
             # GeometryAwarePositionEmbedding expects (abs_pos, rel_pos)
+            # Note: Module handles dtype internally for fp16 compatibility
             geo_embeds = self.encoder_geo_pe(
-                abs_positions.float(),
-                rel_positions.float(),
+                abs_positions,
+                rel_positions,
                 attention_mask
             )
+            # DEBUG: Log dtypes after geo_pe
+            logger.debug(f"[GeoT5Gemma] After encoder_geo_pe: geo_embeds.dtype={geo_embeds.dtype}")
+            # Ensure dtype matches inputs_embeds (critical for fp16 training)
+            if geo_embeds.dtype != inputs_embeds.dtype:
+                logger.debug(f"[GeoT5Gemma] Converting geo_embeds from {geo_embeds.dtype} to {inputs_embeds.dtype}")
+                geo_embeds = geo_embeds.to(inputs_embeds.dtype)
             return inputs_embeds + geo_embeds
 
         # Case 2: Simple Fourier Position Embedding
         if self.encoder_fourier_pe is not None and abs_positions is not None:
-            geo_embeds = self.encoder_fourier_pe(abs_positions.float(), attention_mask)
+            # DEBUG: Log dtypes before fourier_pe
+            logger.debug(f"[GeoT5Gemma] Before encoder_fourier_pe: inputs_embeds.dtype={inputs_embeds.dtype}, "
+                        f"abs_positions.dtype={abs_positions.dtype}")
+            # Note: Module handles dtype internally for fp16 compatibility
+            geo_embeds = self.encoder_fourier_pe(abs_positions, attention_mask)
+            # DEBUG: Log dtypes after fourier_pe
+            logger.debug(f"[GeoT5Gemma] After encoder_fourier_pe: geo_embeds.dtype={geo_embeds.dtype}")
+            # Ensure dtype matches inputs_embeds (critical for fp16 training)
+            if geo_embeds.dtype != inputs_embeds.dtype:
+                logger.debug(f"[GeoT5Gemma] Converting geo_embeds from {geo_embeds.dtype} to {inputs_embeds.dtype}")
+                geo_embeds = geo_embeds.to(inputs_embeds.dtype)
             return inputs_embeds + geo_embeds
 
         return inputs_embeds
@@ -1060,15 +1083,18 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         # Get token embeddings if not provided
         if inputs_embeds is None and input_ids is not None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
+            logger.debug(f"[GeoT5Gemma.forward] After get_input_embeddings: inputs_embeds.dtype={inputs_embeds.dtype}")
 
         # Add position embeddings to encoder inputs
         if inputs_embeds is not None:
+            logger.debug(f"[GeoT5Gemma.forward] Before _add_encoder_geometric_embeddings: inputs_embeds.dtype={inputs_embeds.dtype}")
             inputs_embeds = self._add_encoder_geometric_embeddings(
                 inputs_embeds,
                 encoder_abs_positions,
                 encoder_rel_positions,
                 attention_mask,
             )
+            logger.debug(f"[GeoT5Gemma.forward] After _add_encoder_geometric_embeddings: inputs_embeds.dtype={inputs_embeds.dtype}")
 
         # Get decoder token embeddings if needed
         if decoder_inputs_embeds is None and decoder_input_ids is not None:
@@ -1086,6 +1112,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         # If encoder_outputs not cached, call encoder explicitly
         encoder = self.get_encoder()
         if encoder_outputs is None:
+            logger.debug(f"[GeoT5Gemma.forward] Before encoder: inputs_embeds.dtype={inputs_embeds.dtype if inputs_embeds is not None else None}")
             if isinstance(encoder, GeoT5GemmaEncoder):
                 # GeoT5GemmaEncoder - pass coordinates for LARA
                 encoder_outputs = encoder(
@@ -1105,6 +1132,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                     output_attentions=output_attentions,
                     output_hidden_states=output_hidden_states,
                 )
+            logger.debug(f"[GeoT5Gemma.forward] After encoder: encoder_outputs[0].dtype={encoder_outputs[0].dtype}")
 
         # === KEY FIX: Call decoder explicitly if using GeoT5GemmaDecoder ===
         # The base class forward doesn't pass decoder_coordinates through,

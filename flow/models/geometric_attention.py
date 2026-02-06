@@ -20,11 +20,22 @@
 """
 
 import math
+import logging
 from typing import Optional, Tuple, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
+
+
+def check_dtype_match(tensor1, tensor2, name1="tensor1", name2="tensor2", context=""):
+    """检查两个张量的 dtype 是否匹配，如果不匹配则打印警告"""
+    if tensor1.dtype != tensor2.dtype:
+        logger.warning(f"[DTYPE MISMATCH] {context}: {name1}.dtype={tensor1.dtype}, {name2}.dtype={tensor2.dtype}")
+        return False
+    return True
 
 
 def rotate_half(x):
@@ -256,10 +267,13 @@ class GeometricPositionEmbedding(nn.Module):
             Tuple of (query_rotated, key_rotated) with same shapes as input
         """
         batch_size, num_heads, seq_len, head_dim = query.shape
+        # Store original dtype for fp16 compatibility
+        input_dtype = query.dtype
 
         # Handle shape mismatches between query and coordinates
         # This can happen during beam search (batch expansion) or incremental decoding (seq_len mismatch)
-        coords = coordinates.float()
+        # Keep coordinates in same dtype as query for consistency
+        coords = coordinates.to(query.dtype)
         coord_batch, coord_seq, _ = coords.shape
 
         # Handle batch dimension mismatch (beam search expands batch by num_beams)
@@ -292,10 +306,11 @@ class GeometricPositionEmbedding(nn.Module):
 
         # Compute phases for each sub-vector
         # theta = position × frequency
-        # inv_freq: (num_subvectors,)
-        theta_x = torch.einsum('bt,f->btf', x_pos, self.inv_freq)  # (B, T, num_subvectors)
-        theta_y = torch.einsum('bt,f->btf', y_pos, self.inv_freq)
-        theta_z = torch.einsum('bt,f->btf', z_pos, self.inv_freq)
+        # inv_freq: (num_subvectors,) - cast to input dtype for fp16 compatibility
+        inv_freq = self.inv_freq.to(input_dtype)
+        theta_x = torch.einsum('bt,f->btf', x_pos, inv_freq)  # (B, T, num_subvectors)
+        theta_y = torch.einsum('bt,f->btf', y_pos, inv_freq)
+        theta_z = torch.einsum('bt,f->btf', z_pos, inv_freq)
 
         # Compute symmetric quaternion for each position
         w, qx, qy, qz = self.compute_quaternion(theta_x, theta_y, theta_z)
@@ -334,7 +349,8 @@ class GeometricPositionEmbedding(nn.Module):
             query_rotated = torch.cat([query_rotated, query_remainder], dim=-1)
             key_rotated = torch.cat([key_rotated, key_remainder], dim=-1)
 
-        return query_rotated, key_rotated
+        # Cast back to input dtype for fp16 compatibility
+        return query_rotated.to(input_dtype), key_rotated.to(input_dtype)
 
 
 class LieAlgebraRelativeAttention(nn.Module):
@@ -417,6 +433,7 @@ class LieAlgebraRelativeAttention(nn.Module):
     def compute_geometric_bias(
         self,
         coordinates: torch.Tensor,
+        target_dtype: torch.dtype = None,
     ) -> torch.Tensor:
         """
         Compute attention bias based on 3D relative displacements.
@@ -428,11 +445,21 @@ class LieAlgebraRelativeAttention(nn.Module):
 
         Args:
             coordinates: 3D coordinates (batch, seq_len, 3)
+            target_dtype: Target dtype for output (for fp16 compatibility)
 
         Returns:
             Attention bias (batch, num_heads, seq_len, seq_len)
         """
         batch_size, seq_len, _ = coordinates.shape
+        if target_dtype is None:
+            target_dtype = coordinates.dtype
+
+        # Get MLP weight dtype for fp16 compatibility
+        mlp_weight_dtype = self.geo_bias_mlp[0].weight.dtype
+
+        # Convert coordinates to MLP dtype BEFORE computing rel_disp
+        # This prevents dtype mismatch in fp16 training
+        coordinates = coordinates.to(mlp_weight_dtype)
 
         # Compute pairwise relative displacement
         # Δp_ij = p_i - p_j for all pairs
@@ -441,12 +468,17 @@ class LieAlgebraRelativeAttention(nn.Module):
         rel_disp = coords_i - coords_j       # (B, T, T, 3)
 
         # Scale relative displacement
-        rel_disp = rel_disp.float() * self.coord_scale
+        # Now rel_disp is already in mlp_weight_dtype
+        rel_disp = rel_disp * self.coord_scale
 
         # MLP to compute per-head bias
+        # Note: geo_bias_mlp weights may be fp16 in mixed precision training
         bias = self.geo_bias_mlp(rel_disp)  # (B, T, T, num_heads)
         bias = bias.permute(0, 3, 1, 2)      # (B, num_heads, T, T)
 
+        # Cast to target dtype if needed
+        if target_dtype is not None and bias.dtype != target_dtype:
+            bias = bias.to(target_dtype)
         return bias
 
     def forward(
@@ -474,6 +506,16 @@ class LieAlgebraRelativeAttention(nn.Module):
             Tuple of (output,) or (output, attention_weights)
         """
         batch_size, seq_len, _ = hidden_states.shape
+
+        # DEBUG: Log input dtypes
+        logger.debug(f"[LARA.forward] hidden_states.dtype={hidden_states.dtype}, "
+                    f"coordinates.dtype={coordinates.dtype}, q_proj.weight.dtype={self.q_proj.weight.dtype}")
+
+        # Check dtype match before Linear calls
+        if hidden_states.dtype != self.q_proj.weight.dtype:
+            logger.warning(f"[LARA.forward] DTYPE MISMATCH! hidden_states.dtype={hidden_states.dtype}, "
+                          f"q_proj.weight.dtype={self.q_proj.weight.dtype}. Converting hidden_states.")
+            hidden_states = hidden_states.to(self.q_proj.weight.dtype)
 
         # Project to Q, K, V
         query = self.q_proj(hidden_states).view(
@@ -505,7 +547,7 @@ class LieAlgebraRelativeAttention(nn.Module):
 
         # Add geometric bias
         if self.use_geometric_bias:
-            geo_bias = self.compute_geometric_bias(coordinates)
+            geo_bias = self.compute_geometric_bias(coordinates, target_dtype=attn_scores.dtype)
             attn_scores = attn_scores + geo_bias
 
         # Apply attention mask (additive mask format: 0=valid, large_negative=invalid)
@@ -666,6 +708,10 @@ class T5GemmaLARAAttention(nn.Module):
         # LARA now expects 4D additive mask for direct addition to attn_scores
         # Keep 4D format, no squeeze needed
 
+        # DEBUG: Log dtypes before LARA call
+        logger.debug(f"[T5GemmaLARA] layer_idx={self.layer_idx}, hidden_states.dtype={hidden_states.dtype}, "
+                    f"coordinates.dtype={coordinates.dtype}")
+
         # Call LARA forward with both RoPE and GeoPE
         # Rotation order: RoPE (sequence position) → GeoPE (3D geometry)
         lara_output = self.lara(
@@ -782,6 +828,7 @@ class CrossLARAAttention(nn.Module):
         self,
         query_coords: torch.Tensor,
         key_coords: torch.Tensor,
+        target_dtype: torch.dtype = None,
     ) -> torch.Tensor:
         """
         Compute geometric bias for cross-attention.
@@ -789,12 +836,23 @@ class CrossLARAAttention(nn.Module):
         Args:
             query_coords: Decoder coordinates (batch, query_len, 3)
             key_coords: Encoder coordinates (batch, key_len, 3)
+            target_dtype: Target dtype for output (for fp16 compatibility)
 
         Returns:
             Geometric bias (batch, num_heads, query_len, key_len)
         """
         batch_size, query_len, _ = query_coords.shape
         _, key_len, _ = key_coords.shape
+        if target_dtype is None:
+            target_dtype = query_coords.dtype
+
+        # Get MLP weight dtype for fp16 compatibility
+        mlp_weight_dtype = self.geo_bias_mlp[0].weight.dtype
+
+        # Convert coordinates to MLP dtype BEFORE computing rel_disp
+        # This prevents dtype mismatch in fp16 training
+        query_coords = query_coords.to(mlp_weight_dtype)
+        key_coords = key_coords.to(mlp_weight_dtype)
 
         # Compute pairwise relative displacement
         # Δp_ij = query_i - key_j
@@ -802,13 +860,17 @@ class CrossLARAAttention(nn.Module):
         k_coords = key_coords.unsqueeze(1)    # (batch, 1, key_len, 3)
         rel_disp = q_coords - k_coords         # (batch, query_len, key_len, 3)
 
-        # Scale
-        rel_disp = rel_disp.float() * self.coord_scale
+        # Scale (now rel_disp is already in mlp_weight_dtype)
+        rel_disp = rel_disp * self.coord_scale
 
         # MLP to compute per-head bias
+        # Note: geo_bias_mlp weights may be fp16 in mixed precision training
         bias = self.geo_bias_mlp(rel_disp)  # (batch, query_len, key_len, num_heads)
         bias = bias.permute(0, 3, 1, 2)      # (batch, num_heads, query_len, key_len)
 
+        # Cast to target dtype if needed
+        if target_dtype is not None and bias.dtype != target_dtype:
+            bias = bias.to(target_dtype)
         return bias
 
     def forward(
@@ -839,6 +901,21 @@ class CrossLARAAttention(nn.Module):
         """
         batch_size, query_len, _ = hidden_states.shape
         _, key_len, _ = encoder_hidden_states.shape
+
+        # DEBUG: Log input dtypes
+        logger.debug(f"[CrossLARA.forward] hidden_states.dtype={hidden_states.dtype}, "
+                    f"encoder_hidden_states.dtype={encoder_hidden_states.dtype}, "
+                    f"q_proj.weight.dtype={self.q_proj.weight.dtype}")
+
+        # Check dtype match before Linear calls
+        if hidden_states.dtype != self.q_proj.weight.dtype:
+            logger.warning(f"[CrossLARA.forward] DTYPE MISMATCH! hidden_states.dtype={hidden_states.dtype}, "
+                          f"q_proj.weight.dtype={self.q_proj.weight.dtype}. Converting hidden_states.")
+            hidden_states = hidden_states.to(self.q_proj.weight.dtype)
+        if encoder_hidden_states.dtype != self.k_proj.weight.dtype:
+            logger.warning(f"[CrossLARA.forward] DTYPE MISMATCH! encoder_hidden_states.dtype={encoder_hidden_states.dtype}, "
+                          f"k_proj.weight.dtype={self.k_proj.weight.dtype}. Converting encoder_hidden_states.")
+            encoder_hidden_states = encoder_hidden_states.to(self.k_proj.weight.dtype)
 
         # Validate coordinates
         if query_coordinates is None or key_coordinates is None:
@@ -877,7 +954,7 @@ class CrossLARAAttention(nn.Module):
         # Add geometric bias
         if self.use_geometric_bias:
             geo_bias = self.compute_cross_geometric_bias(
-                query_coordinates, key_coordinates
+                query_coordinates, key_coordinates, target_dtype=attn_scores.dtype
             )
             attn_scores = attn_scores + geo_bias
 
