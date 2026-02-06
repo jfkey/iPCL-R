@@ -27,15 +27,12 @@
 """
 
 import math
-import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-logger = logging.getLogger(__name__)
 
 
 class FourierPositionEmbedding(nn.Module):
@@ -165,10 +162,6 @@ class FourierPositionEmbedding(nn.Module):
         # Get model dtype from output_proj weights (may be fp16 in mixed precision)
         model_dtype = self.output_proj.weight.dtype
 
-        # DEBUG: Log dtypes
-        logger.debug(f"[FourierPE] input_dtype={input_dtype}, model_dtype={model_dtype}, "
-                    f"output_proj.weight.dtype={self.output_proj.weight.dtype}")
-
         # Scale coordinates to reasonable range
         # Chip coordinates can be millions; scaling to ~1.0 range helps stability
         # Use model dtype for compatibility with learnable parameters
@@ -191,9 +184,6 @@ class FourierPositionEmbedding(nn.Module):
         # Apply learnable coefficients (Fourier series mixing)
         if self.learnable_coefficients:
             if self.separate_basis:
-                # DEBUG: Log coefficient dtypes
-                logger.debug(f"[FourierPE] sin_coef.dtype={self.sin_coef.dtype}, cos_coef.dtype={self.cos_coef.dtype}, "
-                            f"phase_x.dtype={phase_x.dtype}")
                 # Normalize coefficients to prevent explosion
                 sin_coef_norm = self.sin_coef / (
                     self.sin_coef.sum(dim=0, keepdim=True).clamp(min=1e-6)
@@ -232,14 +222,8 @@ class FourierPositionEmbedding(nn.Module):
             sin_x, cos_x, sin_y, cos_y, sin_z, cos_z
         ], dim=-1)  # (B, T, 6 * num_freq)
 
-        # DEBUG: Log before output_proj
-        logger.debug(f"[FourierPE] Before output_proj: fourier_features.dtype={fourier_features.dtype}, "
-                    f"output_proj.weight.dtype={self.output_proj.weight.dtype}")
-
         # Check dtype match before Linear call
         if fourier_features.dtype != self.output_proj.weight.dtype:
-            logger.warning(f"[FourierPE] DTYPE MISMATCH! fourier_features.dtype={fourier_features.dtype}, "
-                          f"output_proj.weight.dtype={self.output_proj.weight.dtype}. Converting.")
             fourier_features = fourier_features.to(self.output_proj.weight.dtype)
 
         # Project to hidden_size
@@ -691,31 +675,23 @@ class GeometryAwarePositionEmbedding(nn.Module):
         # Get model dtype from fusion_mlp weights (may be fp16 in mixed precision)
         model_dtype = self.fusion_mlp[0].weight.dtype
 
-        # DEBUG: Log input and model dtypes
-        logger.debug(f"[GeoPE] Input abs_pos.dtype={abs_pos.dtype}, rel_pos.dtype={rel_pos.dtype}, "
-                    f"model_dtype={model_dtype}")
-
         # Convert inputs to model dtype for compatibility with learnable parameters
         abs_pos = abs_pos.to(model_dtype)
         rel_pos = rel_pos.to(model_dtype)
 
         # 1. XY Absolute Fourier Embedding
         xy_abs_emb = self.xy_fourier(abs_pos)  # (B, T, d_xy)
-        logger.debug(f"[GeoPE] xy_abs_emb.dtype={xy_abs_emb.dtype}")
 
         # 2. Metal Layer Embedding
         metal_layer = abs_pos[..., 2]  # (B, T)
         layer_emb = self.layer_embed(metal_layer)  # (B, T, d_m)
-        logger.debug(f"[GeoPE] layer_emb.dtype={layer_emb.dtype}")
 
         # 3. XY Relative Polar Embedding
         polar_rel_emb = self.polar_rel(rel_pos)  # (B, T, d_rel)
-        logger.debug(f"[GeoPE] polar_rel_emb.dtype={polar_rel_emb.dtype}")
 
         # 4. Layer Delta Embedding
         delta_m = rel_pos[..., 2]  # (B, T)
         layer_delta_emb = self.layer_delta(delta_m)  # (B, T, d_Δm)
-        logger.debug(f"[GeoPE] layer_delta_emb.dtype={layer_delta_emb.dtype}")
 
         # Concatenate all embeddings (ensure same dtype)
         combined = torch.cat([
@@ -725,14 +701,8 @@ class GeometryAwarePositionEmbedding(nn.Module):
             layer_delta_emb.to(model_dtype),
         ], dim=-1)  # (B, T, total_input_dim)
 
-        # DEBUG: Log before MLP
-        logger.debug(f"[GeoPE] Before fusion_mlp: combined.dtype={combined.dtype}, "
-                    f"fusion_mlp[0].weight.dtype={self.fusion_mlp[0].weight.dtype}")
-
         # Check dtype match before MLP call
         if combined.dtype != self.fusion_mlp[0].weight.dtype:
-            logger.warning(f"[GeoPE] DTYPE MISMATCH! combined.dtype={combined.dtype}, "
-                          f"fusion_mlp[0].weight.dtype={self.fusion_mlp[0].weight.dtype}. Converting.")
             combined = combined.to(self.fusion_mlp[0].weight.dtype)
 
         # MLP Fusion

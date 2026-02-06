@@ -20,22 +20,12 @@
 """
 
 import math
-import logging
 from typing import Optional, Tuple, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-logger = logging.getLogger(__name__)
-
-
-def check_dtype_match(tensor1, tensor2, name1="tensor1", name2="tensor2", context=""):
-    """检查两个张量的 dtype 是否匹配，如果不匹配则打印警告"""
-    if tensor1.dtype != tensor2.dtype:
-        logger.warning(f"[DTYPE MISMATCH] {context}: {name1}.dtype={tensor1.dtype}, {name2}.dtype={tensor2.dtype}")
-        return False
-    return True
 
 
 def rotate_half(x):
@@ -507,14 +497,8 @@ class LieAlgebraRelativeAttention(nn.Module):
         """
         batch_size, seq_len, _ = hidden_states.shape
 
-        # DEBUG: Log input dtypes
-        logger.debug(f"[LARA.forward] hidden_states.dtype={hidden_states.dtype}, "
-                    f"coordinates.dtype={coordinates.dtype}, q_proj.weight.dtype={self.q_proj.weight.dtype}")
-
         # Check dtype match before Linear calls
         if hidden_states.dtype != self.q_proj.weight.dtype:
-            logger.warning(f"[LARA.forward] DTYPE MISMATCH! hidden_states.dtype={hidden_states.dtype}, "
-                          f"q_proj.weight.dtype={self.q_proj.weight.dtype}. Converting hidden_states.")
             hidden_states = hidden_states.to(self.q_proj.weight.dtype)
 
         # Project to Q, K, V
@@ -708,10 +692,6 @@ class T5GemmaLARAAttention(nn.Module):
         # LARA now expects 4D additive mask for direct addition to attn_scores
         # Keep 4D format, no squeeze needed
 
-        # DEBUG: Log dtypes before LARA call
-        logger.debug(f"[T5GemmaLARA] layer_idx={self.layer_idx}, hidden_states.dtype={hidden_states.dtype}, "
-                    f"coordinates.dtype={coordinates.dtype}")
-
         # Call LARA forward with both RoPE and GeoPE
         # Rotation order: RoPE (sequence position) → GeoPE (3D geometry)
         lara_output = self.lara(
@@ -902,19 +882,10 @@ class CrossLARAAttention(nn.Module):
         batch_size, query_len, _ = hidden_states.shape
         _, key_len, _ = encoder_hidden_states.shape
 
-        # DEBUG: Log input dtypes
-        logger.debug(f"[CrossLARA.forward] hidden_states.dtype={hidden_states.dtype}, "
-                    f"encoder_hidden_states.dtype={encoder_hidden_states.dtype}, "
-                    f"q_proj.weight.dtype={self.q_proj.weight.dtype}")
-
         # Check dtype match before Linear calls
         if hidden_states.dtype != self.q_proj.weight.dtype:
-            logger.warning(f"[CrossLARA.forward] DTYPE MISMATCH! hidden_states.dtype={hidden_states.dtype}, "
-                          f"q_proj.weight.dtype={self.q_proj.weight.dtype}. Converting hidden_states.")
             hidden_states = hidden_states.to(self.q_proj.weight.dtype)
         if encoder_hidden_states.dtype != self.k_proj.weight.dtype:
-            logger.warning(f"[CrossLARA.forward] DTYPE MISMATCH! encoder_hidden_states.dtype={encoder_hidden_states.dtype}, "
-                          f"k_proj.weight.dtype={self.k_proj.weight.dtype}. Converting encoder_hidden_states.")
             encoder_hidden_states = encoder_hidden_states.to(self.k_proj.weight.dtype)
 
         # Validate coordinates
