@@ -421,7 +421,7 @@ def run_evaluation(config: FlowConfig):
         if generation_config.num_beams > 1:
             logging.warning("⚠️  LARA attention does not support KV caching.")
             logging.warning("   With beam search (num_beams > 1), LARA decoder may not work optimally.")
-            logging.warning("   Consider setting num_beams=1 for LARA models, or disable LARA (enable_geometric_attention=False).")
+            logging.warning("   Consider setting num_beams=1 for LARA models, or disable LARA (use_geo_self_attn=False).")
     else:
         logging.info("   Coordinate tracking: Disabled (model uses standard attention)")
         logging.info("   Note: Encoder position embeddings are still used for geometry-aware input")

@@ -216,15 +216,15 @@ class GeometricEmbeddingConfig:
 
     LARA (Lie Algebra Relative Attention) Configuration:
     - Encoder: Standard Attention (enable_encoder_lara=False, default)
-    - Decoder Self-Attention: LARA (enable_geometric_attention=True)
-    - Cross-Attention: LARA (enable_geometric_cross_attention=True)
+    - Decoder Self-Attention: LARA (use_geo_self_attn=True)
+    - Cross-Attention: LARA (use_geo_cross_attn=True)
     """
 
     # Enable flags
-    enable_fourier_pe: bool = False  # Simple 3D Fourier PE (deprecated)
-    enable_geometry_aware_pe: bool = True  # Advanced Geometry-Aware PE (recommended)
-    enable_geometric_attention: bool = False  # LARA for Decoder Self-Attention
-    enable_geometric_cross_attention: bool = False  # LARA for Cross-Attention
+    use_basic_fourier_pe: bool = False  # Simple 3D Fourier PE (deprecated)
+    use_advanced_geo_pe: bool = True  # Advanced Geometry-Aware PE (recommended)
+    use_geo_self_attn: bool = False  # LARA for Decoder Self-Attention
+    use_geo_cross_attn: bool = False  # LARA for Cross-Attention
     enable_encoder_lara: bool = False  # LARA for Encoder (usually not recommended)
 
     # Coordinate scaling

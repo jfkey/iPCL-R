@@ -68,9 +68,9 @@ class GeoConfig:
     - Other tokens: Zero position embedding
 
     Attributes:
-        enable_fourier_pe: Whether to use simple Fourier Position Embedding
-        enable_geometry_aware_pe: Whether to use advanced Geometry-Aware PE (overrides enable_fourier_pe)
-        enable_geometric_attention: Whether to use LARA geometric attention
+        use_basic_fourier_pe: Whether to use simple Fourier Position Embedding
+        use_advanced_geo_pe: Whether to use advanced Geometry-Aware PE (overrides use_basic_fourier_pe)
+        use_geo_self_attn: Whether to use LARA geometric attention
         coord_scale: Scaling factor for coordinates (chip coords are large)
         num_frequencies: Number of frequency bands for Fourier embedding
         num_harmonics: Number of circular harmonics for direction encoding
@@ -88,10 +88,10 @@ class GeoConfig:
     """
 
     # General settings
-    enable_fourier_pe: bool = False  # Simple 3D Fourier (deprecated)
-    enable_geometry_aware_pe: bool = True  # Advanced Geometry-Aware PE (recommended)
-    enable_geometric_attention: bool = False  # Enable LARA for decoder self-attention
-    enable_geometric_cross_attention: bool = False  # Enable LARA for cross-attention
+    use_basic_fourier_pe: bool = False  # Simple 3D Fourier (deprecated)
+    use_advanced_geo_pe: bool = True  # Advanced Geometry-Aware PE (recommended)
+    use_geo_self_attn: bool = False  # Enable LARA for decoder self-attention
+    use_geo_cross_attn: bool = False  # Enable LARA for cross-attention
     enable_encoder_lara: bool = False  # Enable LARA for encoder (usually not recommended)
     coord_scale: float = 1e-5  # Smaller scale for large chip coordinates
 
@@ -158,21 +158,21 @@ class GeoT5GemmaEncoderLayer(T5GemmaEncoderLayer):
     Args:
         config: T5GemmaConfig or T5GemmaModuleConfig
         layer_idx: Layer index in the encoder
-        enable_geometric_attention: Whether to use LARA instead of standard attention
+        use_geo_self_attn: Whether to use LARA instead of standard attention
     """
 
     def __init__(
         self,
         config,
         layer_idx: int,
-        enable_geometric_attention: bool = False,
+        use_geo_self_attn: bool = False,
         geo_config_dict: Optional[Dict[str, Any]] = None,
     ):
         # Initialize base layer (creates standard self_attn)
         super().__init__(config, layer_idx)
 
         # Replace self-attention with LARA if enabled
-        if enable_geometric_attention:
+        if use_geo_self_attn:
             # Get geometric config parameters
             if geo_config_dict is None:
                 geo_config_dict = {}
@@ -277,14 +277,14 @@ class GeoT5GemmaEncoder(T5GemmaEncoder):
 
         # Create custom encoder layers with optional LARA support
         geo_config_dict = getattr(self._full_config, 'geometric_config', {})
-        enable_geo_attn = geo_config_dict.get('enable_geometric_attention', False)
+        enable_geo_attn = geo_config_dict.get('use_geo_self_attn', False)
 
         # Pass encoder_config to layers (not the full config)
         self.layers = nn.ModuleList([
             GeoT5GemmaEncoderLayer(
                 encoder_config,  # Pass encoder_config, not full config
                 layer_idx=layer_idx,
-                enable_geometric_attention=enable_geo_attn,
+                use_geo_self_attn=enable_geo_attn,
                 geo_config_dict=geo_config_dict,  # Pass geo_config_dict
             )
             for layer_idx in range(encoder_config.num_hidden_layers)
@@ -433,7 +433,7 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
         config,
         layer_idx: int,
         enable_geometric_self_attention: bool = False,
-        enable_geometric_cross_attention: bool = False,
+        use_geo_cross_attn: bool = False,
         geo_config_dict: Optional[Dict[str, Any]] = None,
     ):
         # Initialize base layer
@@ -453,7 +453,7 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
             )
 
         # Replace cross-attention with CrossLARAAttention if enabled
-        if enable_geometric_cross_attention:
+        if use_geo_cross_attn:
             self.cross_attn = CrossLARAAttention(
                 config,
                 layer_idx=layer_idx,
@@ -521,8 +521,8 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
                     output_attentions=output_attentions,
                 )
             else:
-                # Standard cross-attention
-                hidden_states, cross_attn_weights, _ = self.cross_attn(
+                # Standard cross-attention (returns 2 values, not 3)
+                hidden_states, cross_attn_weights = self.cross_attn(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=encoder_attention_mask,
@@ -581,15 +581,15 @@ class GeoT5GemmaDecoder(T5GemmaDecoder):
 
         # Create custom decoder layers with optional LARA
         geo_config_dict = getattr(self._full_config, 'geometric_config', {})
-        enable_geo_self_attn = geo_config_dict.get('enable_geometric_attention', False)
-        enable_geo_cross_attn = geo_config_dict.get('enable_geometric_cross_attention', False)
+        enable_geo_self_attn = geo_config_dict.get('use_geo_self_attn', False)
+        enable_geo_cross_attn = geo_config_dict.get('use_geo_cross_attn', False)
 
         self.layers = nn.ModuleList([
             GeoT5GemmaDecoderLayer(
                 decoder_config,
                 layer_idx=layer_idx,
                 enable_geometric_self_attention=enable_geo_self_attn,
-                enable_geometric_cross_attention=enable_geo_cross_attn,
+                use_geo_cross_attn=enable_geo_cross_attn,
                 geo_config_dict=geo_config_dict,
             )
             for layer_idx in range(decoder_config.num_hidden_layers)
@@ -813,7 +813,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
     Example:
         >>> from transformers import T5GemmaConfig
         >>> config = T5GemmaConfig(hidden_size=256, num_hidden_layers=4)
-        >>> geo_config = GeoConfig(enable_geometry_aware_pe=True)
+        >>> geo_config = GeoConfig(use_advanced_geo_pe=True)
         >>> model = GeoT5GemmaForConditionalGeneration(config, geo_config)
         >>>
         >>> # Forward pass with coordinates
@@ -848,7 +848,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
 
         # Replace encoder/decoder with Geo versions if LARA is enabled
         # Note: T5GemmaForConditionalGeneration stores encoder/decoder in self.model
-        if self.geo_config.enable_geometric_attention:
+        if self.geo_config.use_geo_self_attn:
             # Encoder: only use LARA if explicitly enabled for encoder
             # (by default we don't use LARA in encoder due to sparse coordinates)
             enable_encoder_lara = config.geometric_config.get('enable_encoder_lara', False)
@@ -868,7 +868,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         # Option 1: Geometry-Aware Position Embedding (Recommended)
         # Uses separate encodings for XY (Fourier), Metal Layer (Learnable),
         # Relative Position (Polar + Harmonics), and Layer Delta (Signed)
-        if self.geo_config.enable_geometry_aware_pe:
+        if self.geo_config.use_advanced_geo_pe:
             geope_config = self.geo_config.to_geope_config(config.hidden_size)
             self.encoder_geo_pe = GeometryAwarePositionEmbedding(geope_config)
             # Decoder uses simple Fourier since it only has cumulative positions
@@ -885,7 +885,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             )
 
         # Option 2: Simple Fourier Position Embedding (Alternative)
-        elif self.geo_config.enable_fourier_pe:
+        elif self.geo_config.use_basic_fourier_pe:
             self.encoder_fourier_pe = FourierPositionEmbedding(
                 hidden_size=config.hidden_size,
                 num_frequencies=self.geo_config.num_frequencies,
@@ -994,6 +994,43 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             Original input embeddings without geometric modification
         """
         return inputs_embeds
+
+    def _shift_decoder_coordinates(
+        self,
+        decoder_coordinates: torch.Tensor,
+        encoder_abs_positions: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Shift decoder_coordinates right by 1 to prevent data leakage.
+
+        Problem: tgt_coords[t] is the position AFTER executing target_tokens[t],
+        which is aligned with labels[t]. During autoregressive decoding at position t,
+        the model should not see the coordinate resulting from labels[t] — that would
+        leak the answer (coords[t] - coords[t-1] directly reveals labels[t]).
+
+        Solution: Shift right so that decoder_coordinates[t] = position BEFORE
+        predicting labels[t], i.e., the position after all previously decoded tokens.
+
+        Before shift (data leakage):
+            target_tokens:      T2,     <PUSH>, D30000, D3000, ...
+            tgt_coords:         [A],    [B],    [C],    [D],   ...
+            decoder_input:      <pad>,  T2,     <PUSH>, D30000, ...
+            decoder_coordinates:[A],    [B],    [C],    [D],   ...  ← coords[t] leaks labels[t]
+
+        After shift (correct):
+            decoder_input:      <pad>,  T2,     <PUSH>, D30000, ...
+            decoder_coordinates:[drv],  [A],    [B],    [C],   ...  ← coords[t] = current position
+        """
+        # Extract driver starting position from encoder_abs_positions
+        # Source format: "<BOS> <DRIVER> ..." → driver is at index 1
+        if encoder_abs_positions is not None:
+            driver_pos = encoder_abs_positions[:, 1:2, :]  # (batch, 1, 3)
+        else:
+            driver_pos = torch.zeros_like(decoder_coordinates[:, :1, :])
+
+        # Shift right: prepend driver starting position, drop last coordinate
+        shifted = torch.cat([driver_pos, decoder_coordinates[:, :-1, :]], dim=1)
+        return shifted
 
     def forward(
         self,
@@ -1130,6 +1167,14 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                     decoder_attention_mask,
                 )
 
+            # Shift decoder_coordinates to prevent data leakage during training.
+            # tgt_coords[t] = position after target_tokens[t] (aligned with labels[t]).
+            # After shift: decoder_coordinates[t] = position before predicting labels[t].
+            if decoder_coordinates is not None and labels is not None:
+                decoder_coordinates = self._shift_decoder_coordinates(
+                    decoder_coordinates, encoder_abs_positions
+                )
+
             # Prepare encoder attention mask
             if attention_mask is not None and attention_mask.dim() == 2:
                 # Use encoder outputs dtype as reference since decoder_inputs_embeds may be None in edge cases
@@ -1151,7 +1196,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
-                decoder_coordinates=decoder_coordinates,  # Pass decoder coords to LARA
+                decoder_coordinates=decoder_coordinates,  # Pass shifted decoder coords to LARA
                 encoder_coordinates=encoder_abs_positions,  # Pass encoder coords for cross-LARA
             )
 
@@ -1451,7 +1496,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         T5GemmaForConditionalGeneration.__init__(model, config)
 
         # Replace encoder/decoder with Geo versions if LARA is enabled
-        if model.geo_config.enable_geometric_attention:
+        if model.geo_config.use_geo_self_attn:
             enable_encoder_lara = config.geometric_config.get('enable_encoder_lara', False)
             if enable_encoder_lara:
                 model.model.encoder = GeoT5GemmaEncoder(config)
@@ -1463,7 +1508,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         model.encoder_fourier_pe = None
         model.decoder_fourier_pe = None
 
-        if model.geo_config.enable_geometry_aware_pe:
+        if model.geo_config.use_advanced_geo_pe:
             geope_config = model.geo_config.to_geope_config(config.hidden_size)
             model.encoder_geo_pe = GeometryAwarePositionEmbedding(geope_config)
             model.decoder_fourier_pe = FourierPositionEmbedding(
@@ -1477,7 +1522,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 floor_freq_ratio=model.geo_config.floor_freq_ratio,
                 max_sequence_length=model.geo_config.max_sequence_length,
             )
-        elif model.geo_config.enable_fourier_pe:
+        elif model.geo_config.use_basic_fourier_pe:
             model.encoder_fourier_pe = FourierPositionEmbedding(
                 hidden_size=config.hidden_size,
                 num_frequencies=model.geo_config.num_frequencies,

@@ -114,8 +114,8 @@ class TrainingPipeline:
         use_geo = (
             hasattr(self.model_config, 'geometric_config')
             and (
-                self.model_config.geometric_config.enable_geometry_aware_pe
-                or self.model_config.geometric_config.enable_fourier_pe
+                self.model_config.geometric_config.use_advanced_geo_pe
+                or self.model_config.geometric_config.use_basic_fourier_pe
             )
         )
         split_dataset_dir = Path(self.paths_config.split_dataset_dir) 
@@ -298,12 +298,12 @@ class TrainingPipeline:
         logging.info("vocab size: %s", len(tokenizer.get_vocab()))
 
         # Check if geometry-aware mode is enabled
-        # Support both new (enable_geometry_aware_pe) and legacy (enable_fourier_pe) configs
+        # Support both new (use_advanced_geo_pe) and legacy (use_basic_fourier_pe) configs
         use_geo = False
         if hasattr(self.model_config, 'geometric_config'):
             geo_cfg = self.model_config.geometric_config
-            use_geo = getattr(geo_cfg, 'enable_geometry_aware_pe', False) or \
-                      getattr(geo_cfg, 'enable_fourier_pe', False)
+            use_geo = getattr(geo_cfg, 'use_advanced_geo_pe', False) or \
+                      getattr(geo_cfg, 'use_basic_fourier_pe', False)
 
         vocab_size = len(tokenizer.get_vocab())
 
@@ -369,12 +369,12 @@ class TrainingPipeline:
             # Build GeoConfig with both legacy and new parameters
             geo_config_dict = GeoConfig(
                 # New: Geometry-Aware Position Embedding (recommended)
-                enable_geometry_aware_pe=getattr(geo_config, 'enable_geometry_aware_pe', False),
+                use_advanced_geo_pe=getattr(geo_config, 'use_advanced_geo_pe', False),
                 # Legacy: Simple Fourier Position Embedding
-                enable_fourier_pe=getattr(geo_config, 'enable_fourier_pe', False),
+                use_basic_fourier_pe=getattr(geo_config, 'use_basic_fourier_pe', False),
                 # LARA (Lie Algebra Relative Attention) configuration
-                enable_geometric_attention=getattr(geo_config, 'enable_geometric_attention', False),
-                enable_geometric_cross_attention=getattr(geo_config, 'enable_geometric_cross_attention', False),
+                use_geo_self_attn=getattr(geo_config, 'use_geo_self_attn', False),
+                use_geo_cross_attn=getattr(geo_config, 'use_geo_cross_attn', False),
                 enable_encoder_lara=getattr(geo_config, 'enable_encoder_lara', False),
                 # Coordinate scaling
                 coord_scale=getattr(geo_config, 'coord_scale', 1e-5),
@@ -397,7 +397,7 @@ class TrainingPipeline:
             model = GeoT5GemmaForConditionalGeneration(config, geo_config_dict)
 
             # Log which PE mode is being used
-            if geo_config_dict.enable_geometry_aware_pe:
+            if geo_config_dict.use_advanced_geo_pe:
                 logging.info("Using GeoT5GemmaForConditionalGeneration with Geometry-Aware PE")
                 logging.info("  - XY coordinates: Fourier encoding (multi-frequency)")
                 logging.info("  - Metal layer: Learnable embedding with direction awareness")
@@ -409,8 +409,8 @@ class TrainingPipeline:
             # Log LARA configuration
             logging.info("LARA (Lie Algebra Relative Attention) Configuration:")
             logging.info(f"  - Encoder: {'LARA' if geo_config_dict.enable_encoder_lara else 'Standard Attention'}")
-            logging.info(f"  - Decoder Self-Attention: {'LARA' if geo_config_dict.enable_geometric_attention else 'Standard Attention'}")
-            logging.info(f"  - Cross-Attention: {'LARA' if geo_config_dict.enable_geometric_cross_attention else 'Standard Attention'}")
+            logging.info(f"  - Decoder Self-Attention: {'LARA' if geo_config_dict.use_geo_self_attn else 'Standard Attention'}")
+            logging.info(f"  - Cross-Attention: {'LARA' if geo_config_dict.use_geo_cross_attn else 'Standard Attention'}")
         else:
             model = T5GemmaForConditionalGeneration(config)
             logging.info("Using standard T5GemmaForConditionalGeneration")
@@ -433,8 +433,8 @@ class TrainingPipeline:
         use_geo = False
         if hasattr(self.model_config, 'geometric_config'):
             geo_cfg = self.model_config.geometric_config
-            use_geo = getattr(geo_cfg, 'enable_geometry_aware_pe', False) or \
-                      getattr(geo_cfg, 'enable_geometric_attention', False)
+            use_geo = getattr(geo_cfg, 'use_advanced_geo_pe', False) or \
+                      getattr(geo_cfg, 'use_basic_fourier_pe', False)
             
         args = Seq2SeqTrainingArguments(
             output_dir=self.paths_config.model_save_dir,
@@ -469,7 +469,7 @@ class TrainingPipeline:
             dataloader_num_workers=self.performance_config.dataloader_num_workers,
             dataloader_pin_memory=self.performance_config.dataloader_pin_memory,
             # Mixed precision and optimization
-            fp16=torch.cuda.is_available(),
+            fp16=torch.cuda.is_available(), 
             report_to=["tensorboard"],
             # Reproducibility
             seed=self.hyperparameters_config.seed,
@@ -585,8 +585,8 @@ class TrainingPipeline:
         use_geo = (
             hasattr(self.model_config, 'geometric_config')
             and (
-                self.model_config.geometric_config.enable_geometry_aware_pe
-                or self.model_config.geometric_config.enable_fourier_pe
+                self.model_config.geometric_config.use_advanced_geo_pe
+                or self.model_config.geometric_config.use_basic_fourier_pe
             )
         )
 
