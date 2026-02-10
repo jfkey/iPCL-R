@@ -725,3 +725,127 @@ class GeometryAwarePositionEmbedding(nn.Module):
             f"num_harmonics={self.config.num_harmonics}, "
             f"total_input_dim={self.total_input_dim}"
         )
+
+
+class GeometryAwarePositionEmbeddingTMP(nn.Module):
+    """
+    Simplified Geometry-Aware Position Embedding for Testing Metal Layer Effects.
+
+    This module only encodes Metal Layer information to test its impact:
+    - Metal Layer (Learnable): Which layer and what routing direction
+
+    This is a temporary version for ablation study to understand the contribution
+    of metal layer encoding alone, without spatial position or relative position information.
+
+    Architecture:
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  Input: abs_pos = (x, y, m)  (only m is used)                      │
+    ├─────────────────────────────────────────────────────────────────────┤
+    │                                                                     │
+    │                          ┌─────────────┐                            │
+    │                          │ Layer Embed │                            │
+    │                          │    (m)      │                            │
+    │                          └──────┬──────┘                            │
+    │                                 │                                   │
+    │                          ┌──────┴──────┐                            │
+    │                          │  MLP Fusion │                            │
+    │                          └──────┬──────┘                            │
+    │                                 │                                   │
+    │                          ┌──────┴──────┐                            │
+    │                          │  LayerNorm  │                            │
+    │                          └──────┬──────┘                            │
+    │                                 ▼                                   │
+    │                Output: (batch, seq_len, hidden_size)                │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    Args:
+        config: GeoPEConfig with all hyperparameters
+    """
+
+    def __init__(self, config: GeoPEConfig):
+        super().__init__()
+        self.config = config
+
+        # Only Metal Layer Embedding (Learnable + Direction)
+        self.layer_embed = MetalLayerEmbedding(
+            max_layers=config.max_metal_layers,
+            embed_dim=config.num_frequencies,  # Match frequency count for balance
+        )
+
+        # Total input dimension is just the layer embedding
+        self.total_input_dim = self.layer_embed.output_dim
+
+        # MLP Fusion: Project layer embedding to hidden_size
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(self.total_input_dim, config.hidden_size * 2),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_size * 2, config.hidden_size),
+            nn.Dropout(config.dropout),
+        )
+
+        # Layer normalization for stable training
+        self.layer_norm = nn.LayerNorm(config.hidden_size)
+
+        # Initialize MLP weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize MLP weights with small values for stable start."""
+        for module in self.fusion_mlp.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        abs_pos: torch.Tensor,
+        rel_pos: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute metal-layer-only position embeddings.
+
+        Args:
+            abs_pos: Absolute positions (batch, seq_len, 3) as (x, y, m)
+                    Only the m (metal layer) component is used
+            rel_pos: Relative positions (batch, seq_len, 3) - NOT USED in this version
+            attention_mask: Optional mask (batch, seq_len) for padding
+
+        Returns:
+            Position embeddings (batch, seq_len, hidden_size)
+        """
+        batch_size, seq_len, _ = abs_pos.shape
+        # Get model dtype from fusion_mlp weights (may be fp16 in mixed precision)
+        model_dtype = self.fusion_mlp[0].weight.dtype
+
+        # Convert inputs to model dtype for compatibility with learnable parameters
+        abs_pos = abs_pos.to(model_dtype)
+
+        # Extract Metal Layer from absolute position
+        metal_layer = abs_pos[..., 2]  # (B, T)
+        layer_emb = self.layer_embed(metal_layer)  # (B, T, d_m)
+
+        # Check dtype match before MLP call
+        if layer_emb.dtype != self.fusion_mlp[0].weight.dtype:
+            layer_emb = layer_emb.to(self.fusion_mlp[0].weight.dtype)
+
+        # MLP Fusion
+        fused = self.fusion_mlp(layer_emb)  # (B, T, hidden_size)
+
+        # Layer Normalization
+        output = self.layer_norm(fused)
+
+        # Apply attention mask (zero out padding positions)
+        if attention_mask is not None:
+            output = output * attention_mask.unsqueeze(-1).to(model_dtype)
+
+        return output
+
+    def extra_repr(self) -> str:
+        """Extra representation for printing."""
+        return (
+            f"hidden_size={self.config.hidden_size}, "
+            f"total_input_dim={self.total_input_dim} (layer only)"
+        )

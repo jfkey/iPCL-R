@@ -399,6 +399,8 @@ class TrainingPipeline:
                 vq_commitment_cost=getattr(geo_config, 'vq_commitment_cost', 0.25),
                 vq_ema_decay=getattr(geo_config, 'vq_ema_decay', 0.99),
                 vq_dead_code_threshold=getattr(geo_config, 'vq_dead_code_threshold', 2),
+                use_metal_layer_only_pe=getattr(geo_config, 'use_metal_layer_only_pe', False),
+    
             )
             model = GeoT5GemmaForConditionalGeneration(config, geo_config_dict)
 
@@ -475,7 +477,7 @@ class TrainingPipeline:
             dataloader_num_workers=self.performance_config.dataloader_num_workers,
             dataloader_pin_memory=self.performance_config.dataloader_pin_memory,
             # Mixed precision and optimization
-            fp16=torch.cuda.is_available(), 
+            fp16=torch.cuda.is_available(),
             report_to=["tensorboard"],
             # Reproducibility
             seed=self.hyperparameters_config.seed,

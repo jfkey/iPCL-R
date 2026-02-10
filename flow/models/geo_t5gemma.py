@@ -41,6 +41,7 @@ from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput, Base
 from .position_embedding import (
     FourierPositionEmbedding,
     GeometryAwarePositionEmbedding,
+    GeometryAwarePositionEmbeddingTMP,
     GeoPEConfig,
 )
 from .geometric_attention import (
@@ -90,6 +91,7 @@ class GeoConfig:
     # General settings
     use_basic_fourier_pe: bool = False  # Simple 3D Fourier (deprecated)
     use_advanced_geo_pe: bool = True  # Advanced Geometry-Aware PE (recommended)
+    use_metal_layer_only_pe: bool = False  # Only Metal Layer PE (for testing metal layer effects)
     use_geo_self_attn: bool = False  # Enable LARA for decoder self-attention
     use_geo_cross_attn: bool = False  # Enable LARA for cross-attention
     enable_encoder_lara: bool = False  # Enable LARA for encoder (usually not recommended)
@@ -891,6 +893,24 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 max_sequence_length=self.geo_config.max_sequence_length,
             )
 
+        # Option 1.5: Metal Layer Only Position Embedding (For Testing)
+        # Only uses Metal Layer encoding to test its isolated effect
+        elif self.geo_config.use_metal_layer_only_pe:
+            geope_config = self.geo_config.to_geope_config(config.hidden_size)
+            self.encoder_geo_pe = GeometryAwarePositionEmbeddingTMP(geope_config)
+            # Decoder uses simple Fourier since it only has cumulative positions
+            self.decoder_fourier_pe = FourierPositionEmbedding(
+                hidden_size=config.hidden_size,
+                num_frequencies=self.geo_config.num_frequencies,
+                max_wavelength=self.geo_config.max_wavelength,
+                min_wavelength=self.geo_config.min_wavelength,
+                coord_scale=self.geo_config.coord_scale,
+                learnable_coefficients=self.geo_config.learnable_fourier_coefficients,
+                separate_basis=self.geo_config.separate_sin_cos_basis,
+                floor_freq_ratio=self.geo_config.floor_freq_ratio,
+                max_sequence_length=self.geo_config.max_sequence_length,
+            )
+
         # Option 2: Simple Fourier Position Embedding (Alternative)
         elif self.geo_config.use_basic_fourier_pe:
             self.encoder_fourier_pe = FourierPositionEmbedding(
@@ -1565,6 +1585,20 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         if model.geo_config.use_advanced_geo_pe:
             geope_config = model.geo_config.to_geope_config(config.hidden_size)
             model.encoder_geo_pe = GeometryAwarePositionEmbedding(geope_config)
+            model.decoder_fourier_pe = FourierPositionEmbedding(
+                hidden_size=config.hidden_size,
+                num_frequencies=model.geo_config.num_frequencies,
+                max_wavelength=model.geo_config.max_wavelength,
+                min_wavelength=model.geo_config.min_wavelength,
+                coord_scale=model.geo_config.coord_scale,
+                learnable_coefficients=model.geo_config.learnable_fourier_coefficients,
+                separate_basis=model.geo_config.separate_sin_cos_basis,
+                floor_freq_ratio=model.geo_config.floor_freq_ratio,
+                max_sequence_length=model.geo_config.max_sequence_length,
+            )
+        elif model.geo_config.use_metal_layer_only_pe:
+            geope_config = model.geo_config.to_geope_config(config.hidden_size)
+            model.encoder_geo_pe = GeometryAwarePositionEmbeddingTMP(geope_config)
             model.decoder_fourier_pe = FourierPositionEmbedding(
                 hidden_size=config.hidden_size,
                 num_frequencies=model.geo_config.num_frequencies,
