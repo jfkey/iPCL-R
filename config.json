@@ -63,7 +63,7 @@
                 "num_harmonics": 8,
                 "max_wavelength": 10000.0,
                 "min_wavelength": 1.0,
-                "learnable_fourier_coefficients": true,
+                "learnable_fourier_coefficients": false,
                 "separate_sin_cos_basis": true,
                 "floor_freq_ratio": 1.0,
                 "max_sequence_length": 512,
@@ -71,16 +71,21 @@
                 "max_layer_delta": 10,
                 "pe_dropout": 0.1,
                 "use_geometric_bias": true,
-                "bias_mlp_hidden": 64
+                "bias_mlp_hidden": 64,
+                "use_vq": true,
+                "vq_codebook_size": 10,
+                "vq_commitment_cost": 0.25,
+                "vq_ema_decay": 0.99, 
+                "vq_dead_code_threshold":2
             }
         },
         "hyperparameters": {
-            "quick_training": 0.01,
+            "quick_training": 0.02,
             "max_src_len": 128,
             "max_tgt_len": 256,
             "train_split_ratio": 0.9,
             "num_train_epochs": 3,
-            "batch_size_per_device": 128,
+            "batch_size_per_device": 10,
             "gradient_accumulation_steps": 1,
             "learning_rate": 0.0001,
             "weight_decay": 0.005,

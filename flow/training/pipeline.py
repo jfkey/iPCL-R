@@ -393,6 +393,12 @@ class TrainingPipeline:
                 # Geometric Attention (LARA) parameters
                 use_geometric_bias=getattr(geo_config, 'use_geometric_bias', True),
                 bias_mlp_hidden=getattr(geo_config, 'bias_mlp_hidden', 64),
+                # Vector Quantization (VQ) parameters
+                use_vq=getattr(geo_config, 'use_vq', False),
+                vq_codebook_size=getattr(geo_config, 'vq_codebook_size', 1024),
+                vq_commitment_cost=getattr(geo_config, 'vq_commitment_cost', 0.25),
+                vq_ema_decay=getattr(geo_config, 'vq_ema_decay', 0.99),
+                vq_dead_code_threshold=getattr(geo_config, 'vq_dead_code_threshold', 2),
             )
             model = GeoT5GemmaForConditionalGeneration(config, geo_config_dict)
 

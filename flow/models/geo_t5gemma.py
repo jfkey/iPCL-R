@@ -112,6 +112,13 @@ class GeoConfig:
     use_geometric_bias: bool = True
     bias_mlp_hidden: int = 64
 
+    # Vector Quantization settings (Information Bottleneck)
+    use_vq: bool = False  # Whether to apply VQ to position embeddings
+    vq_codebook_size: int = 256  # Number of codebook entries (K), info: log2(K) bits
+    vq_commitment_cost: float = 0.25  # β for commitment loss
+    vq_ema_decay: float = 0.99  # EMA decay for codebook updates
+    vq_dead_code_threshold: int = 2  # Usage threshold for dead code revival
+
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "GeoConfig":
         """Create GeoConfig from dictionary."""
@@ -909,6 +916,23 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 max_sequence_length=self.geo_config.max_sequence_length,
             )
 
+        # Vector Quantization module (information bottleneck for PE)
+        self.encoder_pe_vq = None
+        if self.geo_config.use_vq and (
+            self.encoder_geo_pe is not None or self.encoder_fourier_pe is not None
+        ):
+            from .vq import VectorQuantizer
+            self.encoder_pe_vq = VectorQuantizer(
+                hidden_size=config.hidden_size,
+                codebook_size=self.geo_config.vq_codebook_size,
+                commitment_cost=self.geo_config.vq_commitment_cost,
+                ema_decay=self.geo_config.vq_ema_decay,
+                dead_code_threshold=self.geo_config.vq_dead_code_threshold,
+            )
+
+        # Initialize VQ loss accumulator
+        self._vq_loss = None
+
         # Post-initialization
         self.post_init()
 
@@ -955,6 +979,12 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             # Ensure dtype matches inputs_embeds (critical for fp16 training)
             if geo_embeds.dtype != inputs_embeds.dtype:
                 geo_embeds = geo_embeds.to(inputs_embeds.dtype)
+
+            # Apply VQ if enabled (information bottleneck)
+            if self.encoder_pe_vq is not None:
+                geo_embeds, vq_loss, _ = self.encoder_pe_vq(geo_embeds, attention_mask)
+                self._vq_loss = vq_loss  # Store for adding to main loss
+
             return inputs_embeds + geo_embeds
 
         # Case 2: Simple Fourier Position Embedding
@@ -964,6 +994,12 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             # Ensure dtype matches inputs_embeds (critical for fp16 training)
             if geo_embeds.dtype != inputs_embeds.dtype:
                 geo_embeds = geo_embeds.to(inputs_embeds.dtype)
+
+            # Apply VQ if enabled (information bottleneck)
+            if self.encoder_pe_vq is not None:
+                geo_embeds, vq_loss, _ = self.encoder_pe_vq(geo_embeds, attention_mask)
+                self._vq_loss = vq_loss  # Store for adding to main loss
+
             return inputs_embeds + geo_embeds
 
         return inputs_embeds
@@ -1211,6 +1247,11 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                     labels.view(-1)
                 )
 
+                # Add VQ loss if applicable
+                if self._vq_loss is not None:
+                    loss = loss + self._vq_loss
+                    self._vq_loss = None  # Reset
+
             if not return_dict:
                 output = (lm_logits,) + decoder_outputs[1:]
                 return ((loss,) + output) if loss is not None else output
@@ -1228,7 +1269,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             )
 
         # Fallback: Standard decoder (no LARA) - use parent forward
-        return super().forward(
+        output = super().forward(
             input_ids=None,  # Use inputs_embeds instead
             attention_mask=attention_mask,
             decoder_input_ids=None,  # Use decoder_inputs_embeds instead
@@ -1247,6 +1288,19 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             return_dict=return_dict,
             **kwargs,  # Pass through additional args like cache_position
         )
+
+        # Add VQ loss if applicable
+        if self._vq_loss is not None:
+            if return_dict and output.loss is not None:
+                # Modify the dataclass output
+                output.loss = output.loss + self._vq_loss
+            elif not return_dict and isinstance(output, tuple) and len(output) > 0:
+                # Modify tuple output (loss is first element if present)
+                if isinstance(output[0], torch.Tensor) and output[0].dim() == 0:
+                    output = (output[0] + self._vq_loss,) + output[1:]
+            self._vq_loss = None  # Reset
+
+        return output
 
     def prepare_inputs_for_generation(
         self,
@@ -1545,6 +1599,23 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 floor_freq_ratio=model.geo_config.floor_freq_ratio,
                 max_sequence_length=model.geo_config.max_sequence_length,
             )
+
+        # Vector Quantization module (information bottleneck for PE)
+        model.encoder_pe_vq = None
+        if model.geo_config.use_vq and (
+            model.encoder_geo_pe is not None or model.encoder_fourier_pe is not None
+        ):
+            from .vq import VectorQuantizer
+            model.encoder_pe_vq = VectorQuantizer(
+                hidden_size=config.hidden_size,
+                codebook_size=model.geo_config.vq_codebook_size,
+                commitment_cost=model.geo_config.vq_commitment_cost,
+                ema_decay=model.geo_config.vq_ema_decay,
+                dead_code_threshold=model.geo_config.vq_dead_code_threshold,
+            )
+
+        # Initialize VQ loss accumulator
+        model._vq_loss = None
 
         # Now load the state dict with all weights
         model_path = Path(pretrained_model_name_or_path)

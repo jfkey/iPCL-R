@@ -251,6 +251,13 @@ class GeometricEmbeddingConfig:
     use_geometric_bias: bool = True
     bias_mlp_hidden: int = 64
 
+    # Vector Quantization (VQ) parameters
+    use_vq: bool = False  # Enable Vector Quantization
+    vq_codebook_size: int = 1024  # Size of VQ codebook
+    vq_commitment_cost: float = 0.25  # Commitment cost for VQ
+    vq_ema_decay: float = 0.99  # EMA decay rate for VQ codebook updates
+    vq_dead_code_threshold: int = 2  # Usage threshold for dead code revival
+
 
 @dataclass
 class TrainingModel:
