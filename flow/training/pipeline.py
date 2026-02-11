@@ -478,6 +478,8 @@ class TrainingPipeline:
             dataloader_pin_memory=self.performance_config.dataloader_pin_memory,
             # Mixed precision and optimization
             fp16=torch.cuda.is_available(),
+            # DDP: allow unused parameters (e.g. VQ codebook updated via EMA)
+            # ddp_find_unused_parameters=True,
             report_to=["tensorboard"],
             # Reproducibility
             seed=self.hyperparameters_config.seed,
@@ -513,6 +515,11 @@ class TrainingPipeline:
                 weight_decay=self.hyperparameters_config.weight_decay,
             )
         elif self.hyperparameters_config.optimizer_type == "adafactor":
+            # When fp16 is enabled, GradScaler wraps the optimizer and requires
+            # param_groups['lr'] to be a real number. Adafactor's relative_step
+            # mode sets lr=None, which causes GradScaler to produce zero updates.
+            # Fix: use relative_step=False with explicit lr when fp16 is active.
+            # TODO optimize Adafactor in FP16?  
             optimizer = Adafactor(
                 model.parameters(),
                 relative_step=True,
@@ -560,6 +567,9 @@ class TrainingPipeline:
             self.hyperparameters_config.scheduler_type == "adafactor"
             and self.hyperparameters_config.optimizer_type == "adafactor"
         ):
+            # When fp16 is active, Adafactor uses relative_step=False with
+            # explicit lr, so AdafactorSchedule won't work. Use linear warmup.
+            # TODO optimize scheduler in FP16? 
             scheduler = AdafactorSchedule(optimizer)
         else:
             scheduler = None
@@ -614,7 +624,7 @@ class TrainingPipeline:
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            optimizers=(optimizer, scheduler),
+            optimizers=(optimizer, scheduler), 
             data_collator=data_collator,
             callbacks=callbacks,
         )

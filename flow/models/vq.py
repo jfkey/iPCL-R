@@ -85,9 +85,11 @@ class VectorQuantizer(nn.Module):
         self.dead_code_threshold = dead_code_threshold
 
         # Codebook: K entries of D dimensions
+        # No gradient needed: codebook is updated via EMA, not backprop.
+        # Setting requires_grad=False also prevents DDP unused-parameter errors.
         self.embedding = nn.Embedding(codebook_size, hidden_size)
-        # Initialize uniformly in [-1/K, 1/K]
         self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+        self.embedding.weight.requires_grad_(False)
 
         # EMA tracking buffers (no gradient)
         self.register_buffer('ema_cluster_size', torch.zeros(codebook_size))

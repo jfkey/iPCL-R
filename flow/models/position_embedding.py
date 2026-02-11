@@ -165,8 +165,9 @@ class FourierPositionEmbedding(nn.Module):
         # Scale coordinates to reasonable range
         # Chip coordinates can be millions; scaling to ~1.0 range helps stability
         # Use model dtype for compatibility with learnable parameters
-        coords_scaled = coordinates.to(model_dtype) * self.coord_scale  # (B, T, 3)
-
+        # Scale in FP32 first to prevent overflow (chip coords can be >65504, FP16 max)
+        coords_scaled = (coordinates.float() * self.coord_scale).to(model_dtype)  # (B, T, 3)
+        
         # Separate x, y, z coordinates
         x = coords_scaled[..., 0:1]  # (B, T, 1)
         y = coords_scaled[..., 1:2]  # (B, T, 1)
@@ -336,9 +337,9 @@ class XYFourierEmbedding(nn.Module):
         Returns:
             Fourier embeddings of shape (..., output_dim)
         """
-        # Scale coordinates
-        x = coords[..., 0:1] * self.coord_scale  # (..., 1)
-        y = coords[..., 1:2] * self.coord_scale  # (..., 1)
+        # Scale in FP32 first to prevent overflow (chip coords can be >65504, FP16 max)
+        x = coords[..., 0:1].float() * self.coord_scale  # (..., 1)
+        y = coords[..., 1:2].float() * self.coord_scale  # (..., 1)
 
         # Compute phases: (..., 1) * (num_freq,) -> (..., num_freq)
         # Cast frequencies to input dtype for fp16 compatibility
@@ -475,8 +476,9 @@ class PolarRelativeEmbedding(nn.Module):
             Polar embeddings of shape (..., output_dim)
         """
         input_dtype = rel_coords.dtype
-        dx = rel_coords[..., 0] * self.coord_scale
-        dy = rel_coords[..., 1] * self.coord_scale
+        # Scale in FP32 first to prevent overflow (relative coords can be >65504, FP16 max)
+        dx = rel_coords[..., 0].float() * self.coord_scale
+        dy = rel_coords[..., 1].float() * self.coord_scale
 
         # Polar conversion
         r = torch.sqrt(dx ** 2 + dy ** 2 + 1e-8)  # Add eps for stability
@@ -675,9 +677,10 @@ class GeometryAwarePositionEmbedding(nn.Module):
         # Get model dtype from fusion_mlp weights (may be fp16 in mixed precision)
         model_dtype = self.fusion_mlp[0].weight.dtype
 
-        # Convert inputs to model dtype for compatibility with learnable parameters
-        abs_pos = abs_pos.to(model_dtype)
-        rel_pos = rel_pos.to(model_dtype)
+        # NOTE: Do NOT cast abs_pos/rel_pos to model_dtype here.
+        # Chip coordinates can be >65504 which overflows FP16.
+        # Sub-modules (XYFourier, PolarRel) scale in FP32 internally.
+        # MetalLayerEmbedding / LayerDeltaEmbedding call .long(), safe with any dtype.
 
         # 1. XY Absolute Fourier Embedding
         xy_abs_emb = self.xy_fourier(abs_pos)  # (B, T, d_xy)
