@@ -463,9 +463,10 @@ class TrainingPipeline:
             eval_strategy=self.hyperparameters_config.eval_strategy,
             save_strategy=self.hyperparameters_config.save_strategy,
             # average_tokens_across_devices= True,
-            load_best_model_at_end=True,
+            load_best_model_at_end=False,  # Disabled: causes NCCL deadlock with DeepSpeed ZeRO-2
             metric_for_best_model="eval_loss",
             greater_is_better=False,
+            save_total_limit=5,
             # Logging
             logging_dir=os.path.join(
                 self.paths_config.logging_dir,
@@ -477,9 +478,7 @@ class TrainingPipeline:
             dataloader_num_workers=self.performance_config.dataloader_num_workers,
             dataloader_pin_memory=self.performance_config.dataloader_pin_memory,
             # Mixed precision and optimization
-            fp16=torch.cuda.is_available(),
-            # DDP: allow unused parameters (e.g. VQ codebook updated via EMA)
-            # ddp_find_unused_parameters=True,
+            fp16=torch.cuda.is_available(), 
             report_to=["tensorboard"],
             # Reproducibility
             seed=self.hyperparameters_config.seed,
@@ -514,11 +513,7 @@ class TrainingPipeline:
                 lr=self.hyperparameters_config.learning_rate,
                 weight_decay=self.hyperparameters_config.weight_decay,
             )
-        elif self.hyperparameters_config.optimizer_type == "adafactor":
-            # When fp16 is enabled, GradScaler wraps the optimizer and requires
-            # param_groups['lr'] to be a real number. Adafactor's relative_step
-            # mode sets lr=None, which causes GradScaler to produce zero updates.
-            # Fix: use relative_step=False with explicit lr when fp16 is active.
+        elif self.hyperparameters_config.optimizer_type == "adafactor": 
             # TODO optimize Adafactor in FP16?  
             optimizer = Adafactor(
                 model.parameters(),
@@ -644,6 +639,16 @@ class TrainingPipeline:
         train_result = trainer.train(
             resume_from_checkpoint=self.performance_config.resume_from_checkpoint
         )
+
+        # Synchronize all ranks before saving (DeepSpeed ZeRO requires all ranks)
+        self.accelerator.wait_for_everyone()
+
+        # Save final model (DeepSpeed-safe: uses Trainer's save which handles ZeRO sharding)
+        final_model_dir = os.path.join(self.paths_config.model_save_dir, "final_model")
+        trainer.save_model(final_model_dir)
+        logging.info(f"Final model saved to {final_model_dir}")
+
+        self.accelerator.wait_for_everyone()
 
         # Save training metrics
         metrics = train_result.metrics
