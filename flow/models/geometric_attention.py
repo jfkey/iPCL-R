@@ -248,6 +248,10 @@ class GeometricPositionEmbedding(nn.Module):
         When computing attention scores q_rot · k_rot, the relative position
         information emerges naturally from the rotation difference.
 
+        All intermediate computations (theta, quaternion, rotation) are done in
+        FP32 to avoid numerical issues in FP16 (epsilon underflow, trig precision).
+        Only the final output is cast back to the input dtype.
+
         Args:
             query: Query vectors (batch, num_heads, seq_len, head_dim)
             key: Key vectors (batch, num_heads, seq_len, head_dim)
@@ -262,8 +266,10 @@ class GeometricPositionEmbedding(nn.Module):
 
         # Handle shape mismatches between query and coordinates
         # This can happen during beam search (batch expansion) or incremental decoding (seq_len mismatch)
-        # Keep coordinates in same dtype as query for consistency
-        coords = coordinates.to(query.dtype)
+        # Work in FP32 for all intermediate computations to avoid fp16 numerical issues:
+        # - Epsilon values like 1e-8 underflow to 0 in fp16 (min subnormal ~6e-8)
+        # - This causes 0/0 = NaN in compute_quaternion when coordinates are zero (padding tokens)
+        coords = coordinates.float()
         coord_batch, coord_seq, _ = coords.shape
 
         # Handle batch dimension mismatch (beam search expands batch by num_beams)
@@ -288,21 +294,22 @@ class GeometricPositionEmbedding(nn.Module):
                     f"Seq len mismatch: query has {seq_len}, coordinates has {coord_seq}"
                 )
 
-        # Scale coordinates to reasonable range
+        # Scale coordinates in FP32 (stay in FP32 for all subsequent computations)
         coords = coords * self.coord_scale  # (B, T, 3)
+
         x_pos = coords[:, :, 0]  # (B, T)
         y_pos = coords[:, :, 1]  # (B, T)
         z_pos = coords[:, :, 2]  # (B, T)
 
-        # Compute phases for each sub-vector
+        # Compute phases for each sub-vector in FP32
         # theta = position × frequency
-        # inv_freq: (num_subvectors,) - cast to input dtype for fp16 compatibility
-        inv_freq = self.inv_freq.to(input_dtype)
+        # inv_freq is already FP32 (registered buffer), keep it in FP32
+        inv_freq = self.inv_freq  # (num_subvectors,) in FP32
         theta_x = torch.einsum('bt,f->btf', x_pos, inv_freq)  # (B, T, num_subvectors)
         theta_y = torch.einsum('bt,f->btf', y_pos, inv_freq)
         theta_z = torch.einsum('bt,f->btf', z_pos, inv_freq)
 
-        # Compute symmetric quaternion for each position
+        # Compute symmetric quaternion for each position (in FP32)
         w, qx, qy, qz = self.compute_quaternion(theta_x, theta_y, theta_z)
         # Each has shape (B, T, num_subvectors)
 
@@ -316,9 +323,9 @@ class GeometricPositionEmbedding(nn.Module):
             query_to_rotate = query
             key_to_rotate = key
 
-        # Reshape query/key to (B, num_heads, T, num_subvectors, 3)
-        query_3d = query_to_rotate.view(batch_size, num_heads, seq_len, self.num_subvectors, 3)
-        key_3d = key_to_rotate.view(batch_size, num_heads, seq_len, self.num_subvectors, 3)
+        # Cast query/key to FP32 for rotation, then cast back at the end
+        query_3d = query_to_rotate.float().view(batch_size, num_heads, seq_len, self.num_subvectors, 3)
+        key_3d = key_to_rotate.float().view(batch_size, num_heads, seq_len, self.num_subvectors, 3)
 
         # Expand quaternion for broadcasting: (B, 1, T, num_subvectors)
         w = w.unsqueeze(1)
@@ -326,7 +333,7 @@ class GeometricPositionEmbedding(nn.Module):
         qy = qy.unsqueeze(1)
         qz = qz.unsqueeze(1)
 
-        # Apply rotation to each 3D sub-vector
+        # Apply rotation to each 3D sub-vector (all in FP32)
         query_rotated = self.quaternion_rotate(query_3d, w, qx, qy, qz)
         key_rotated = self.quaternion_rotate(key_3d, w, qx, qy, qz)
 
@@ -336,10 +343,10 @@ class GeometricPositionEmbedding(nn.Module):
 
         # Concatenate with non-rotated remainder if needed
         if self.needs_padding:
-            query_rotated = torch.cat([query_rotated, query_remainder], dim=-1)
-            key_rotated = torch.cat([key_rotated, key_remainder], dim=-1)
+            query_rotated = torch.cat([query_rotated, query_remainder.float()], dim=-1)
+            key_rotated = torch.cat([key_rotated, key_remainder.float()], dim=-1)
 
-        # Cast back to input dtype for fp16 compatibility
+        # Cast back to input dtype (fp16/bf16) only at the very end
         return query_rotated.to(input_dtype), key_rotated.to(input_dtype)
 
 
@@ -447,19 +454,16 @@ class LieAlgebraRelativeAttention(nn.Module):
         # Get MLP weight dtype for fp16 compatibility
         mlp_weight_dtype = self.geo_bias_mlp[0].weight.dtype
 
-        # Convert coordinates to MLP dtype BEFORE computing rel_disp
-        # This prevents dtype mismatch in fp16 training
-        coordinates = coordinates.to(mlp_weight_dtype)
+        # Compute pairwise relative displacement in FP32 first
+        # Coordinates can be >65504 (FP16 max), so we must scale before converting
+        coords_f32 = coordinates.float()
+        coords_i = coords_f32.unsqueeze(2)  # (B, T, 1, 3)
+        coords_j = coords_f32.unsqueeze(1)  # (B, 1, T, 3)
+        rel_disp = (coords_i - coords_j) * self.coord_scale  # (B, T, T, 3)
 
-        # Compute pairwise relative displacement
-        # Δp_ij = p_i - p_j for all pairs
-        coords_i = coordinates.unsqueeze(2)  # (B, T, 1, 3)
-        coords_j = coordinates.unsqueeze(1)  # (B, 1, T, 3)
-        rel_disp = coords_i - coords_j       # (B, T, T, 3)
 
-        # Scale relative displacement
-        # Now rel_disp is already in mlp_weight_dtype
-        rel_disp = rel_disp * self.coord_scale
+        # Convert to MLP weight dtype after scaling
+        rel_disp = rel_disp.to(mlp_weight_dtype)
 
         # MLP to compute per-head bias
         # Note: geo_bias_mlp weights may be fp16 in mixed precision training
@@ -516,7 +520,7 @@ class LieAlgebraRelativeAttention(nn.Module):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
-
+        
         # Step 1: Apply RoPE (Rotary Position Embedding) for sequence position
         if position_embeddings is not None:
             cos, sin = position_embeddings
@@ -829,19 +833,14 @@ class CrossLARAAttention(nn.Module):
         # Get MLP weight dtype for fp16 compatibility
         mlp_weight_dtype = self.geo_bias_mlp[0].weight.dtype
 
-        # Convert coordinates to MLP dtype BEFORE computing rel_disp
-        # This prevents dtype mismatch in fp16 training
-        query_coords = query_coords.to(mlp_weight_dtype)
-        key_coords = key_coords.to(mlp_weight_dtype)
+        # Compute pairwise relative displacement in FP32 first
+        # Coordinates can be >65504 (FP16 max), so we must scale before converting
+        q_coords_f32 = query_coords.float().unsqueeze(2)  # (batch, query_len, 1, 3)
+        k_coords_f32 = key_coords.float().unsqueeze(1)    # (batch, 1, key_len, 3)
+        rel_disp = (q_coords_f32 - k_coords_f32) * self.coord_scale  # (batch, query_len, key_len, 3)
 
-        # Compute pairwise relative displacement
-        # Δp_ij = query_i - key_j
-        q_coords = query_coords.unsqueeze(2)  # (batch, query_len, 1, 3)
-        k_coords = key_coords.unsqueeze(1)    # (batch, 1, key_len, 3)
-        rel_disp = q_coords - k_coords         # (batch, query_len, key_len, 3)
-
-        # Scale (now rel_disp is already in mlp_weight_dtype)
-        rel_disp = rel_disp * self.coord_scale
+        # Convert to MLP weight dtype after scaling
+        rel_disp = rel_disp.to(mlp_weight_dtype)
 
         # MLP to compute per-head bias
         # Note: geo_bias_mlp weights may be fp16 in mixed precision training

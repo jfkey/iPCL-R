@@ -20,6 +20,7 @@
 """
 
 from dataclasses import dataclass, field
+from torch.nn.modules.module import Module
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -497,7 +498,7 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
         # Self-Attention
         residual = hidden_states
         hidden_states = self.pre_self_attn_layernorm(hidden_states)
-
+  
         # Pass coordinates to self-attention if it's LARA
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -508,7 +509,7 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
             output_attentions=output_attentions,
             **kwargs
         )
-
+ 
         hidden_states = self.post_self_attn_layernorm(hidden_states)
         hidden_states = residual + self.dropout(hidden_states)
 
@@ -546,8 +547,8 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + self.dropout(hidden_states)
-
+        hidden_states = residual + self.dropout(hidden_states) 
+        
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights, cross_attn_weights)
@@ -709,7 +710,7 @@ class GeoT5GemmaDecoder(T5GemmaDecoder):
                     # Empty cache, treat as None
                     past_key_values = None
 
-        for idx, decoder_layer in enumerate(self.layers):
+        for idx, decoder_layer in enumerate[Module](self.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -1077,15 +1078,21 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             decoder_input:      <pad>,  T2,     <PUSH>, D30000, ...
             decoder_coordinates:[drv],  [A],    [B],    [C],   ...  ← coords[t] = current position
         """
+        # Work in FP32 to prevent overflow (chip coords can be >65504, FP16 max)
         # Extract driver starting position from encoder_abs_positions
         # Source format: "<BOS> <DRIVER> ..." → driver is at index 1
         if encoder_abs_positions is not None:
-            driver_pos = encoder_abs_positions[:, 1:2, :]  # (batch, 1, 3)
+            driver_pos = encoder_abs_positions[:, 1:2, :].float()  # (batch, 1, 3)
         else:
-            driver_pos = torch.zeros_like(decoder_coordinates[:, :1, :])
+            driver_pos = torch.zeros(
+                decoder_coordinates.shape[0], 1, 3,
+                dtype=torch.float32, device=decoder_coordinates.device
+            )
+
 
         # Shift right: prepend driver starting position, drop last coordinate
-        shifted = torch.cat([driver_pos, decoder_coordinates[:, :-1, :]], dim=1)
+        # Keep in FP32 — downstream LARA modules call .float() internally
+        shifted = torch.cat([driver_pos, decoder_coordinates[:, :-1, :].float()], dim=1)
         return shifted
 
     def forward(
@@ -1206,7 +1213,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                     output_attentions=output_attentions,
                     output_hidden_states=output_hidden_states,
                 )
-
+        
         # === KEY FIX: Call decoder explicitly if using GeoT5GemmaDecoder ===
         # The base class forward doesn't pass decoder_coordinates through,
         # so we need to handle the decoder call ourselves
@@ -1221,7 +1228,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                     decoder_inputs_embeds,
                     decoder_coordinates,
                     decoder_attention_mask,
-                )
+                ) 
 
             # Shift decoder_coordinates to prevent data leakage during training.
             # tgt_coords[t] = position after target_tokens[t] (aligned with labels[t]).
@@ -1255,7 +1262,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 decoder_coordinates=decoder_coordinates,  # Pass shifted decoder coords to LARA
                 encoder_coordinates=encoder_abs_positions,  # Pass encoder coords for cross-LARA
             )
-
+ 
             # Compute logits and loss
             lm_logits = self.lm_head(decoder_outputs[0])
 

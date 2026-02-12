@@ -57,7 +57,7 @@
                 "use_advanced_geo_pe": true,
                 "use_metal_layer_only_pe":false,
                 "use_geo_self_attn": true, 
-                "use_geo_cross_attn": true, 
+                "use_geo_cross_attn": false, 
                 "enable_encoder_lara": false,       
                 "coord_scale": 1e-6,
                 "num_frequencies": 32,
