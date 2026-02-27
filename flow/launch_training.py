@@ -97,4 +97,4 @@ if __name__ == "__main__":
     sys.exit(main())
 
 # Usage: 
-# accelerate launch -m  --config_file /home/liujunfeng/.cache/huggingface/accelerate/fast_training.yaml  flow.launch_training --flow-config config.json 
+# accelerate launch -m  --config_file /home/liujunfeng/.cache/huggingface/accelerate/default_config.yaml  flow.launch_training --flow-config config.json 

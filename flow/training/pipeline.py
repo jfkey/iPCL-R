@@ -111,14 +111,16 @@ class TrainingPipeline:
     def _load_or_create_dataset(self) -> Tuple[Dataset, Dataset]:
         """Split dataset into train and validation sets"""
         # Check if geometry-aware mode is enabled
-        use_geo = (
-            hasattr(self.model_config, 'geometric_config')
-            and (
-                self.model_config.geometric_config.use_advanced_geo_pe
-                or self.model_config.geometric_config.use_basic_fourier_pe
-            )
+        geo_cfg = getattr(self.model_config, 'geometric_config', None)
+        use_geo = geo_cfg is not None and (
+            getattr(geo_cfg, 'use_advanced_geo_pe', False) or
+            getattr(geo_cfg, 'use_basic_fourier_pe', False) or
+            getattr(geo_cfg, 'use_metal_layer_only_pe', False) or
+            getattr(geo_cfg, 'use_geo_self_attn', False) or
+            getattr(geo_cfg, 'use_geo_cross_attn', False) or
+            getattr(geo_cfg, 'enable_encoder_lara', False)
         )
-        split_dataset_dir = Path(self.paths_config.split_dataset_dir) 
+        split_dataset_dir = Path(self.paths_config.split_dataset_dir)
 
         if use_geo:
             split_dataset_dir = split_dataset_dir.with_name(split_dataset_dir.name + "_geo")
@@ -297,13 +299,19 @@ class TrainingPipeline:
         logging.info("Initializing model for net routing generation")
         logging.info("vocab size: %s", len(tokenizer.get_vocab()))
 
-        # Check if geometry-aware mode is enabled
-        # Support both new (use_advanced_geo_pe) and legacy (use_basic_fourier_pe) configs
+        # Check if geometry-aware mode is enabled.
+        # GeoT5Gemma is needed when ANY geo feature is active (PE or LARA).
         use_geo = False
         if hasattr(self.model_config, 'geometric_config'):
             geo_cfg = self.model_config.geometric_config
-            use_geo = getattr(geo_cfg, 'use_advanced_geo_pe', False) or \
-                      getattr(geo_cfg, 'use_basic_fourier_pe', False)
+            use_geo = (
+                getattr(geo_cfg, 'use_advanced_geo_pe', False) or
+                getattr(geo_cfg, 'use_basic_fourier_pe', False) or
+                getattr(geo_cfg, 'use_metal_layer_only_pe', False) or
+                getattr(geo_cfg, 'use_geo_self_attn', False) or
+                getattr(geo_cfg, 'use_geo_cross_attn', False) or
+                getattr(geo_cfg, 'enable_encoder_lara', False)
+            )
 
         vocab_size = len(tokenizer.get_vocab())
 
@@ -438,12 +446,16 @@ class TrainingPipeline:
     def _setup_training_arguments(self) -> Seq2SeqTrainingArguments:
         """Setup training arguments for the model"""
 
-        use_geo = False
-        if hasattr(self.model_config, 'geometric_config'):
-            geo_cfg = self.model_config.geometric_config
-            use_geo = getattr(geo_cfg, 'use_advanced_geo_pe', False) or \
-                      getattr(geo_cfg, 'use_basic_fourier_pe', False)
-            
+        geo_cfg = getattr(self.model_config, 'geometric_config', None)
+        use_geo = geo_cfg is not None and (
+            getattr(geo_cfg, 'use_advanced_geo_pe', False) or
+            getattr(geo_cfg, 'use_basic_fourier_pe', False) or
+            getattr(geo_cfg, 'use_metal_layer_only_pe', False) or
+            getattr(geo_cfg, 'use_geo_self_attn', False) or
+            getattr(geo_cfg, 'use_geo_cross_attn', False) or
+            getattr(geo_cfg, 'enable_encoder_lara', False)
+        )
+
         args = Seq2SeqTrainingArguments(
             output_dir=self.paths_config.model_save_dir,
             overwrite_output_dir=True,
@@ -466,7 +478,7 @@ class TrainingPipeline:
             load_best_model_at_end=True,   
             metric_for_best_model="eval_loss",
             greater_is_better=False,
-            save_total_limit=5,
+            save_total_limit=10,
             # Logging
             logging_dir=os.path.join(
                 self.paths_config.logging_dir,
@@ -595,12 +607,14 @@ class TrainingPipeline:
         )
 
         # Check if geometry-aware mode is enabled
-        use_geo = (
-            hasattr(self.model_config, 'geometric_config')
-            and (
-                self.model_config.geometric_config.use_advanced_geo_pe
-                or self.model_config.geometric_config.use_basic_fourier_pe
-            )
+        geo_cfg = getattr(self.model_config, 'geometric_config', None)
+        use_geo = geo_cfg is not None and (
+            getattr(geo_cfg, 'use_advanced_geo_pe', False) or
+            getattr(geo_cfg, 'use_basic_fourier_pe', False) or
+            getattr(geo_cfg, 'use_metal_layer_only_pe', False) or
+            getattr(geo_cfg, 'use_geo_self_attn', False) or
+            getattr(geo_cfg, 'use_geo_cross_attn', False) or
+            getattr(geo_cfg, 'enable_encoder_lara', False)
         )
 
         # Initialize data collator (Geo-aware or standard)

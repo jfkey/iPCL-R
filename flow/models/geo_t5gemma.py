@@ -300,7 +300,9 @@ class GeoT5GemmaEncoder(T5GemmaEncoder):
             for layer_idx in range(encoder_config.num_hidden_layers)
         ])
 
-        self.final_layer_norm = T5GemmaRMSNorm(
+        # Use 'norm' to match standard T5GemmaEncoder attribute name
+        # (ensures pretrained weights load correctly)
+        self.norm = T5GemmaRMSNorm(
             encoder_config.hidden_size,
             eps=getattr(encoder_config, 'rms_norm_eps', 1e-6)
         )
@@ -356,7 +358,10 @@ class GeoT5GemmaEncoder(T5GemmaEncoder):
                 raise ValueError("You have to specify either input_ids or inputs_embeds")
             inputs_embeds = self.embed_tokens(input_ids)
 
-        hidden_states = self.dropout(inputs_embeds)
+        # Apply embedding scaling (matches T5GemmaEncoder: hidden_states * sqrt(hidden_size))
+        normalizer = torch.tensor(self.config.hidden_size ** 0.5, dtype=inputs_embeds.dtype)
+        hidden_states = inputs_embeds * normalizer
+        hidden_states = self.dropout(hidden_states)
 
         batch_size, seq_length = hidden_states.shape[:2]
 
@@ -373,7 +378,6 @@ class GeoT5GemmaEncoder(T5GemmaEncoder):
         if attention_mask is not None and attention_mask.dim() == 2:
             # Expand to 4D: (batch, 1, 1, seq_len)
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
-            # Convert to float and create causal mask
             attention_mask = attention_mask.to(dtype=hidden_states.dtype)
             attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
 
@@ -411,8 +415,9 @@ class GeoT5GemmaEncoder(T5GemmaEncoder):
             if output_attentions:
                 all_self_attns = all_self_attns + (layer_outputs[1],)
 
-        # Final layer norm
-        hidden_states = self.final_layer_norm(hidden_states)
+        # Final layer norm + dropout (matches T5GemmaEncoder: self.norm then self.dropout)
+        hidden_states = self.norm(hidden_states)
+        hidden_states = self.dropout(hidden_states)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -605,7 +610,9 @@ class GeoT5GemmaDecoder(T5GemmaDecoder):
             for layer_idx in range(decoder_config.num_hidden_layers)
         ])
 
-        self.final_layer_norm = T5GemmaRMSNorm(
+        # Use 'norm' to match standard T5GemmaDecoder attribute name
+        # (ensures pretrained weights load correctly)
+        self.norm = T5GemmaRMSNorm(
             decoder_config.hidden_size,
             eps=getattr(decoder_config, 'rms_norm_eps', 1e-6)
         )
@@ -675,7 +682,10 @@ class GeoT5GemmaDecoder(T5GemmaDecoder):
                 raise ValueError("You have to specify either input_ids or inputs_embeds")
             inputs_embeds = self.embed_tokens(input_ids)
 
-        hidden_states = self.dropout(inputs_embeds)
+        # Apply embedding scaling (matches T5GemmaDecoder: hidden_states * sqrt(hidden_size))
+        normalizer = torch.tensor(self.config.hidden_size ** 0.5, dtype=inputs_embeds.dtype)
+        hidden_states = inputs_embeds * normalizer
+        hidden_states = self.dropout(hidden_states)
 
         batch_size, seq_length = hidden_states.shape[:2]
 
@@ -688,11 +698,23 @@ class GeoT5GemmaDecoder(T5GemmaDecoder):
         # Compute position embeddings (RoPE)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # Prepare attention masks
+        # Build causal attention mask for decoder self-attention.
+        # CRITICAL: without this, LARA self-attention is non-causal and the decoder
+        # can attend to future tokens during training, making training loss artificially low.
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        # Upper triangle = -inf (future positions masked), lower+diag = 0 (valid)
+        causal_mask = torch.zeros(1, 1, seq_length, seq_length, device=device, dtype=dtype)
+        future_mask = torch.ones(seq_length, seq_length, device=device, dtype=torch.bool)
+        future_mask = torch.triu(future_mask, diagonal=1)
+        causal_mask = causal_mask.masked_fill(future_mask, torch.finfo(dtype).min)
+        # Combine with padding mask if provided
         if attention_mask is not None and attention_mask.dim() == 2:
-            attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
-            attention_mask = attention_mask.to(dtype=hidden_states.dtype)
-            attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
+            # attention_mask: (batch, seq_len), 1=valid, 0=padding
+            padding_mask = (1.0 - attention_mask.to(dtype=dtype)).unsqueeze(1).unsqueeze(2)
+            padding_mask = padding_mask * torch.finfo(dtype).min
+            causal_mask = causal_mask + padding_mask  # (batch, 1, seq_len, seq_len)
+        attention_mask = causal_mask
 
         # Layer stack
         all_hidden_states = () if output_hidden_states else None
@@ -710,7 +732,7 @@ class GeoT5GemmaDecoder(T5GemmaDecoder):
                     # Empty cache, treat as None
                     past_key_values = None
 
-        for idx, decoder_layer in enumerate[Module](self.layers):
+        for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -763,8 +785,9 @@ class GeoT5GemmaDecoder(T5GemmaDecoder):
                 if encoder_hidden_states is not None:
                     all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
 
-        # Final layer norm
-        hidden_states = self.final_layer_norm(hidden_states)
+        # Final layer norm + dropout (matches T5GemmaDecoder: self.norm then self.dropout)
+        hidden_states = self.norm(hidden_states)
+        hidden_states = self.dropout(hidden_states)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -856,17 +879,16 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         # Initialize base model
         super().__init__(config)
 
-        # Replace encoder/decoder with Geo versions if LARA is enabled
-        # Note: T5GemmaForConditionalGeneration stores encoder/decoder in self.model
-        if self.geo_config.use_geo_self_attn:
-            # Encoder: only use LARA if explicitly enabled for encoder
+        # Replace encoder/decoder with Geo versions if LARA is enabled.
+        # GeoT5GemmaDecoder is needed when EITHER self-attn OR cross-attn uses LARA.
+        if self.geo_config.use_geo_self_attn or self.geo_config.use_geo_cross_attn:
+            # Encoder: only replace if explicitly enabled
             # (by default we don't use LARA in encoder due to sparse coordinates)
             enable_encoder_lara = config.geometric_config.get('enable_encoder_lara', False)
             if enable_encoder_lara:
                 self.model.encoder = GeoT5GemmaEncoder(config)
 
-            # Decoder: always use LARA when geometric_attention is enabled
-            # This is the most important part for EDA routing
+            # Decoder: replace whenever any decoder LARA variant is enabled
             self.model.decoder = GeoT5GemmaDecoder(config)
 
         # Initialize Position Embedding modules
@@ -954,8 +976,21 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         # Initialize VQ loss accumulator
         self._vq_loss = None
 
-        # Post-initialization
-        self.post_init()
+        # Initialize only the newly added geo modules.
+        # super().__init__(config) already called post_init() for all base T5Gemma weights.
+        # Calling self.post_init() again would re-randomize the entire base model,
+        # causing different initial weights than pure T5Gemma (training loss inconsistency).
+        for module in [
+            self.encoder_geo_pe,
+            self.decoder_geo_pe,
+            self.encoder_fourier_pe,
+            self.decoder_fourier_pe,
+            self.encoder_pe_vq,
+        ]:
+            if module is not None:
+                module.apply(self._init_weights)
+        # Re-tie embeddings in case new modules affect weight tying
+        self.tie_weights()
 
     def _add_encoder_geometric_embeddings(
         self,
