@@ -342,8 +342,10 @@ class XYFourierEmbedding(nn.Module):
         y = coords[..., 1:2].float() * self.coord_scale  # (..., 1)
 
         # Compute phases: (..., 1) * (num_freq,) -> (..., num_freq)
-        # Cast frequencies to input dtype for fp16 compatibility
-        freqs = self.frequencies.to(coords.dtype).view(*([1] * (coords.dim() - 1)), -1)
+        # CRITICAL: Keep frequencies in float32. coords.dtype may be torch.long (from data collator),
+        # and .to(torch.long) would truncate float frequencies (e.g. 0.000628 → 0), destroying
+        # ~80% of frequency bands. x and y are already float32 from .float() above.
+        freqs = self.frequencies.float().view(*([1] * (coords.dim() - 1)), -1)
         phase_x = x * freqs
         phase_y = y * freqs
 
@@ -485,9 +487,12 @@ class PolarRelativeEmbedding(nn.Module):
         theta = torch.atan2(dy, dx)  # Range: [-π, π]
 
         # Distance encoding: Fourier features
-        # Cast buffers to input dtype for fp16 compatibility
+        # CRITICAL: Keep frequencies in float32. input_dtype may be torch.long (from data collator),
+        # and .to(torch.long) would truncate float frequencies to integers, destroying most bands.
+        # r is already float32 from .float() above.
         r_expanded = r.unsqueeze(-1)  # (..., 1)
-        freqs = self.frequencies.to(input_dtype).view(*([1] * r.dim()), -1)  # (1, ..., num_freq)
+        freqs = self.frequencies.float().view(*([1] * r.dim()), -1)  # (1, ..., num_freq)
+
         phase_r = r_expanded * freqs
         distance_features = torch.cat([
             torch.sin(phase_r), torch.cos(phase_r)
@@ -495,7 +500,7 @@ class PolarRelativeEmbedding(nn.Module):
 
         # Direction encoding: Circular Harmonics
         theta_expanded = theta.unsqueeze(-1)  # (..., 1)
-        harmonics = self.harmonics.to(input_dtype).view(*([1] * theta.dim()), -1)  # (1, ..., K)
+        harmonics = self.harmonics.float().view(*([1] * theta.dim()), -1)  # (1, ..., K)
         phase_theta = theta_expanded * harmonics
         direction_features = torch.cat([
             torch.sin(phase_theta), torch.cos(phase_theta)
@@ -582,7 +587,7 @@ class GeometryAwarePositionEmbedding(nn.Module):
     │                          └───────┬───────┘                          │
     │                                  │                                  │
     │                          ┌───────┴───────┐                          │
-    │                          │  LayerNorm    │                          │
+    │                          │  × pe_scale   │                          │
     │                          └───────┬───────┘                          │
     │                                  ▼                                  │
     │                     Output: (batch, seq_len, hidden_size)           │
@@ -642,8 +647,13 @@ class GeometryAwarePositionEmbedding(nn.Module):
             nn.Dropout(config.dropout),
         )
 
-        # Layer normalization for stable training
-        self.layer_norm = nn.LayerNorm(config.hidden_size)
+        # Learnable scale factor for geo PE output.
+        # With MLP weights initialized at std=0.02, the MLP output already has
+        # small magnitude (std≈0.05). pe_scale=1.0 gives geo PE ~6% of token
+        # embedding magnitude — meaningful but not disruptive to pretrained weights.
+        # The model can learn to increase/decrease this during training.
+        # (Replaces LayerNorm which would amplify output to std≈1.0, 16x too large.)
+        self.pe_scale = nn.Parameter(torch.tensor(0.5))
 
         # Initialize MLP weights
         self._init_weights()
@@ -711,8 +721,8 @@ class GeometryAwarePositionEmbedding(nn.Module):
         # MLP Fusion
         fused = self.fusion_mlp(combined)  # (B, T, hidden_size)
 
-        # Layer Normalization
-        output = self.layer_norm(fused)
+        # Apply learnable scale (starts small to preserve pretrained embeddings)
+        output = fused * self.pe_scale
 
         # Apply attention mask (zero out padding positions)
         if attention_mask is not None:
@@ -726,7 +736,8 @@ class GeometryAwarePositionEmbedding(nn.Module):
             f"hidden_size={self.config.hidden_size}, "
             f"num_frequencies={self.config.num_frequencies}, "
             f"num_harmonics={self.config.num_harmonics}, "
-            f"total_input_dim={self.total_input_dim}"
+            f"total_input_dim={self.total_input_dim}, "
+            f"pe_scale={self.pe_scale.item():.4f}"
         )
 
 
@@ -755,7 +766,7 @@ class GeometryAwarePositionEmbeddingTMP(nn.Module):
     │                          └──────┬──────┘                            │
     │                                 │                                   │
     │                          ┌──────┴──────┐                            │
-    │                          │  LayerNorm  │                            │
+    │                          │  × pe_scale │                            │
     │                          └──────┬──────┘                            │
     │                                 ▼                                   │
     │                Output: (batch, seq_len, hidden_size)                │
@@ -787,8 +798,8 @@ class GeometryAwarePositionEmbeddingTMP(nn.Module):
             nn.Dropout(config.dropout),
         )
 
-        # Layer normalization for stable training
-        self.layer_norm = nn.LayerNorm(config.hidden_size)
+        # Learnable scale factor (same rationale as GeometryAwarePositionEmbedding)
+        self.pe_scale = nn.Parameter(torch.tensor(0.5))
 
         # Initialize MLP weights
         self._init_weights()
@@ -837,8 +848,8 @@ class GeometryAwarePositionEmbeddingTMP(nn.Module):
         # MLP Fusion
         fused = self.fusion_mlp(layer_emb)  # (B, T, hidden_size)
 
-        # Layer Normalization
-        output = self.layer_norm(fused)
+        # Apply learnable scale (starts small to preserve pretrained embeddings)
+        output = fused * self.pe_scale
 
         # Apply attention mask (zero out padding positions)
         if attention_mask is not None:

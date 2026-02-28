@@ -1036,6 +1036,17 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             if geo_embeds.dtype != inputs_embeds.dtype:
                 geo_embeds = geo_embeds.to(inputs_embeds.dtype)
 
+            # Mask out geo PE for tokens without real coordinates.
+            # Tokens with abs_pos=(0,0,0) AND rel_pos=(0,0,0) are non-positioned
+            # (e.g., token <Drive> ). Their Fourier/embedding outputs are
+            # non-zero artifacts (cos(0)=1, direction_embed(0)≠0) that add noise.
+            # Only DRIVER/LOAD tokens with real coordinates should receive geo PE.
+            has_coords = (
+                (abs_positions.abs().sum(dim=-1) > 0) |
+                (rel_positions.abs().sum(dim=-1) > 0)
+            ).unsqueeze(-1).to(geo_embeds.dtype)  # (B, T, 1)
+            geo_embeds = geo_embeds * has_coords
+
             # Apply VQ if enabled (information bottleneck)
             if self.encoder_pe_vq is not None:
                 geo_embeds, vq_loss, _ = self.encoder_pe_vq(geo_embeds, attention_mask)
@@ -1050,6 +1061,10 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             # Ensure dtype matches inputs_embeds (critical for fp16 training)
             if geo_embeds.dtype != inputs_embeds.dtype:
                 geo_embeds = geo_embeds.to(inputs_embeds.dtype)
+
+            # Mask out geo PE for tokens without real coordinates
+            has_coords = (abs_positions.abs().sum(dim=-1) > 0).unsqueeze(-1).to(geo_embeds.dtype)
+            geo_embeds = geo_embeds * has_coords
 
             # Apply VQ if enabled (information bottleneck)
             if self.encoder_pe_vq is not None:
