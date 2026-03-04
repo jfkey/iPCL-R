@@ -35,6 +35,23 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    Expand key/value heads for Grouped Query Attention (GQA).
+
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
+    The hidden states go from (batch, num_kv_heads, seq_len, head_dim)
+    to (batch, num_attention_heads, seq_len, head_dim).
+    """
+    batch, num_kv_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_kv_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
+
+
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     """
     Applies Rotary Position Embedding (RoPE) to query and key tensors.
@@ -387,25 +404,43 @@ class LieAlgebraRelativeAttention(nn.Module):
         self,
         hidden_size: int = 256,
         num_heads: int = 4,
+        num_kv_heads: int = 4,
         head_dim: int = 64,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
         use_geometric_bias: bool = True,
         bias_mlp_hidden: int = 64,
         coord_scale: float = 1e-4,
+        scaling: float = None,
+        attn_logit_softcapping: float = None,
+        attention_bias: bool = False,
     ):
         super().__init__()
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.use_geometric_bias = use_geometric_bias
         self.coord_scale = coord_scale
+        self.attn_logit_softcapping = attn_logit_softcapping
 
-        # Standard attention projections
-        self.q_proj = nn.Linear(hidden_size, num_heads * head_dim)
-        self.k_proj = nn.Linear(hidden_size, num_heads * head_dim)
-        self.v_proj = nn.Linear(hidden_size, num_heads * head_dim)
-        self.out_proj = nn.Linear(num_heads * head_dim, hidden_size)
+        # GQA: number of query heads per key/value head group
+        assert num_heads % num_kv_heads == 0, (
+            f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )
+        self.num_key_value_groups = num_heads // num_kv_heads
+
+        # Attention scaling: matches T5Gemma's query_pre_attn_scalar**-0.5
+        # Default: head_dim**-0.5 for backward compatibility
+        self.scaling = scaling if scaling is not None else head_dim ** -0.5
+
+        # Q projection: full num_heads (matches T5GemmaSelfAttention)
+        # K/V projections: num_kv_heads for GQA (matches T5GemmaSelfAttention)
+        # bias=attention_bias to match config.attention_bias (typically False)
+        self.q_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=attention_bias)
+        self.out_proj = nn.Linear(num_heads * head_dim, hidden_size, bias=attention_bias)
 
         # Geometric position embedding (quaternion rotation)
         self.geo_pe = GeometricPositionEmbedding(
@@ -424,8 +459,11 @@ class LieAlgebraRelativeAttention(nn.Module):
                 nn.Linear(bias_mlp_hidden, num_heads),
             )
 
-        self.dropout = nn.Dropout(dropout)
-        self.scale = head_dim ** -0.5
+        # attention_dropout: store as float, matching T5Gemma's convention.
+        # Applied via F.dropout(x, p=self.attention_dropout if self.training else 0.0, training=True)
+        # so eval mode ALWAYS gets p=0.0 regardless of the stored value.
+        # Default is 0.0 (T5GemmaModuleConfig.attention_dropout = 0.0).
+        self.attention_dropout = dropout
 
     def compute_geometric_bias(
         self,
@@ -506,50 +544,73 @@ class LieAlgebraRelativeAttention(nn.Module):
             hidden_states = hidden_states.to(self.q_proj.weight.dtype)
 
         # Project to Q, K, V
+        # Q: full num_heads, K/V: num_kv_heads (GQA, matches T5GemmaSelfAttention)
         query = self.q_proj(hidden_states).view(
             batch_size, seq_len, self.num_heads, self.head_dim
         )
         key = self.k_proj(hidden_states).view(
-            batch_size, seq_len, self.num_heads, self.head_dim
+            batch_size, seq_len, self.num_kv_heads, self.head_dim
         )
         value = self.v_proj(hidden_states).view(
-            batch_size, seq_len, self.num_heads, self.head_dim
+            batch_size, seq_len, self.num_kv_heads, self.head_dim
         )
 
         # Transpose for attention: (B, num_heads, T, head_dim)
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
-        
+        query = query.transpose(1, 2)    # (B, num_heads, T, head_dim)
+        key = key.transpose(1, 2)        # (B, num_kv_heads, T, head_dim)
+        value = value.transpose(1, 2)    # (B, num_kv_heads, T, head_dim)
+
         # Step 1: Apply RoPE (Rotary Position Embedding) for sequence position
+        # RoPE broadcasts over num_heads dimension, so works with different Q/K head counts
         if position_embeddings is not None:
             cos, sin = position_embeddings
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # Step 2: Apply GeoPE (Geometric Position Embedding) for 3D spatial position
-        query_rot, key_rot = self.geo_pe(query, key, coordinates)
+        # Step 2: GQA expansion — expand K/V from num_kv_heads to num_heads via repetition
+        # Must be done BEFORE GeoPE since GeoPE expects Q and K to have the same num_heads
+        key = repeat_kv(key, self.num_key_value_groups)     # (B, num_heads, T, head_dim)
+        value = repeat_kv(value, self.num_key_value_groups) # (B, num_heads, T, head_dim)
 
-        # Compute attention scores with rotated Q, K
-        attn_scores = torch.matmul(query_rot, key_rot.transpose(-2, -1)) * self.scale
+        # Step 3: Apply GeoPE (Geometric Position Embedding) for 3D spatial position
+        # Both Q and K now have num_heads, so GeoPE works correctly
+        query_rot, key_rot = self.geo_pe(query, key, coordinates)
+        
+        # Step 4: Compute attention scores with rotated Q, K
+        # Use self.scaling = query_pre_attn_scalar**-0.5 (matches T5Gemma, NOT head_dim**-0.5)
+        attn_scores = torch.matmul(query_rot, key_rot.transpose(-2, -1)) * self.scaling
         # (B, num_heads, T, T)
 
-        # Add geometric bias
+        # Step 5: Add geometric bias (if enabled)
         if self.use_geometric_bias:
             geo_bias = self.compute_geometric_bias(coordinates, target_dtype=attn_scores.dtype)
             attn_scores = attn_scores + geo_bias
 
-        # Apply attention mask (additive mask format: 0=valid, large_negative=invalid)
+        # Step 6: Attention logit soft-capping (matches T5Gemma's attn_logit_softcapping=50.0)
+        # Caps attention logits to [-cap, cap] via tanh to prevent degenerate softmax.
+        # Critical for training stability with random initialization.
+        if self.attn_logit_softcapping is not None:
+            attn_scores = attn_scores / self.attn_logit_softcapping
+            attn_scores = torch.tanh(attn_scores)
+            attn_scores = attn_scores * self.attn_logit_softcapping
+
+        # Step 7: Apply attention mask (additive format: 0=valid, large_negative=masked)
         if attention_mask is not None:
-            # attention_mask is already in additive format from HuggingFace
-            # Shape: (batch, 1, 1, seq_len) or (batch, 1, seq_len, seq_len)
-            # Just add it directly to attn_scores
-            attn_scores = attn_scores + attention_mask
+            # Slice to match key length (matches T5Gemma's eager_attention_forward)
+            causal_mask = attention_mask[:, :, :, :key_rot.shape[-2]]
+            attn_scores = attn_scores + causal_mask
 
-        # Softmax and dropout
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_probs = self.dropout(attn_probs)
+        # Step 8: Softmax in FP32 for numerical stability (matches T5Gemma's eager_attention_forward)
+        # FP16 softmax can overflow/underflow with large attention scores
+        attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query_rot.dtype)
+        # Attention dropout — matches T5Gemma: p=0.0 in eval, p=attention_dropout in train
+        # Using explicit self.training check (same pattern as T5GemmaSelfAttention.forward)
+        attn_probs = F.dropout(
+            attn_probs,
+            p=self.attention_dropout if self.training else 0.0,
+            training=True,
+        )
 
-        # Apply attention to values
+        # Step 9: Apply attention to values
         context = torch.matmul(attn_probs, value)  # (B, num_heads, T, head_dim)
 
         # Reshape and project output
@@ -611,35 +672,52 @@ class T5GemmaLARAAttention(nn.Module):
     ):
         super().__init__()
 
-        # Extract config parameters
+        # Extract config parameters — support both T5GemmaModuleConfig and T5GemmaConfig
         if hasattr(config, 'hidden_size'):
-            # Full model config
+            # T5GemmaModuleConfig (decoder sub-config) — the typical case for decoder layers
             self.hidden_size = config.hidden_size
             self.num_heads = config.num_attention_heads
+            self.num_kv_heads = getattr(config, 'num_key_value_heads', config.num_attention_heads)
             self.head_dim = config.head_dim
-            dropout_rate = getattr(config, 'dropout_rate', 0.1)
+            # Matches T5GemmaSelfAttention: scaling = query_pre_attn_scalar**-0.5
+            query_pre_attn_scalar = getattr(config, 'query_pre_attn_scalar', self.head_dim)
+            # attention_dropout: specifically for attention weights (typically 0.0 in T5Gemma)
+            # Distinct from residual dropout_rate (0.1), which is NOT applied to attention weights
+            attention_dropout = getattr(config, 'attention_dropout', 0.0)
+            # Soft-cap attention logits to [-cap, cap] via tanh (T5Gemma default: 50.0)
+            attn_logit_softcapping = getattr(config, 'attn_logit_softcapping', None)
+            # Attention projection bias (T5Gemma default: False)
+            attention_bias = getattr(config, 'attention_bias', False)
         elif hasattr(config, 'encoder'):
-            # T5GemmaConfig with encoder/decoder subconfigs
+            # Top-level T5GemmaConfig — fallback path
             encoder_config = config.encoder
             self.hidden_size = encoder_config.hidden_size
             self.num_heads = encoder_config.num_attention_heads
+            self.num_kv_heads = getattr(encoder_config, 'num_key_value_heads', self.num_heads)
             self.head_dim = encoder_config.head_dim
-            dropout_rate = config.dropout_rate
+            query_pre_attn_scalar = getattr(encoder_config, 'query_pre_attn_scalar', self.head_dim)
+            attention_dropout = getattr(encoder_config, 'attention_dropout', 0.0)
+            attn_logit_softcapping = getattr(encoder_config, 'attn_logit_softcapping', None)
+            attention_bias = getattr(encoder_config, 'attention_bias', False)
         else:
             raise ValueError(f"Unexpected config type: {type(config)}")
 
         self.layer_idx = layer_idx
         self.coord_scale = coord_scale
 
-        # Core LARA module
+        # Core LARA module — initialized with T5Gemma-consistent parameters
         self.lara = LieAlgebraRelativeAttention(
             hidden_size=self.hidden_size,
             num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
-            dropout=dropout_rate,
+            dropout=attention_dropout,
             use_geometric_bias=use_geometric_bias,
             bias_mlp_hidden=bias_mlp_hidden,
             coord_scale=coord_scale,
+            scaling=query_pre_attn_scalar ** -0.5,
+            attn_logit_softcapping=attn_logit_softcapping,
+            attention_bias=attention_bias,
         )
 
     def forward(
@@ -761,33 +839,52 @@ class CrossLARAAttention(nn.Module):
     ):
         super().__init__()
 
-        # Extract config parameters
+        # Extract config parameters — support both T5GemmaModuleConfig and T5GemmaConfig
         if hasattr(config, 'hidden_size'):
+            # T5GemmaModuleConfig (decoder sub-config)
             self.hidden_size = config.hidden_size
             self.num_heads = config.num_attention_heads
+            self.num_kv_heads = getattr(config, 'num_key_value_heads', config.num_attention_heads)
             self.head_dim = config.head_dim
-            dropout_rate = getattr(config, 'dropout_rate', 0.1)
+            query_pre_attn_scalar = getattr(config, 'query_pre_attn_scalar', self.head_dim)
+            attention_dropout = getattr(config, 'attention_dropout', 0.0)
+            attn_logit_softcapping = getattr(config, 'attn_logit_softcapping', None)
+            attention_bias = getattr(config, 'attention_bias', False)
         elif hasattr(config, 'decoder'):
+            # Top-level T5GemmaConfig
             decoder_config = config.decoder
             self.hidden_size = decoder_config.hidden_size
             self.num_heads = decoder_config.num_attention_heads
+            self.num_kv_heads = getattr(decoder_config, 'num_key_value_heads', self.num_heads)
             self.head_dim = decoder_config.head_dim
-            dropout_rate = config.dropout_rate
+            query_pre_attn_scalar = getattr(decoder_config, 'query_pre_attn_scalar', self.head_dim)
+            attention_dropout = getattr(decoder_config, 'attention_dropout', 0.0)
+            attn_logit_softcapping = getattr(decoder_config, 'attn_logit_softcapping', None)
+            attention_bias = getattr(decoder_config, 'attention_bias', False)
         else:
             raise ValueError(f"Unexpected config type: {type(config)}")
 
         self.layer_idx = layer_idx
         self.coord_scale = coord_scale
         self.use_geometric_bias = use_geometric_bias
+        self.attn_logit_softcapping = attn_logit_softcapping
+
+        # GQA: num_heads may differ from num_kv_heads
+        assert self.num_heads % self.num_kv_heads == 0
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
+
+        # Attention scaling: query_pre_attn_scalar**-0.5 (matches T5Gemma)
+        self.scaling = query_pre_attn_scalar ** -0.5
 
         # Cross-attention may have different hidden sizes for encoder/decoder
         self.cross_attention_hidden_size = cross_attention_hidden_size or self.hidden_size
 
-        # Projection layers
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim)
-        self.k_proj = nn.Linear(self.cross_attention_hidden_size, self.num_heads * self.head_dim)
-        self.v_proj = nn.Linear(self.cross_attention_hidden_size, self.num_heads * self.head_dim)
-        self.out_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size)
+        # Q projection: full num_heads; K/V: num_kv_heads for GQA
+        # bias=attention_bias to match config (typically False)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(self.cross_attention_hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(self.cross_attention_hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
+        self.out_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=attention_bias)
 
         # Geometric position embedding (for Q and K)
         self.geo_pe = GeometricPositionEmbedding(
@@ -805,8 +902,8 @@ class CrossLARAAttention(nn.Module):
                 nn.Linear(bias_mlp_hidden, self.num_heads),
             )
 
-        self.dropout = nn.Dropout(dropout_rate)
-        self.scale = self.head_dim ** -0.5
+        # Store as float, same convention as T5Gemma (0.0 by default)
+        self.attention_dropout = attention_dropout
 
     def compute_cross_geometric_bias(
         self,
@@ -899,18 +996,22 @@ class CrossLARAAttention(nn.Module):
         if past_key_value is not None:
             raise NotImplementedError("KV caching not yet supported in CrossLARAAttention")
 
-        # Project to Q, K, V
+        # Project to Q, K, V (GQA: K/V use num_kv_heads, Q uses num_heads)
         query = self.q_proj(hidden_states).view(
             batch_size, query_len, self.num_heads, self.head_dim
         ).transpose(1, 2)  # (batch, num_heads, query_len, head_dim)
 
         key = self.k_proj(encoder_hidden_states).view(
-            batch_size, key_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)  # (batch, num_heads, key_len, head_dim)
+            batch_size, key_len, self.num_kv_heads, self.head_dim
+        ).transpose(1, 2)  # (batch, num_kv_heads, key_len, head_dim)
 
         value = self.v_proj(encoder_hidden_states).view(
-            batch_size, key_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)  # (batch, num_heads, key_len, head_dim)
+            batch_size, key_len, self.num_kv_heads, self.head_dim
+        ).transpose(1, 2)  # (batch, num_kv_heads, key_len, head_dim)
+
+        # GQA: expand K/V from num_kv_heads to num_heads
+        key = repeat_kv(key, self.num_key_value_groups)     # (batch, num_heads, key_len, head_dim)
+        value = repeat_kv(value, self.num_key_value_groups) # (batch, num_heads, key_len, head_dim)
 
         # NOTE: In cross-attention, query_len != key_len, so we cannot use GeoPE
         # rotation directly (it assumes same seq_len for Q and K).
@@ -918,8 +1019,8 @@ class CrossLARAAttention(nn.Module):
         # The geometric bias already models the distance between decoder positions
         # (query_coordinates) and encoder positions (key_coordinates).
 
-        # Compute attention scores (without GeoPE rotation)
-        attn_scores = torch.matmul(query, key.transpose(-2, -1)) * self.scale
+        # Compute attention scores with corrected scaling (query_pre_attn_scalar**-0.5)
+        attn_scores = torch.matmul(query, key.transpose(-2, -1)) * self.scaling
 
         # Add geometric bias
         if self.use_geometric_bias:
@@ -928,15 +1029,24 @@ class CrossLARAAttention(nn.Module):
             )
             attn_scores = attn_scores + geo_bias
 
-        # Apply attention mask (additive mask format: 0=valid, large_negative=invalid)
+        # Attention logit soft-capping (matches T5Gemma's attn_logit_softcapping)
+        if self.attn_logit_softcapping is not None:
+            attn_scores = attn_scores / self.attn_logit_softcapping
+            attn_scores = torch.tanh(attn_scores)
+            attn_scores = attn_scores * self.attn_logit_softcapping
+
+        # Apply attention mask (additive format: 0=valid, large_negative=masked)
         if attention_mask is not None:
-            # attention_mask is already in additive format from HuggingFace
-            # Just add it directly to attn_scores
             attn_scores = attn_scores + attention_mask
 
-        # Softmax and dropout
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        attn_probs = self.dropout(attn_probs)
+        # Softmax in FP32 for numerical stability (matches T5Gemma's eager_attention_forward)
+        attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        # Attention dropout — explicit self.training check, same as T5GemmaSelfAttention
+        attn_probs = F.dropout(
+            attn_probs,
+            p=self.attention_dropout if self.training else 0.0,
+            training=True,
+        )
 
         # Apply attention to values
         context = torch.matmul(attn_probs, value)  # (batch, num_heads, query_len, head_dim)

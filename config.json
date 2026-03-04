@@ -39,8 +39,8 @@
     "training": {
         "paths": {
             "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/split_dataset",
-            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_advanced_geo",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_advanced_geo/logs"
+            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_self_att",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_self_att/logs"
         },
         "model": {
             "hidden_size": 512,
@@ -56,7 +56,7 @@
                 "use_basic_fourier_pe": false,
                 "use_advanced_geo_pe": true,
                 "use_metal_layer_only_pe":false,
-                "use_geo_self_attn": false, 
+                "use_geo_self_attn": true, 
                 "use_geo_cross_attn": false, 
                 "enable_encoder_lara": false,       
                 "coord_scale": 1e-6,

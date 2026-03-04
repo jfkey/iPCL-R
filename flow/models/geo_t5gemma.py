@@ -887,9 +887,18 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             enable_encoder_lara = config.geometric_config.get('enable_encoder_lara', False)
             if enable_encoder_lara:
                 self.model.encoder = GeoT5GemmaEncoder(config)
+                # Initialize new encoder modules with T5Gemma weight init strategy
+                # (super().__init__ already called post_init, so new modules aren't covered)
+                self.model.encoder.apply(self._init_weights)
 
             # Decoder: replace whenever any decoder LARA variant is enabled
             self.model.decoder = GeoT5GemmaDecoder(config)
+            # Initialize new decoder modules with T5Gemma weight init strategy.
+            # This covers ALL decoder sub-modules: LARA projections, cross_attn, MLP, norms.
+            # Without this, they use PyTorch default Kaiming uniform instead of normal(0, 0.02),
+            # causing different training dynamics vs the standard T5Gemma decoder.
+            # Note: embed_tokens will be re-tied to shared embedding by tie_weights() below.
+            self.model.decoder.apply(self._init_weights)
 
         # Initialize Position Embedding modules
         self.encoder_geo_pe = None
@@ -1316,13 +1325,21 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             # Compute logits and loss
             lm_logits = self.lm_head(decoder_outputs[0])
 
+            # Apply final logit softcapping (matches T5Gemma base class).
+            # Without this, logits grow unbounded after many epochs, causing
+            # dropout-perturbed predictions to incur extreme penalties in training
+            # (train_loss >> eval_loss, e.g. 14 vs 0.9).
+            decoder_config = decoder.config
+            if getattr(decoder_config, 'final_logit_softcapping', None) is not None:
+                lm_logits = lm_logits / decoder_config.final_logit_softcapping
+                lm_logits = torch.tanh(lm_logits)
+                lm_logits = lm_logits * decoder_config.final_logit_softcapping
+
             loss = None
             if labels is not None:
-                loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
-                loss = loss_fct(
-                    lm_logits.view(-1, lm_logits.size(-1)),
-                    labels.view(-1)
-                )
+                # Use base class loss_function (ForMaskedLMLoss) which upcasts
+                # logits to FP32 before computing cross-entropy for numerical stability.
+                loss = self.loss_function(lm_logits, labels, self.config.vocab_size, **kwargs )
 
                 # Add VQ loss if applicable
                 if self._vq_loss is not None:
