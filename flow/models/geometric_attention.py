@@ -252,119 +252,218 @@ class GeometricPositionEmbedding(nn.Module):
 
         return torch.stack([v_prime_x, v_prime_y, v_prime_z], dim=-1)
 
-    def forward(
+    def _prepare_coords(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        coordinates: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        coordinates: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+    ) -> torch.Tensor:
         """
-        Apply GeoPE rotation to query and key vectors.
-
-        The rotation encodes absolute 3D positions into the attention mechanism.
-        When computing attention scores q_rot · k_rot, the relative position
-        information emerges naturally from the rotation difference.
-
-        All intermediate computations (theta, quaternion, rotation) are done in
-        FP32 to avoid numerical issues in FP16 (epsilon underflow, trig precision).
-        Only the final output is cast back to the input dtype.
+        Prepare coordinates: handle batch/seq_len mismatches, scale to FP32.
 
         Args:
-            query: Query vectors (batch, num_heads, seq_len, head_dim)
-            key: Key vectors (batch, num_heads, seq_len, head_dim)
-            coordinates: 3D coordinates (batch, seq_len, 3)
+            coordinates: 3D coordinates (coord_batch, coord_seq, 3)
+            batch_size: Expected batch size (from query/key)
+            seq_len: Expected sequence length (from query/key)
 
         Returns:
-            Tuple of (query_rotated, key_rotated) with same shapes as input
+            Scaled coordinates in FP32 (batch_size, seq_len, 3)
         """
-        batch_size, num_heads, seq_len, head_dim = query.shape
-        # Store original dtype for fp16 compatibility
-        input_dtype = query.dtype
-
-        # Handle shape mismatches between query and coordinates
-        # This can happen during beam search (batch expansion) or incremental decoding (seq_len mismatch)
-        # Work in FP32 for all intermediate computations to avoid fp16 numerical issues:
-        # - Epsilon values like 1e-8 underflow to 0 in fp16 (min subnormal ~6e-8)
-        # - This causes 0/0 = NaN in compute_quaternion when coordinates are zero (padding tokens)
         coords = coordinates.float()
         coord_batch, coord_seq, _ = coords.shape
 
         # Handle batch dimension mismatch (beam search expands batch by num_beams)
         if coord_batch != batch_size:
             if batch_size % coord_batch == 0:
-                # Expand coordinates for beam search: (B, T, 3) -> (B*num_beams, T, 3)
                 num_beams = batch_size // coord_batch
                 coords = coords.unsqueeze(1).expand(-1, num_beams, -1, -1)
                 coords = coords.reshape(batch_size, coord_seq, 3)
             else:
                 raise ValueError(
-                    f"Batch size mismatch: query has {batch_size}, coordinates has {coord_batch}"
+                    f"Batch size mismatch: expected {batch_size}, coordinates has {coord_batch}"
                 )
 
         # Handle seq_len mismatch (incremental decoding uses only current token)
         if coord_seq != seq_len:
             if coord_seq > seq_len:
-                # Take the last seq_len positions (for incremental decoding)
                 coords = coords[:, -seq_len:, :]
             else:
                 raise ValueError(
-                    f"Seq len mismatch: query has {seq_len}, coordinates has {coord_seq}"
+                    f"Seq len mismatch: expected {seq_len}, coordinates has {coord_seq}"
                 )
 
-        # Scale coordinates in FP32 (stay in FP32 for all subsequent computations)
-        coords = coords * self.coord_scale  # (B, T, 3)
+        # Scale coordinates in FP32
+        coords = coords * self.coord_scale
+        return coords
+
+    def _coords_to_quaternion(
+        self,
+        coordinates: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Convert 3D coordinates to quaternion components for rotation.
+
+        All computations in FP32 for numerical stability.
+
+        Args:
+            coordinates: 3D coordinates (batch, seq_len, 3)
+            batch_size: Expected batch size
+            seq_len: Expected sequence length
+
+        Returns:
+            Tuple of (w, qx, qy, qz), each (batch, 1, seq_len, num_subvectors)
+            with head dimension already unsqueezed for broadcasting.
+        """
+        coords = self._prepare_coords(coordinates, batch_size, seq_len)
 
         x_pos = coords[:, :, 0]  # (B, T)
-        y_pos = coords[:, :, 1]  # (B, T)
-        z_pos = coords[:, :, 2]  # (B, T)
+        y_pos = coords[:, :, 1]
+        z_pos = coords[:, :, 2]
 
         # Compute phases for each sub-vector in FP32
-        # theta = position × frequency
-        # inv_freq is already FP32 (registered buffer), keep it in FP32
         inv_freq = self.inv_freq  # (num_subvectors,) in FP32
         theta_x = torch.einsum('bt,f->btf', x_pos, inv_freq)  # (B, T, num_subvectors)
         theta_y = torch.einsum('bt,f->btf', y_pos, inv_freq)
         theta_z = torch.einsum('bt,f->btf', z_pos, inv_freq)
 
-        # Compute symmetric quaternion for each position (in FP32)
+        # Compute symmetric quaternion (in FP32)
         w, qx, qy, qz = self.compute_quaternion(theta_x, theta_y, theta_z)
-        # Each has shape (B, T, num_subvectors)
 
-        # Handle head_dim not divisible by 3
+        # Expand for head broadcasting: (B, 1, T, num_subvectors)
+        return w.unsqueeze(1), qx.unsqueeze(1), qy.unsqueeze(1), qz.unsqueeze(1)
+
+    def _rotate_vectors(
+        self,
+        vectors: torch.Tensor,
+        w: torch.Tensor,
+        qx: torch.Tensor,
+        qy: torch.Tensor,
+        qz: torch.Tensor,
+        inverse: bool = False,
+    ) -> torch.Tensor:
+        """
+        Apply quaternion rotation to vectors, handling head_dim padding.
+
+        Args:
+            vectors: (batch, num_heads, seq_len, head_dim)
+            w, qx, qy, qz: Quaternion components (batch, 1, seq_len, num_subvectors)
+            inverse: If True, apply inverse rotation (conjugate quaternion: negate qx,qy,qz)
+
+        Returns:
+            Rotated vectors (batch, num_heads, seq_len, head_dim) in FP32
+        """
+        batch_size, num_heads, seq_len, head_dim = vectors.shape
+
+        if inverse:
+            qx, qy, qz = -qx, -qy, -qz
+
         if self.needs_padding:
-            query_to_rotate = query[..., :self.effective_head_dim]
-            key_to_rotate = key[..., :self.effective_head_dim]
-            query_remainder = query[..., self.effective_head_dim:]
-            key_remainder = key[..., self.effective_head_dim:]
+            to_rotate = vectors[..., :self.effective_head_dim]
+            remainder = vectors[..., self.effective_head_dim:]
         else:
-            query_to_rotate = query
-            key_to_rotate = key
+            to_rotate = vectors
 
-        # Cast query/key to FP32 for rotation, then cast back at the end
-        query_3d = query_to_rotate.float().view(batch_size, num_heads, seq_len, self.num_subvectors, 3)
-        key_3d = key_to_rotate.float().view(batch_size, num_heads, seq_len, self.num_subvectors, 3)
+        vecs_3d = to_rotate.float().view(
+            batch_size, num_heads, seq_len, self.num_subvectors, 3
+        )
+        rotated = self.quaternion_rotate(vecs_3d, w, qx, qy, qz)
+        rotated = rotated.view(
+            batch_size, num_heads, seq_len, self.effective_head_dim
+        )
 
-        # Expand quaternion for broadcasting: (B, 1, T, num_subvectors)
-        w = w.unsqueeze(1)
-        qx = qx.unsqueeze(1)
-        qy = qy.unsqueeze(1)
-        qz = qz.unsqueeze(1)
-
-        # Apply rotation to each 3D sub-vector (all in FP32)
-        query_rotated = self.quaternion_rotate(query_3d, w, qx, qy, qz)
-        key_rotated = self.quaternion_rotate(key_3d, w, qx, qy, qz)
-
-        # Reshape back to (B, num_heads, T, effective_head_dim)
-        query_rotated = query_rotated.view(batch_size, num_heads, seq_len, self.effective_head_dim)
-        key_rotated = key_rotated.view(batch_size, num_heads, seq_len, self.effective_head_dim)
-
-        # Concatenate with non-rotated remainder if needed
         if self.needs_padding:
-            query_rotated = torch.cat([query_rotated, query_remainder.float()], dim=-1)
-            key_rotated = torch.cat([key_rotated, key_remainder.float()], dim=-1)
+            rotated = torch.cat([rotated, remainder.float()], dim=-1)
 
-        # Cast back to input dtype (fp16/bf16) only at the very end
+        return rotated
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        query_coordinates: torch.Tensor,
+        key_coordinates: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply GeoPE rotation to query and key vectors.
+
+        Supports both self-attention (single coordinate set) and cross-attention
+        (separate coordinates for Q and K).
+
+        In self-attention (key_coordinates=None):
+            Q and K are rotated by the same coordinates. The relative geometry
+            emerges from R(p_i)^{-1} R(p_j) in the dot product.
+
+        In cross-attention (key_coordinates provided):
+            Q is rotated by query_coordinates, K by key_coordinates. The relative
+            geometry emerges from R(p^q_i)^{-1} R(p^kv_j).
+
+        Args:
+            query: Query vectors (batch, num_heads, query_len, head_dim)
+            key: Key vectors (batch, num_heads, key_len, head_dim)
+            query_coordinates: Coordinates for Q rotation (batch, query_len, 3)
+            key_coordinates: Coordinates for K rotation (batch, key_len, 3).
+                If None, uses query_coordinates (self-attention mode).
+
+        Returns:
+            Tuple of (query_rotated, key_rotated) with same shapes as input
+        """
+        input_dtype = query.dtype
+        batch_size_q, num_heads, query_len, _ = query.shape
+        batch_size_k, _, key_len, _ = key.shape
+
+        # Compute quaternion for query coordinates
+        w_q, qx_q, qy_q, qz_q = self._coords_to_quaternion(
+            query_coordinates, batch_size_q, query_len
+        )
+
+        if key_coordinates is None:
+            # Self-attention: same quaternion for Q and K
+            w_k, qx_k, qy_k, qz_k = w_q, qx_q, qy_q, qz_q
+        else:
+            # Cross-attention: separate quaternion for K
+            w_k, qx_k, qy_k, qz_k = self._coords_to_quaternion(
+                key_coordinates, batch_size_k, key_len
+            )
+
+        # Rotate Q with query quaternion, K with key quaternion
+        query_rotated = self._rotate_vectors(query, w_q, qx_q, qy_q, qz_q)
+        key_rotated = self._rotate_vectors(key, w_k, qx_k, qy_k, qz_k)
+
         return query_rotated.to(input_dtype), key_rotated.to(input_dtype)
+
+    def rotate_value(
+        self,
+        value: torch.Tensor,
+        coordinates: torch.Tensor,
+        inverse: bool = True,
+    ) -> torch.Tensor:
+        """
+        Apply geometric rotation to value vectors for Cross-LARA value rotation.
+
+        In Cross-LARA, value rotation uses a factored form:
+            o_i = R(p^d_i) * Σ_j α_ij * R(p^e_j)^{-1} * v_j
+
+        This method handles one side of the factorization:
+        - rotate_value(V, p^e, inverse=True)  → R(p^e)^{-1} V  (encoder side, precomputed)
+        - rotate_value(C, p^d, inverse=False)  → R(p^d) C       (decoder side, post-aggregation)
+
+        Args:
+            value: Value vectors (batch, num_heads, seq_len, head_dim)
+            coordinates: 3D coordinates (batch, seq_len, 3)
+            inverse: If True, apply inverse rotation R^{-1} (conjugate quaternion)
+
+        Returns:
+            Rotated value vectors (batch, num_heads, seq_len, head_dim)
+        """
+        input_dtype = value.dtype
+        batch_size, num_heads, seq_len, _ = value.shape
+
+        w, qx, qy, qz = self._coords_to_quaternion(coordinates, batch_size, seq_len)
+        rotated = self._rotate_vectors(value, w, qx, qy, qz, inverse=inverse)
+
+        return rotated.to(input_dtype)
 
 
 class LieAlgebraRelativeAttention(nn.Module):
@@ -573,7 +672,8 @@ class LieAlgebraRelativeAttention(nn.Module):
 
         # Step 3: Apply GeoPE (Geometric Position Embedding) for 3D spatial position
         # Both Q and K now have num_heads, so GeoPE works correctly
-        query_rot, key_rot = self.geo_pe(query, key, coordinates)
+        # Self-attention: key_coordinates=None → same coords for Q and K
+        query_rot, key_rot = self.geo_pe(query, key, query_coordinates=coordinates)
         
         # Step 4: Compute attention scores with rotated Q, K
         # Use self.scaling = query_pre_attn_scalar**-0.5 (matches T5Gemma, NOT head_dim**-0.5)
@@ -809,21 +909,48 @@ class T5GemmaLARAAttention(nn.Module):
 
 class CrossLARAAttention(nn.Module):
     """
-    Cross-Attention with LARA for geometry-aware encoding-decoding.
+    Cross-Attention with Lie Algebra Relative Attention (Cross-LARA).
 
-    Extends LARA to cross-attention scenario where:
-    - Query: from decoder (with decoder coordinates)
-    - Key/Value: from encoder (with encoder coordinates)
-    - Geometric bias: computed based on spatial distance between q and k positions
+    Extends LARA to cross-attention with three levels of geometric awareness:
 
-    This is crucial for EDA routing where the decoder (current path position)
-    should attend more to spatially nearby source loads/drivers.
+    Level 1 — WHERE to attend (geometric bias):
+        Learned MLP bias from relative displacement φ(p^d_i - p^e_j) modulates
+        attention scores, providing a spatial prior for which pins to attend to.
+
+    Level 2 — HOW to interact (dual-coordinate GeoPE on Q/K):
+        Q is rotated by decoder coordinates, K by encoder coordinates:
+            q̂_i = R(p^d_i) q_i,  k̂_j = R(p^e_j) k_j
+        The dot product ⟨q̂_i, k̂_j⟩ = ⟨q_i, R_rel k_j⟩ decomposes via Rodrigues
+        into projected similarity + axial alignment + torsional components,
+        capturing direction-sensitive geometric relationships.
+
+    Level 3 — WHAT to extract (geometric value rotation):
+        Values are aggregated through a factored reference-frame transform:
+            o_i = R(p^d_i) · Σ_j α_ij · R(p^e_j)^{-1} · v_j
+        Encoder values are "unrotated" to a canonical frame, aggregated, then
+        rotated into the decoder's local reference frame. This allows the model
+        to extract different semantic information depending on relative geometry.
+
+    Key properties:
+    - Geometric Coincidence: When p^d_i = p^e_j (decoder at a pin), all rotations
+      cancel → pure semantic attention + constant bias. The model focuses on
+      "what information does this pin carry", not "where is it".
+    - Self-attention Reduction: When P^q = P^{kv}, value rotation cancels to
+      identity, recovering exactly the Self-LARA formulation.
+    - Efficiency: Value rotation uses a factored form with O((T_d + T_e) · d)
+      extra cost, same asymptotic complexity as standard attention.
+
+    For EDA routing:
+    - At pin positions: pure semantic attention (read pin properties)
+    - Between pins: geometrically modulated attention (nearby pins contribute
+      fine-grained routing guidance, far pins contribute connectivity constraints)
 
     Args:
         config: Model config with hidden_size, num_heads, etc.
         layer_idx: Layer index
         coord_scale: Coordinate scaling factor
-        use_geometric_bias: Whether to use MLP-based geometric bias
+        use_geometric_bias: Whether to use MLP-based geometric bias (Level 1)
+        use_value_rotation: Whether to use geometric value rotation (Level 3)
         bias_mlp_hidden: Hidden dimension for bias MLP
         cross_attention_hidden_size: Encoder hidden size (if different from decoder)
     """
@@ -834,6 +961,7 @@ class CrossLARAAttention(nn.Module):
         layer_idx: int = 0,
         coord_scale: float = 1e-5,
         use_geometric_bias: bool = True,
+        use_value_rotation: bool = True,
         bias_mlp_hidden: int = 64,
         cross_attention_hidden_size: Optional[int] = None,
     ):
@@ -867,6 +995,7 @@ class CrossLARAAttention(nn.Module):
         self.layer_idx = layer_idx
         self.coord_scale = coord_scale
         self.use_geometric_bias = use_geometric_bias
+        self.use_value_rotation = use_value_rotation
         self.attn_logit_softcapping = attn_logit_softcapping
 
         # GQA: num_heads may differ from num_kv_heads
@@ -886,7 +1015,7 @@ class CrossLARAAttention(nn.Module):
         self.v_proj = nn.Linear(self.cross_attention_hidden_size, self.num_kv_heads * self.head_dim, bias=attention_bias)
         self.out_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=attention_bias)
 
-        # Geometric position embedding (for Q and K)
+        # Geometric position embedding (for Q/K rotation and value rotation)
         self.geo_pe = GeometricPositionEmbedding(
             hidden_size=self.hidden_size,
             num_heads=self.num_heads,
@@ -894,7 +1023,7 @@ class CrossLARAAttention(nn.Module):
             coord_scale=coord_scale,
         )
 
-        # Geometric bias MLP
+        # Geometric bias MLP (Level 1)
         if use_geometric_bias:
             self.geo_bias_mlp = nn.Sequential(
                 nn.Linear(3, bias_mlp_hidden),
@@ -912,7 +1041,10 @@ class CrossLARAAttention(nn.Module):
         target_dtype: torch.dtype = None,
     ) -> torch.Tensor:
         """
-        Compute geometric bias for cross-attention.
+        Compute geometric bias for cross-attention (Level 1).
+
+        Maps relative 3D displacement to per-head attention bias:
+            b_{ij}^{(h)} = MLP(p^d_i - p^e_j)
 
         Args:
             query_coords: Decoder coordinates (batch, query_len, 3)
@@ -922,8 +1054,6 @@ class CrossLARAAttention(nn.Module):
         Returns:
             Geometric bias (batch, num_heads, query_len, key_len)
         """
-        batch_size, query_len, _ = query_coords.shape
-        _, key_len, _ = key_coords.shape
         if target_dtype is None:
             target_dtype = query_coords.dtype
 
@@ -940,11 +1070,9 @@ class CrossLARAAttention(nn.Module):
         rel_disp = rel_disp.to(mlp_weight_dtype)
 
         # MLP to compute per-head bias
-        # Note: geo_bias_mlp weights may be fp16 in mixed precision training
         bias = self.geo_bias_mlp(rel_disp)  # (batch, query_len, key_len, num_heads)
         bias = bias.permute(0, 3, 1, 2)      # (batch, num_heads, query_len, key_len)
 
-        # Cast to target dtype if needed
         if target_dtype is not None and bias.dtype != target_dtype:
             bias = bias.to(target_dtype)
         return bias
@@ -961,15 +1089,18 @@ class CrossLARAAttention(nn.Module):
         **kwargs
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """
-        Cross-attention with geometric awareness.
+        Cross-LARA forward pass with three levels of geometric awareness.
+
+        Implements the unified LARA formula for cross-attention:
+            o_i = R(p^d_i) · softmax(R(p^d_i)Q · (R(p^e_j)K)^T / √d + φ(Δp)) · R(p^e_j)^{-1} V
 
         Args:
             hidden_states: Decoder hidden states (batch, query_len, hidden_size)
             encoder_hidden_states: Encoder hidden states (batch, key_len, hidden_size)
-            attention_mask: Attention mask
+            attention_mask: Attention mask (additive: 0=valid, large_neg=masked)
             query_coordinates: Decoder coordinates (batch, query_len, 3)
             key_coordinates: Encoder coordinates (batch, key_len, 3)
-            past_key_value: KV cache
+            past_key_value: KV cache (not yet supported)
             output_attentions: Whether to return attention weights
 
         Returns:
@@ -992,11 +1123,11 @@ class CrossLARAAttention(nn.Module):
                 f"key_coordinates={key_coordinates is not None}"
             )
 
-        # Check unsupported features
         if past_key_value is not None:
             raise NotImplementedError("KV caching not yet supported in CrossLARAAttention")
 
-        # Project to Q, K, V (GQA: K/V use num_kv_heads, Q uses num_heads)
+        # ── Step 1: Linear projections ──
+        # Q from decoder, K/V from encoder (GQA: K/V use num_kv_heads)
         query = self.q_proj(hidden_states).view(
             batch_size, query_len, self.num_heads, self.head_dim
         ).transpose(1, 2)  # (batch, num_heads, query_len, head_dim)
@@ -1009,49 +1140,79 @@ class CrossLARAAttention(nn.Module):
             batch_size, key_len, self.num_kv_heads, self.head_dim
         ).transpose(1, 2)  # (batch, num_kv_heads, key_len, head_dim)
 
-        # GQA: expand K/V from num_kv_heads to num_heads
+        # ── Step 2: GQA expansion ──
+        # Expand K/V from num_kv_heads to num_heads before GeoPE
         key = repeat_kv(key, self.num_key_value_groups)     # (batch, num_heads, key_len, head_dim)
         value = repeat_kv(value, self.num_key_value_groups) # (batch, num_heads, key_len, head_dim)
 
-        # NOTE: In cross-attention, query_len != key_len, so we cannot use GeoPE
-        # rotation directly (it assumes same seq_len for Q and K).
-        # Instead, we rely on geometric_bias to capture spatial relationships.
-        # The geometric bias already models the distance between decoder positions
-        # (query_coordinates) and encoder positions (key_coordinates).
+        # ── Step 3: Level 2 — Dual-coordinate GeoPE on Q/K ──
+        # Q rotated by decoder coords, K rotated by encoder coords
+        # Attention score decomposes via Rodrigues formula:
+        #   ⟨R(p^d_i)q, R(p^e_j)k⟩ = ⟨q, R_rel k⟩
+        # where R_rel = R(p^d_i)^{-1} R(p^e_j) encodes relative geometry
+        query_rot, key_rot = self.geo_pe(
+            query, key,
+            query_coordinates=query_coordinates,
+            key_coordinates=key_coordinates,
+        )
 
-        # Compute attention scores with corrected scaling (query_pre_attn_scalar**-0.5)
-        attn_scores = torch.matmul(query, key.transpose(-2, -1)) * self.scaling
+        # ── Step 4: Attention scores ──
+        attn_scores = torch.matmul(query_rot, key_rot.transpose(-2, -1)) * self.scaling
+        # (batch, num_heads, query_len, key_len)
 
-        # Add geometric bias
+        # ── Step 5: Level 1 — Geometric bias ──
         if self.use_geometric_bias:
             geo_bias = self.compute_cross_geometric_bias(
                 query_coordinates, key_coordinates, target_dtype=attn_scores.dtype
             )
             attn_scores = attn_scores + geo_bias
 
-        # Attention logit soft-capping (matches T5Gemma's attn_logit_softcapping)
+        # ── Step 6: Attention logit soft-capping ──
         if self.attn_logit_softcapping is not None:
             attn_scores = attn_scores / self.attn_logit_softcapping
             attn_scores = torch.tanh(attn_scores)
             attn_scores = attn_scores * self.attn_logit_softcapping
 
-        # Apply attention mask (additive format: 0=valid, large_negative=masked)
+        # ── Step 7: Attention mask ──
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
 
-        # Softmax in FP32 for numerical stability (matches T5Gemma's eager_attention_forward)
-        attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query.dtype)
-        # Attention dropout — explicit self.training check, same as T5GemmaSelfAttention
+        # ── Step 8: Softmax + dropout ──
+        attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query_rot.dtype)
         attn_probs = F.dropout(
             attn_probs,
             p=self.attention_dropout if self.training else 0.0,
             training=True,
         )
 
-        # Apply attention to values
-        context = torch.matmul(attn_probs, value)  # (batch, num_heads, query_len, head_dim)
+        # ── Step 9: Level 3 — Geometric value rotation ──
+        # Factored form: o_i = R(p^d_i) · Σ_j α_ij · R(p^e_j)^{-1} · v_j
+        #
+        # Encoder side (precomputed):  ṽ_j = R(p^e_j)^{-1} v_j     — O(T_e · d)
+        # Standard aggregation:       c_i = Σ_j α_ij · ṽ_j          — O(T_d · T_e · d)
+        # Decoder side (post-agg):    o_i = R(p^d_i) · c_i           — O(T_d · d)
+        #
+        # Geometric Coincidence: when p^d_i = p^e_j, R(p^d)·R(p^e)^{-1} = I
+        # → value passes through unchanged (pure semantic attention at pin positions)
+        if self.use_value_rotation:
+            # Encoder side: unrotate values to canonical frame
+            value_canonical = self.geo_pe.rotate_value(
+                value, key_coordinates, inverse=True
+            )  # R(p^e_j)^{-1} v_j
 
-        # Reshape and project output
+            # Standard weighted aggregation in canonical frame
+            context = torch.matmul(attn_probs, value_canonical)
+            # (batch, num_heads, query_len, head_dim)
+
+            # Decoder side: rotate aggregated context to decoder's reference frame
+            context = self.geo_pe.rotate_value(
+                context, query_coordinates, inverse=False
+            )  # R(p^d_i) · c_i
+        else:
+            # Standard value aggregation (no geometric value rotation)
+            context = torch.matmul(attn_probs, value)
+
+        # ── Step 10: Output projection ──
         context = context.transpose(1, 2).contiguous().view(
             batch_size, query_len, self.num_heads * self.head_dim
         )

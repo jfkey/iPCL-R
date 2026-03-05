@@ -3,7 +3,7 @@
 """
 @File    :   vq.py
 @Time    :   2025/02/10
-@Author  :   Claude
+@Author  :   Junfeng Liu
 @Version :   1.0
 @Desc    :   Vector Quantization for Position Embeddings.
 

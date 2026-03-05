@@ -3,7 +3,7 @@
 """
 @File    :   coordinate_tracker.py
 @Time    :   2025/01/29
-@Author  :   Claude Code
+@Author  :   Junfeng Liu
 @Version :   1.0
 @Desc    :   Real-time coordinate tracking for inference-time generation.
 

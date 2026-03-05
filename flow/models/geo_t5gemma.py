@@ -3,7 +3,7 @@
 """
 @File    :   geo_t5gemma.py
 @Time    :   2025/01/14
-@Author  :   Dawn Li
+@Author  :   Junfeng Liu
 @Version :   1.0
 @Desc    :   GeoT5Gemma: T5Gemma with Geometry-Aware Position Embeddings.
              Combined implementation of Steps 2 and 3 for geometry-aware
@@ -85,7 +85,9 @@ class GeoConfig:
         floor_freq_ratio: Ratio for clipping low frequencies
         max_sequence_length: Maximum sequence length for frequency clipping
         pe_dropout: Dropout rate for position embeddings
-        use_geometric_bias: Whether to use MLP bias in LARA
+        self_attn_geometric_bias: Whether to use MLP bias in self-attention LARA
+        cross_attn_geometric_bias: Whether to use MLP bias in cross-attention LARA
+        use_value_rotation: Whether to use value rotation in cross-attention LARA
         bias_mlp_hidden: Hidden dimension for geometric bias MLP
     """
 
@@ -112,7 +114,9 @@ class GeoConfig:
     pe_dropout: float = 0.1  # Dropout for position embeddings
 
     # Geometric Attention settings (Step 3)
-    use_geometric_bias: bool = True
+    self_attn_geometric_bias: bool = True   # MLP bias for self-attention (encoder + decoder)
+    cross_attn_geometric_bias: bool = True  # MLP bias for cross-attention
+    use_value_rotation: bool = True         # Value rotation for cross-attention
     bias_mlp_hidden: int = 64
 
     # Vector Quantization settings (Information Bottleneck)
@@ -191,7 +195,7 @@ class GeoT5GemmaEncoderLayer(T5GemmaEncoderLayer):
                 config,
                 layer_idx=layer_idx,
                 coord_scale=geo_config_dict.get('coord_scale', 1e-5),
-                use_geometric_bias=geo_config_dict.get('use_geometric_bias', True),
+                use_geometric_bias=geo_config_dict.get('self_attn_geometric_bias', True),
                 bias_mlp_hidden=geo_config_dict.get('bias_mlp_hidden', 64),
             )
 
@@ -463,7 +467,7 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
                 config,
                 layer_idx=layer_idx,
                 coord_scale=geo_config_dict.get('coord_scale', 1e-5),
-                use_geometric_bias=geo_config_dict.get('use_geometric_bias', True),
+                use_geometric_bias=geo_config_dict.get('self_attn_geometric_bias', True),
                 bias_mlp_hidden=geo_config_dict.get('bias_mlp_hidden', 64),
             )
 
@@ -473,7 +477,8 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
                 config,
                 layer_idx=layer_idx,
                 coord_scale=geo_config_dict.get('coord_scale', 1e-5),
-                use_geometric_bias=geo_config_dict.get('use_geometric_bias', True),
+                use_geometric_bias=geo_config_dict.get('cross_attn_geometric_bias', True),
+                use_value_rotation=geo_config_dict.get('use_value_rotation', True),
                 bias_mlp_hidden=geo_config_dict.get('bias_mlp_hidden', 64),
             )
 

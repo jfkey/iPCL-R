@@ -399,7 +399,9 @@ class TrainingPipeline:
                 max_sequence_length=self.hyperparameters_config.max_src_len,
                 pe_dropout=getattr(geo_config, 'pe_dropout', 0.1),
                 # Geometric Attention (LARA) parameters
-                use_geometric_bias=getattr(geo_config, 'use_geometric_bias', True),
+                self_attn_geometric_bias=getattr(geo_config, 'self_attn_geometric_bias', True),
+                cross_attn_geometric_bias=getattr(geo_config, 'cross_attn_geometric_bias', True),
+                use_value_rotation=getattr(geo_config, 'use_value_rotation', True),
                 bias_mlp_hidden=getattr(geo_config, 'bias_mlp_hidden', 64),
                 # Vector Quantization (VQ) parameters
                 use_vq=getattr(geo_config, 'use_vq', False),
