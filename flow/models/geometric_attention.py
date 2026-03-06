@@ -3,7 +3,7 @@
 """
 @File    :   geometric_attention.py
 @Time    :   2025/01/14
-@Author  :   Dawn Li
+@Author  :   Junfeng Liu
 @Version :   1.0
 @Desc    :   Geometric Position Embedding and Lie Algebra Relative Attention.
              Step 3 of the Geometry-Aware Trajectory Generation upgrade.
@@ -466,6 +466,92 @@ class GeometricPositionEmbedding(nn.Module):
         return rotated.to(input_dtype)
 
 
+class FactorizedGeoBias(nn.Module):
+    """
+    Memory-efficient geometric attention bias using Fourier feature factorization.
+
+    Instead of computing pairwise MLP(p_i - p_j) which creates O(B·T²·hidden)
+    intermediate tensors, we factorize into g(p_i)·h(p_j)^T using Fourier features.
+
+    Key insight: dot products of Fourier features encode relative positions:
+        sin(ω·p_i)·cos(ω·p_j) - cos(ω·p_i)·sin(ω·p_j) = sin(ω·(p_i - p_j))
+
+    Memory: O(B·T·rank) instead of O(B·T²·hidden) — ~500x reduction for T=512.
+
+    Args:
+        num_heads: Number of attention heads
+        num_freqs: Number of Fourier frequency bands
+        rank_per_head: Rank of factorized bias per head
+        coord_scale: Scaling factor for coordinates
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        num_freqs: int = 16,
+        rank_per_head: int = 8,
+        coord_scale: float = 1e-6,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.rank_per_head = rank_per_head
+        self.coord_scale = coord_scale
+        total_rank = num_heads * rank_per_head
+
+        # Learnable frequency projection: 3D coords → num_freqs
+        self.freq_proj = nn.Linear(3, num_freqs, bias=False)
+        fourier_dim = num_freqs * 2  # sin + cos
+
+        # Separate projections for query-side and key-side positions
+        self.proj_q = nn.Linear(fourier_dim, total_rank)
+        self.proj_k = nn.Linear(fourier_dim, total_rank)
+
+    def _encode(self, coords: torch.Tensor) -> torch.Tensor:
+        """Encode coordinates to Fourier features. Only O(B·T·fourier_dim)."""
+        coords_scaled = coords.float() * self.coord_scale
+        freq_features = self.freq_proj(coords_scaled.to(self.freq_proj.weight.dtype))
+        return torch.cat([freq_features.sin(), freq_features.cos()], dim=-1)
+
+    def forward(
+        self,
+        query_coords: torch.Tensor,
+        key_coords: Optional[torch.Tensor] = None,
+        target_dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        """
+        Compute factorized geometric bias.
+
+        Args:
+            query_coords: (batch, query_len, 3)
+            key_coords: (batch, key_len, 3) or None for self-attention
+            target_dtype: Target dtype for output
+
+        Returns:
+            bias: (batch, num_heads, query_len, key_len)
+        """
+        if key_coords is None:
+            key_coords = query_coords
+
+        B, T_q, _ = query_coords.shape
+        T_k = key_coords.shape[1]
+        H, r = self.num_heads, self.rank_per_head
+
+        # Fourier encode — O(B·T·fourier_dim), NOT O(B·T²)
+        q_fourier = self._encode(query_coords)  # (B, T_q, fourier_dim)
+        k_fourier = self._encode(key_coords)    # (B, T_k, fourier_dim)
+
+        # Project to per-head rank space — O(B·T·total_rank)
+        phi_q = self.proj_q(q_fourier).view(B, T_q, H, r).permute(0, 2, 1, 3)  # (B, H, T_q, r)
+        phi_k = self.proj_k(k_fourier).view(B, T_k, H, r).permute(0, 2, 1, 3)  # (B, H, T_k, r)
+
+        # Dot product → bias matrix — T² only appears here, computed by efficient GEMM
+        bias = torch.matmul(phi_q, phi_k.transpose(-2, -1))  # (B, H, T_q, T_k)
+
+        if target_dtype is not None and bias.dtype != target_dtype:
+            bias = bias.to(target_dtype)
+        return bias
+
+
 class LieAlgebraRelativeAttention(nn.Module):
     """
     Lie Algebra Relative Attention (LARA) for geometry-aware attention.
@@ -489,8 +575,9 @@ class LieAlgebraRelativeAttention(nn.Module):
         num_heads: Number of attention heads
         head_dim: Dimension per head
         dropout: Attention dropout probability
-        use_geometric_bias: Whether to add MLP-based geometric bias
-        bias_mlp_hidden: Hidden dimension for bias MLP
+        use_geometric_bias: Whether to add factorized geometric bias
+        bias_num_freqs: Number of Fourier frequency bands for factorized bias
+        bias_rank_per_head: Rank per head for factorized bias
 
     Example:
         >>> lara = LieAlgebraRelativeAttention(hidden_size=256, num_heads=4)
@@ -507,7 +594,8 @@ class LieAlgebraRelativeAttention(nn.Module):
         head_dim: int = 64,
         dropout: float = 0.0,
         use_geometric_bias: bool = True,
-        bias_mlp_hidden: int = 64,
+        bias_num_freqs: int = 16,
+        bias_rank_per_head: int = 8,
         coord_scale: float = 1e-4,
         scaling: float = None,
         attn_logit_softcapping: float = None,
@@ -549,13 +637,14 @@ class LieAlgebraRelativeAttention(nn.Module):
             coord_scale=coord_scale,
         )
 
-        # Geometric bias MLP (optional)
-        # Maps relative 3D displacement to per-head attention bias
+        # Factorized geometric bias (optional)
+        # Uses Fourier features + low-rank factorization: O(B·T·rank) instead of O(B·T²·hidden)
         if use_geometric_bias:
-            self.geo_bias_mlp = nn.Sequential(
-                nn.Linear(3, bias_mlp_hidden),
-                nn.GELU(),
-                nn.Linear(bias_mlp_hidden, num_heads),
+            self.geo_bias = FactorizedGeoBias(
+                num_heads=num_heads,
+                num_freqs=bias_num_freqs,
+                rank_per_head=bias_rank_per_head,
+                coord_scale=coord_scale,
             )
 
         # attention_dropout: store as float, matching T5Gemma's convention.
@@ -570,12 +659,10 @@ class LieAlgebraRelativeAttention(nn.Module):
         target_dtype: torch.dtype = None,
     ) -> torch.Tensor:
         """
-        Compute attention bias based on 3D relative displacements.
+        Compute factorized geometric attention bias.
 
-        This adds direction-aware geometric priors to attention:
-        - Nearby tokens in chip space get higher attention
-        - Direction of displacement matters (not just distance)
-        - Each head can learn different spatial preferences
+        Uses Fourier feature factorization: g(p_i)·h(p_j)^T
+        Memory: O(B·T·rank) instead of O(B·T²·hidden).
 
         Args:
             coordinates: 3D coordinates (batch, seq_len, 3)
@@ -584,33 +671,10 @@ class LieAlgebraRelativeAttention(nn.Module):
         Returns:
             Attention bias (batch, num_heads, seq_len, seq_len)
         """
-        batch_size, seq_len, _ = coordinates.shape
-        if target_dtype is None:
-            target_dtype = coordinates.dtype
-
-        # Get MLP weight dtype for fp16 compatibility
-        mlp_weight_dtype = self.geo_bias_mlp[0].weight.dtype
-
-        # Compute pairwise relative displacement in FP32 first
-        # Coordinates can be >65504 (FP16 max), so we must scale before converting
-        coords_f32 = coordinates.float()
-        coords_i = coords_f32.unsqueeze(2)  # (B, T, 1, 3)
-        coords_j = coords_f32.unsqueeze(1)  # (B, 1, T, 3)
-        rel_disp = (coords_i - coords_j) * self.coord_scale  # (B, T, T, 3)
-
-
-        # Convert to MLP weight dtype after scaling
-        rel_disp = rel_disp.to(mlp_weight_dtype)
-
-        # MLP to compute per-head bias
-        # Note: geo_bias_mlp weights may be fp16 in mixed precision training
-        bias = self.geo_bias_mlp(rel_disp)  # (B, T, T, num_heads)
-        bias = bias.permute(0, 3, 1, 2)      # (B, num_heads, T, T)
-
-        # Cast to target dtype if needed
-        if target_dtype is not None and bias.dtype != target_dtype:
-            bias = bias.to(target_dtype)
-        return bias
+        return self.geo_bias(
+            query_coords=coordinates,
+            target_dtype=target_dtype,
+        )
 
     def forward(
         self,
@@ -753,8 +817,9 @@ class T5GemmaLARAAttention(nn.Module):
         config: T5GemmaConfig or T5GemmaModuleConfig
         layer_idx: Layer index in the model
         coord_scale: Scaling factor for input coordinates
-        use_geometric_bias: Whether to use MLP-based geometric bias
-        bias_mlp_hidden: Hidden dimension for geometric bias MLP
+        use_geometric_bias: Whether to use factorized geometric bias
+        bias_num_freqs: Number of Fourier frequency bands for factorized bias
+        bias_rank_per_head: Rank per head for factorized bias
 
     Note:
         - KV caching (past_key_value) is not yet supported
@@ -768,7 +833,8 @@ class T5GemmaLARAAttention(nn.Module):
         layer_idx: int = 0,
         coord_scale: float = 1e-5,
         use_geometric_bias: bool = True,
-        bias_mlp_hidden: int = 64,
+        bias_num_freqs: int = 16,
+        bias_rank_per_head: int = 8,
     ):
         super().__init__()
 
@@ -813,7 +879,8 @@ class T5GemmaLARAAttention(nn.Module):
             head_dim=self.head_dim,
             dropout=attention_dropout,
             use_geometric_bias=use_geometric_bias,
-            bias_mlp_hidden=bias_mlp_hidden,
+            bias_num_freqs=bias_num_freqs,
+            bias_rank_per_head=bias_rank_per_head,
             coord_scale=coord_scale,
             scaling=query_pre_attn_scalar ** -0.5,
             attn_logit_softcapping=attn_logit_softcapping,
@@ -949,9 +1016,10 @@ class CrossLARAAttention(nn.Module):
         config: Model config with hidden_size, num_heads, etc.
         layer_idx: Layer index
         coord_scale: Coordinate scaling factor
-        use_geometric_bias: Whether to use MLP-based geometric bias (Level 1)
+        use_geometric_bias: Whether to use factorized geometric bias (Level 1)
         use_value_rotation: Whether to use geometric value rotation (Level 3)
-        bias_mlp_hidden: Hidden dimension for bias MLP
+        bias_num_freqs: Number of Fourier frequency bands for factorized bias
+        bias_rank_per_head: Rank per head for factorized bias
         cross_attention_hidden_size: Encoder hidden size (if different from decoder)
     """
 
@@ -962,7 +1030,8 @@ class CrossLARAAttention(nn.Module):
         coord_scale: float = 1e-5,
         use_geometric_bias: bool = True,
         use_value_rotation: bool = True,
-        bias_mlp_hidden: int = 64,
+        bias_num_freqs: int = 16,
+        bias_rank_per_head: int = 8,
         cross_attention_hidden_size: Optional[int] = None,
     ):
         super().__init__()
@@ -1023,12 +1092,14 @@ class CrossLARAAttention(nn.Module):
             coord_scale=coord_scale,
         )
 
-        # Geometric bias MLP (Level 1)
+        # Factorized geometric bias (Level 1)
+        # Uses Fourier features + low-rank factorization: O(B·T·rank) instead of O(B·T²·hidden)
         if use_geometric_bias:
-            self.geo_bias_mlp = nn.Sequential(
-                nn.Linear(3, bias_mlp_hidden),
-                nn.GELU(),
-                nn.Linear(bias_mlp_hidden, self.num_heads),
+            self.geo_bias = FactorizedGeoBias(
+                num_heads=self.num_heads,
+                num_freqs=bias_num_freqs,
+                rank_per_head=bias_rank_per_head,
+                coord_scale=coord_scale,
             )
 
         # Store as float, same convention as T5Gemma (0.0 by default)
@@ -1041,10 +1112,10 @@ class CrossLARAAttention(nn.Module):
         target_dtype: torch.dtype = None,
     ) -> torch.Tensor:
         """
-        Compute geometric bias for cross-attention (Level 1).
+        Compute factorized geometric bias for cross-attention (Level 1).
 
-        Maps relative 3D displacement to per-head attention bias:
-            b_{ij}^{(h)} = MLP(p^d_i - p^e_j)
+        Uses Fourier feature factorization: g(p^d_i)·h(p^e_j)^T
+        Memory: O(B·(T_q+T_k)·rank) instead of O(B·T_q·T_k·hidden).
 
         Args:
             query_coords: Decoder coordinates (batch, query_len, 3)
@@ -1054,28 +1125,11 @@ class CrossLARAAttention(nn.Module):
         Returns:
             Geometric bias (batch, num_heads, query_len, key_len)
         """
-        if target_dtype is None:
-            target_dtype = query_coords.dtype
-
-        # Get MLP weight dtype for fp16 compatibility
-        mlp_weight_dtype = self.geo_bias_mlp[0].weight.dtype
-
-        # Compute pairwise relative displacement in FP32 first
-        # Coordinates can be >65504 (FP16 max), so we must scale before converting
-        q_coords_f32 = query_coords.float().unsqueeze(2)  # (batch, query_len, 1, 3)
-        k_coords_f32 = key_coords.float().unsqueeze(1)    # (batch, 1, key_len, 3)
-        rel_disp = (q_coords_f32 - k_coords_f32) * self.coord_scale  # (batch, query_len, key_len, 3)
-
-        # Convert to MLP weight dtype after scaling
-        rel_disp = rel_disp.to(mlp_weight_dtype)
-
-        # MLP to compute per-head bias
-        bias = self.geo_bias_mlp(rel_disp)  # (batch, query_len, key_len, num_heads)
-        bias = bias.permute(0, 3, 1, 2)      # (batch, num_heads, query_len, key_len)
-
-        if target_dtype is not None and bias.dtype != target_dtype:
-            bias = bias.to(target_dtype)
-        return bias
+        return self.geo_bias(
+            query_coords=query_coords,
+            key_coords=key_coords,
+            target_dtype=target_dtype,
+        )
 
     def forward(
         self,

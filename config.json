@@ -39,8 +39,8 @@
     "training": {
         "paths": {
             "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/split_dataset",
-            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_self_cross_att",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_self_cross_att/logs"
+            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_all",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_all/logs"
         },
         "model": {
             "hidden_size": 512,
@@ -71,10 +71,11 @@
                 "max_metal_layers": 16,
                 "max_layer_delta": 10,
                 "pe_dropout": 0.1,
-                "self_attn_geometric_bias": false,
-                "cross_attn_geometric_bias": false,
+                "self_attn_geometric_bias": true,
+                "cross_attn_geometric_bias": true,
                 "use_value_rotation": false,
-                "bias_mlp_hidden": 64,
+                "bias_num_freqs": 16,
+                "bias_rank_per_head": 8,
                 "use_vq": false,
                 "vq_codebook_size": 512,
                 "vq_commitment_cost": 0.25,
@@ -114,10 +115,10 @@
     },
     "evaluation": {
         "paths": {
-            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation",
-            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation/metrics",
-            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation/plots",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation/logs"
+            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation/model_all",
+            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation/model_all/metrics",
+            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation/model_all/plots",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation/model_all/logs"
         },
         "generation": {
             "max_new_tokens": 512,

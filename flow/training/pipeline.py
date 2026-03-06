@@ -402,7 +402,8 @@ class TrainingPipeline:
                 self_attn_geometric_bias=getattr(geo_config, 'self_attn_geometric_bias', True),
                 cross_attn_geometric_bias=getattr(geo_config, 'cross_attn_geometric_bias', True),
                 use_value_rotation=getattr(geo_config, 'use_value_rotation', True),
-                bias_mlp_hidden=getattr(geo_config, 'bias_mlp_hidden', 64),
+                bias_num_freqs=getattr(geo_config, 'bias_num_freqs', 16),
+                bias_rank_per_head=getattr(geo_config, 'bias_rank_per_head', 8),
                 # Vector Quantization (VQ) parameters
                 use_vq=getattr(geo_config, 'use_vq', False),
                 vq_codebook_size=getattr(geo_config, 'vq_codebook_size', 1024),

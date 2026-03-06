@@ -249,10 +249,11 @@ class GeometricEmbeddingConfig:
     pe_dropout: float = 0.1  # Dropout rate for position embeddings
 
     # Geometric Attention (LARA) parameters
-    self_attn_geometric_bias: bool = True   # MLP bias for self-attention (encoder + decoder)
-    cross_attn_geometric_bias: bool = True  # MLP bias for cross-attention
+    self_attn_geometric_bias: bool = True   # Factorized bias for self-attention (encoder + decoder)
+    cross_attn_geometric_bias: bool = True  # Factorized bias for cross-attention
     use_value_rotation: bool = True         # Value rotation for cross-attention
-    bias_mlp_hidden: int = 64
+    bias_num_freqs: int = 16               # Fourier frequency bands for factorized geo bias
+    bias_rank_per_head: int = 8            # Rank per head for factorized geo bias
 
     # Vector Quantization (VQ) parameters
     use_vq: bool = False  # Enable Vector Quantization

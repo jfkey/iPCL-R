@@ -85,10 +85,11 @@ class GeoConfig:
         floor_freq_ratio: Ratio for clipping low frequencies
         max_sequence_length: Maximum sequence length for frequency clipping
         pe_dropout: Dropout rate for position embeddings
-        self_attn_geometric_bias: Whether to use MLP bias in self-attention LARA
-        cross_attn_geometric_bias: Whether to use MLP bias in cross-attention LARA
+        self_attn_geometric_bias: Whether to use factorized bias in self-attention LARA
+        cross_attn_geometric_bias: Whether to use factorized bias in cross-attention LARA
         use_value_rotation: Whether to use value rotation in cross-attention LARA
-        bias_mlp_hidden: Hidden dimension for geometric bias MLP
+        bias_num_freqs: Fourier frequency bands for factorized geo bias
+        bias_rank_per_head: Rank per head for factorized geo bias
     """
 
     # General settings
@@ -114,10 +115,11 @@ class GeoConfig:
     pe_dropout: float = 0.1  # Dropout for position embeddings
 
     # Geometric Attention settings (Step 3)
-    self_attn_geometric_bias: bool = True   # MLP bias for self-attention (encoder + decoder)
-    cross_attn_geometric_bias: bool = True  # MLP bias for cross-attention
+    self_attn_geometric_bias: bool = True   # Factorized bias for self-attention (encoder + decoder)
+    cross_attn_geometric_bias: bool = True  # Factorized bias for cross-attention
     use_value_rotation: bool = True         # Value rotation for cross-attention
-    bias_mlp_hidden: int = 64
+    bias_num_freqs: int = 16               # Fourier frequency bands for factorized geo bias
+    bias_rank_per_head: int = 8            # Rank per head for factorized geo bias
 
     # Vector Quantization settings (Information Bottleneck)
     use_vq: bool = False  # Whether to apply VQ to position embeddings
@@ -196,7 +198,8 @@ class GeoT5GemmaEncoderLayer(T5GemmaEncoderLayer):
                 layer_idx=layer_idx,
                 coord_scale=geo_config_dict.get('coord_scale', 1e-5),
                 use_geometric_bias=geo_config_dict.get('self_attn_geometric_bias', True),
-                bias_mlp_hidden=geo_config_dict.get('bias_mlp_hidden', 64),
+                bias_num_freqs=geo_config_dict.get('bias_num_freqs', 16),
+                bias_rank_per_head=geo_config_dict.get('bias_rank_per_head', 8),
             )
 
     def forward(
@@ -468,7 +471,8 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
                 layer_idx=layer_idx,
                 coord_scale=geo_config_dict.get('coord_scale', 1e-5),
                 use_geometric_bias=geo_config_dict.get('self_attn_geometric_bias', True),
-                bias_mlp_hidden=geo_config_dict.get('bias_mlp_hidden', 64),
+                bias_num_freqs=geo_config_dict.get('bias_num_freqs', 16),
+                bias_rank_per_head=geo_config_dict.get('bias_rank_per_head', 8),
             )
 
         # Replace cross-attention with CrossLARAAttention if enabled
@@ -479,7 +483,8 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
                 coord_scale=geo_config_dict.get('coord_scale', 1e-5),
                 use_geometric_bias=geo_config_dict.get('cross_attn_geometric_bias', True),
                 use_value_rotation=geo_config_dict.get('use_value_rotation', True),
-                bias_mlp_hidden=geo_config_dict.get('bias_mlp_hidden', 64),
+                bias_num_freqs=geo_config_dict.get('bias_num_freqs', 16),
+                bias_rank_per_head=geo_config_dict.get('bias_rank_per_head', 8),
             )
 
     def forward(
