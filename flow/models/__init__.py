@@ -3,7 +3,7 @@
 """
 @File    :   __init__.py
 @Time    :   2025/01/14
-@Author  :   Dawn Li
+@Author  :   Junfeng Liu
 @Version :   1.0
 @Desc    :   Geometry-aware models for EDA routing trajectory generation.
              Includes Fourier Position Embedding, Geometric Attention (GeoPE/LARA),

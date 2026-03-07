@@ -99,7 +99,8 @@ class GeoConfig:
     use_geo_self_attn: bool = False  # Enable LARA for decoder self-attention
     use_geo_cross_attn: bool = False  # Enable LARA for cross-attention
     enable_encoder_lara: bool = False  # Enable LARA for encoder (usually not recommended)
-    coord_scale: float = 1e-5  # Smaller scale for large chip coordinates
+    coord_scale: float = 1e-5  # Smaller scale for large chip coordinates (x, y axes)
+    coord_scale_z: float = 0.3  # Scale for z-axis (metal layer, range 0-20)
 
     # Fourier / Geometry-Aware Position Embedding settings
     num_frequencies: int = 32  # Frequency bands for Fourier encoding
@@ -197,6 +198,7 @@ class GeoT5GemmaEncoderLayer(T5GemmaEncoderLayer):
                 config,
                 layer_idx=layer_idx,
                 coord_scale=geo_config_dict.get('coord_scale', 1e-5),
+                coord_scale_z=geo_config_dict.get('coord_scale_z', 0.3),
                 use_geometric_bias=geo_config_dict.get('self_attn_geometric_bias', True),
                 bias_num_freqs=geo_config_dict.get('bias_num_freqs', 16),
                 bias_rank_per_head=geo_config_dict.get('bias_rank_per_head', 8),
@@ -470,6 +472,7 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
                 config,
                 layer_idx=layer_idx,
                 coord_scale=geo_config_dict.get('coord_scale', 1e-5),
+                coord_scale_z=geo_config_dict.get('coord_scale_z', 0.3),
                 use_geometric_bias=geo_config_dict.get('self_attn_geometric_bias', True),
                 bias_num_freqs=geo_config_dict.get('bias_num_freqs', 16),
                 bias_rank_per_head=geo_config_dict.get('bias_rank_per_head', 8),
@@ -481,6 +484,7 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
                 config,
                 layer_idx=layer_idx,
                 coord_scale=geo_config_dict.get('coord_scale', 1e-5),
+                coord_scale_z=geo_config_dict.get('coord_scale_z', 0.3),
                 use_geometric_bias=geo_config_dict.get('cross_attn_geometric_bias', True),
                 use_value_rotation=geo_config_dict.get('use_value_rotation', True),
                 bias_num_freqs=geo_config_dict.get('bias_num_freqs', 16),

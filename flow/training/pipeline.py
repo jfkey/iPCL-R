@@ -386,6 +386,7 @@ class TrainingPipeline:
                 enable_encoder_lara=getattr(geo_config, 'enable_encoder_lara', False),
                 # Coordinate scaling
                 coord_scale=getattr(geo_config, 'coord_scale', 1e-5),
+                coord_scale_z=getattr(geo_config, 'coord_scale_z', 0.3),
                 # Fourier / GeoPE parameters
                 num_frequencies=getattr(geo_config, 'num_frequencies', 32),
                 num_harmonics=getattr(geo_config, 'num_harmonics', 8),

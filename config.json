@@ -39,8 +39,8 @@
     "training": {
         "paths": {
             "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/split_dataset",
-            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_all",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_all/logs"
+            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_all_quick_train_2",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_all_quick_train_2/logs"
         },
         "model": {
             "hidden_size": 512,
@@ -59,7 +59,8 @@
                 "use_geo_self_attn": true, 
                 "use_geo_cross_attn": true, 
                 "enable_encoder_lara": false,       
-                "coord_scale": 1e-6,
+                "coord_scale": 1e-5, 
+                "coord_scale_z": 0.3, 
                 "num_frequencies": 32,
                 "num_harmonics": 8,
                 "max_wavelength": 10000.0,
@@ -84,7 +85,7 @@
             }
         },
         "hyperparameters": {
-            "quick_training": 1.0,
+            "quick_training": 0.1,
             "max_src_len": 128,
             "max_tgt_len": 256,
             "train_split_ratio": 0.9,

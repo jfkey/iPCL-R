@@ -121,6 +121,7 @@ class GeometricPositionEmbedding(nn.Module):
         head_dim: int = 63,  # Must be divisible by 3
         base: float = 32.0,
         coord_scale: float = 1e-4,
+        coord_scale_z: float = 0.3,
     ):
         super().__init__()
 
@@ -128,7 +129,14 @@ class GeometricPositionEmbedding(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.base = base
-        self.coord_scale = coord_scale
+
+        # Fixed per-axis scaling (not learnable).
+        # x,y use coord_scale (large chip coords ~2M), z (metal layer, range 0-20)
+        # uses coord_scale_z to bring it to a comparable magnitude.
+        self.register_buffer(
+            'log_axis_scale',
+            torch.log(torch.tensor([coord_scale, coord_scale, coord_scale_z]))
+        )
 
         # For 3D GeoPE, we partition head_dim into sub-vectors of size 3
         # Each 3D sub-vector undergoes quaternion rotation
@@ -292,8 +300,8 @@ class GeometricPositionEmbedding(nn.Module):
                     f"Seq len mismatch: expected {seq_len}, coordinates has {coord_seq}"
                 )
 
-        # Scale coordinates in FP32
-        coords = coords * self.coord_scale
+        # Per-axis learnable scaling in FP32: (B, T, 3) * (3,)
+        coords = coords * torch.exp(self.log_axis_scale)
         return coords
 
     def _coords_to_quaternion(
@@ -491,11 +499,18 @@ class FactorizedGeoBias(nn.Module):
         num_freqs: int = 16,
         rank_per_head: int = 8,
         coord_scale: float = 1e-6,
+        coord_scale_z: float = 0.3,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.rank_per_head = rank_per_head
-        self.coord_scale = coord_scale
+
+        # Fixed per-axis scaling (not learnable).
+        # See GeometricPositionEmbedding for detailed rationale.
+        self.register_buffer(
+            'log_axis_scale',
+            torch.log(torch.tensor([coord_scale, coord_scale, coord_scale_z]))
+        )
         total_rank = num_heads * rank_per_head
 
         # Learnable frequency projection: 3D coords → num_freqs
@@ -508,7 +523,7 @@ class FactorizedGeoBias(nn.Module):
 
     def _encode(self, coords: torch.Tensor) -> torch.Tensor:
         """Encode coordinates to Fourier features. Only O(B·T·fourier_dim)."""
-        coords_scaled = coords.float() * self.coord_scale
+        coords_scaled = coords.float() * torch.exp(self.log_axis_scale)
         freq_features = self.freq_proj(coords_scaled.to(self.freq_proj.weight.dtype))
         return torch.cat([freq_features.sin(), freq_features.cos()], dim=-1)
 
@@ -597,6 +612,7 @@ class LieAlgebraRelativeAttention(nn.Module):
         bias_num_freqs: int = 16,
         bias_rank_per_head: int = 8,
         coord_scale: float = 1e-4,
+        coord_scale_z: float = 0.3,
         scaling: float = None,
         attn_logit_softcapping: float = None,
         attention_bias: bool = False,
@@ -609,6 +625,7 @@ class LieAlgebraRelativeAttention(nn.Module):
         self.head_dim = head_dim
         self.use_geometric_bias = use_geometric_bias
         self.coord_scale = coord_scale
+        self.coord_scale_z = coord_scale_z
         self.attn_logit_softcapping = attn_logit_softcapping
 
         # GQA: number of query heads per key/value head group
@@ -635,6 +652,7 @@ class LieAlgebraRelativeAttention(nn.Module):
             num_heads=num_heads,
             head_dim=head_dim,
             coord_scale=coord_scale,
+            coord_scale_z=coord_scale_z,
         )
 
         # Factorized geometric bias (optional)
@@ -645,6 +663,7 @@ class LieAlgebraRelativeAttention(nn.Module):
                 num_freqs=bias_num_freqs,
                 rank_per_head=bias_rank_per_head,
                 coord_scale=coord_scale,
+                coord_scale_z=coord_scale_z,
             )
 
         # attention_dropout: store as float, matching T5Gemma's convention.
@@ -832,6 +851,7 @@ class T5GemmaLARAAttention(nn.Module):
         config,
         layer_idx: int = 0,
         coord_scale: float = 1e-5,
+        coord_scale_z: float = 0.3,
         use_geometric_bias: bool = True,
         bias_num_freqs: int = 16,
         bias_rank_per_head: int = 8,
@@ -882,6 +902,7 @@ class T5GemmaLARAAttention(nn.Module):
             bias_num_freqs=bias_num_freqs,
             bias_rank_per_head=bias_rank_per_head,
             coord_scale=coord_scale,
+            coord_scale_z=coord_scale_z,
             scaling=query_pre_attn_scalar ** -0.5,
             attn_logit_softcapping=attn_logit_softcapping,
             attention_bias=attention_bias,
@@ -1028,6 +1049,7 @@ class CrossLARAAttention(nn.Module):
         config,
         layer_idx: int = 0,
         coord_scale: float = 1e-5,
+        coord_scale_z: float = 0.3,
         use_geometric_bias: bool = True,
         use_value_rotation: bool = True,
         bias_num_freqs: int = 16,
@@ -1090,6 +1112,7 @@ class CrossLARAAttention(nn.Module):
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             coord_scale=coord_scale,
+            coord_scale_z=coord_scale_z,
         )
 
         # Factorized geometric bias (Level 1)
@@ -1100,6 +1123,7 @@ class CrossLARAAttention(nn.Module):
                 num_freqs=bias_num_freqs,
                 rank_per_head=bias_rank_per_head,
                 coord_scale=coord_scale,
+                coord_scale_z=coord_scale_z,
             )
 
         # Store as float, same convention as T5Gemma (0.0 by default)

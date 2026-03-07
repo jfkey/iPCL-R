@@ -229,7 +229,8 @@ class GeometricEmbeddingConfig:
     enable_encoder_lara: bool = False  # LARA for Encoder (usually not recommended)
 
     # Coordinate scaling
-    coord_scale: float = 1e-5  # Scale for large chip coordinates (e.g., 1e5 -> 1.0)
+    coord_scale: float = 1e-5  # Scale for large chip coordinates (x, y axes)
+    coord_scale_z: float = 0.3  # Scale for z-axis (metal layer, range 0-20)
 
     # Fourier Position Embedding parameters
     num_frequencies: int = 32  # Number of frequency bands
