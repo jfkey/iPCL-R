@@ -3,7 +3,7 @@
 """
 @File    :   launch_geo_evaluation.py
 @Time    :   2025/01/30
-@Author  :   Dawn Li
+@Author  :   Junfeng Liu
 @Version :   1.0
 @Desc    :   Command-line launcher for GeoT5GemmaForConditionalGeneration evaluation.
 
