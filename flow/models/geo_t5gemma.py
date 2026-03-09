@@ -1754,6 +1754,17 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         if state_dict is not None:
             # Load all weights (including geo_pe weights)
             missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+
+            # Re-tie lm_head to decoder embed_tokens after loading weights.
+            # This is necessary because replacing the decoder with GeoT5GemmaDecoder
+            # breaks the weight tying established during __init__, causing lm_head
+            # to point to stale random weights instead of the loaded embeddings.
+            model.tie_weights()
+
+            # Filter out tied weight keys from missing keys
+            tied_keys = {'lm_head.out_proj.weight'}
+            missing_keys = [k for k in missing_keys if k not in tied_keys]
+
             if missing_keys:
                 import logging
                 logging.warning(f"Missing keys when loading model: {missing_keys}")

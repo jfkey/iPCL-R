@@ -116,10 +116,10 @@
     },
     "evaluation": {
         "paths": {
-            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation/model_all_3",
-            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation/model_all_3/metrics",
-            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation/model_all_3/plots",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-DecimalWordLevel/stage_evaluation/model_all_3/logs"
+            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_3",
+            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_3/metrics",
+            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_3/plots",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_3/logs"
         },
         "generation": {
             "max_new_tokens": 512,

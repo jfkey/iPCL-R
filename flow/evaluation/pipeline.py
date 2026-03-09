@@ -2197,15 +2197,15 @@ def min_cost_connection(
         added_edges = list(final_edges - original_edges)
         if added_edges:
             add_wirelength, add_via = calculate_modification_costs(added_edges)
-            cost_metrics["post_add_wirelength_cost"] = add_wirelength
-            cost_metrics["post_add_via_cost"] = add_via
+            cost_metrics["post_add_wirelength_cost"] = float(add_wirelength)
+            cost_metrics["post_add_via_cost"] = float(add_via)
 
         # Remove costs: edges removed from original
         removed_edges = list(original_edges - final_edges)
         if removed_edges:
             remove_wirelength, remove_via = calculate_modification_costs(removed_edges)
-            cost_metrics["post_remove_wirelength_cost"] = remove_wirelength
-            cost_metrics["post_remove_via_cost"] = remove_via
+            cost_metrics["post_remove_wirelength_cost"] = float(remove_wirelength)
+            cost_metrics["post_remove_via_cost"] = float(remove_via)
 
         return convert_tree_to_coord_tokens(steiner_tree_node, tokenizer), cost_metrics
 

@@ -76,8 +76,8 @@ def load_components(
     target_split = dataset_config.validation_split
     dataset = load_corpus_dataset(dataset_config, split=target_split)
 
-    # dataset = dataset.select(range(min(100, len(dataset))))
-    # logging.info(f"DEBUG: Using only {len(dataset)} samples for evaluation")
+    dataset = dataset.select(range(min(20, len(dataset))))
+    logging.info(f"DEBUG: Using only {len(dataset)} samples for evaluation")
 
     tokenization_pipeline = TokenizationPipeline(config)
     dataset = tokenization_pipeline.preprocess_corpus(dataset)
