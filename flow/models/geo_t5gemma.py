@@ -1657,8 +1657,9 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         # Call parent __init__ which sets up the base model
         T5GemmaForConditionalGeneration.__init__(model, config)
 
-        # Replace encoder/decoder with Geo versions if LARA is enabled
-        if model.geo_config.use_geo_self_attn:
+        # Replace encoder/decoder with Geo versions if LARA is enabled.
+        # Must check BOTH use_geo_self_attn and use_geo_cross_attn to match __init__().
+        if model.geo_config.use_geo_self_attn or model.geo_config.use_geo_cross_attn:
             enable_encoder_lara = config.geometric_config.get('enable_encoder_lara', False)
             if enable_encoder_lara:
                 model.model.encoder = GeoT5GemmaEncoder(config)

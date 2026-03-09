@@ -39,8 +39,8 @@
     "training": {
         "paths": {
             "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/split_dataset",
-            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_all_3",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_all_3/logs"
+            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_only_geo_pe",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_only_geo_pe/logs"
         },
         "model": {
             "hidden_size": 512,
@@ -56,8 +56,8 @@
                 "use_basic_fourier_pe": false,
                 "use_advanced_geo_pe": true,
                 "use_metal_layer_only_pe":false,
-                "use_geo_self_attn": true, 
-                "use_geo_cross_attn": true, 
+                "use_geo_self_attn": false, 
+                "use_geo_cross_attn": false, 
                 "enable_encoder_lara": false,       
                 "coord_scale": 1e-5, 
                 "coord_scale_z": 0.3, 
@@ -72,8 +72,8 @@
                 "max_metal_layers": 16,
                 "max_layer_delta": 10,
                 "pe_dropout": 0.1,
-                "self_attn_geometric_bias": true,
-                "cross_attn_geometric_bias": true,
+                "self_attn_geometric_bias": false,
+                "cross_attn_geometric_bias": false,
                 "use_value_rotation": false,
                 "bias_num_freqs": 16,
                 "bias_rank_per_head": 8,
@@ -116,10 +116,10 @@
     },
     "evaluation": {
         "paths": {
-            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_3",
-            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_3/metrics",
-            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_3/plots",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_3/logs"
+            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_only",
+            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_only_geo_pe/metrics",
+            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_only_geo_pe/plots",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_only_geo_pe/logs"
         },
         "generation": {
             "max_new_tokens": 512,
