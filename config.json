@@ -35,12 +35,12 @@
             "use_coord_sorted_input": true
         },
         "log_level": "INFO"
-    },
+    }, 
     "training": {
         "paths": {
-            "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Origin/stage_training/split_dataset",
-            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Origin/stage_training/model",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Origin/stage_training/logs"
+            "split_dataset_dir": "/mnt/local_data1/liweiguo/experiments/model_size_comparison/work_dir/Medium-DecimalWordLevel/stage_training/split_dataset",
+            "model_save_dir": "/mnt/local_data1/liweiguo/experiments/model_size_comparison/work_dir/Medium-DecimalWordLevel/stage_training/model",
+            "logging_dir": "/mnt/local_data1/liweiguo/experiments/model_size_comparison/work_dir/Medium-DecimalWordLevel/stage_training/logs"
         },
         "model": {
             "hidden_size": 512,
@@ -91,7 +91,7 @@
         },
         "generation": {
             "max_new_tokens": 512,
-            "num_beams": 4,
+            "num_beams": 1,
             "do_sample": false,
             "temperature": 0.9,
             "top_p": 1.0,

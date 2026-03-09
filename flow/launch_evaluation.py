@@ -44,6 +44,8 @@ def load_components(
     target_split = dataset_config.validation_split
     dataset = load_corpus_dataset(dataset_config, split=target_split)
 
+    dataset = dataset.select(range(min(20, len(dataset))))
+
     tokenization_pipeline = TokenizationPipeline(config)
     dataset = tokenization_pipeline.preprocess_corpus(dataset)
     # Set remove_columns=False to keep original columns for evaluation ('source_design')
