@@ -44,7 +44,11 @@ def load_components(
     target_split = dataset_config.validation_split
     dataset = load_corpus_dataset(dataset_config, split=target_split)
 
-    dataset = dataset.select(range(min(20, len(dataset))))
+    # Filter to only include nets from design 's713'
+    eval_design = "s713"
+    dataset = dataset.filter(lambda x: x["source_design"] == eval_design)
+    logging.info(f"Filtered to design '{eval_design}': {len(dataset)} samples")
+
 
     tokenization_pipeline = TokenizationPipeline(config)
     dataset = tokenization_pipeline.preprocess_corpus(dataset)
