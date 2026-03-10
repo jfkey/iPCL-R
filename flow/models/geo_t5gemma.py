@@ -122,6 +122,17 @@ class GeoConfig:
     bias_num_freqs: int = 16               # Fourier frequency bands for factorized geo bias
     bias_rank_per_head: int = 8            # Rank per head for factorized geo bias
 
+    # Coordinate Noise Injection settings (for bridging train-test gap)
+    # During training, decoder_coordinates come from ground truth (perfect).
+    # During inference, they come from predicted tokens (noisy, error accumulates).
+    # Injecting noise during training makes the model robust to imperfect coordinates.
+    coord_noise_enabled: bool = False       # Enable coordinate noise during training
+    coord_noise_std_xy: float = 500.0       # Noise std for x,y axes (chip coordinate scale)
+    coord_noise_std_z: float = 1.0          # Noise std for z axis (metal layer scale)
+    coord_noise_max_ratio: float = 0.5      # Max probability of applying noise per position
+    coord_noise_warmup_steps: int = 5000    # Ramp noise from 0 to max_ratio over this many steps
+    coord_noise_cumulative: bool = True     # Use cumulative noise (simulates inference error drift)
+
     # Vector Quantization settings (Information Bottleneck)
     use_vq: bool = False  # Whether to apply VQ to position embeddings
     vq_codebook_size: int = 256  # Number of codebook entries (K), info: log2(K) bits
@@ -999,6 +1010,14 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         # Initialize VQ loss accumulator
         self._vq_loss = None
 
+        # Coordinate noise step counter for warmup scheduling.
+        # Uses register_buffer so it persists across checkpoints and device moves.
+        self.register_buffer(
+            '_coord_noise_step',
+            torch.tensor(0, dtype=torch.long),
+            persistent=True,
+        )
+
         # Initialize only the newly added geo modules.
         # super().__init__(config) already called post_init() for all base T5Gemma weights.
         # Calling self.post_init() again would re-randomize the entire base model,
@@ -1168,6 +1187,100 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         shifted = torch.cat([driver_pos, decoder_coordinates[:, :-1, :].float()], dim=1)
         return shifted
 
+    def _apply_coordinate_noise(
+        self,
+        decoder_coordinates: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply noise to decoder coordinates during training to bridge the
+        train-test distribution gap.
+
+        During training, decoder_coordinates come from ground-truth tokens (perfect).
+        During inference, they come from model predictions (noisy, errors accumulate).
+        This creates a distribution mismatch that degrades LARA performance at test time.
+
+        This method injects controlled noise to simulate inference-time coordinate
+        imperfections, making the model robust to imperfect coordinates.
+
+        Two noise modes:
+        - Uniform: Independent Gaussian noise at each position. Simple but doesn't
+          capture the cumulative nature of inference errors.
+        - Cumulative (recommended): Small per-step perturbations that accumulate
+          via cumsum, mimicking how prediction errors drift over the sequence.
+          Later positions get progressively more noise, matching inference behavior.
+
+        Warmup schedule: noise probability ramps linearly from 0 to max_ratio
+        over coord_noise_warmup_steps, so early training is stable.
+
+        Args:
+            decoder_coordinates: Shifted coordinates (batch, seq_len, 3) in FP32
+
+        Returns:
+            Noised coordinates (same shape and dtype)
+        """
+        if not self.training or not self.geo_config.coord_noise_enabled:
+            return decoder_coordinates
+
+        # Update step counter
+        self._coord_noise_step += 1
+
+        # Compute current noise ratio with linear warmup
+        warmup = self.geo_config.coord_noise_warmup_steps
+        if warmup > 0:
+            progress = min(self._coord_noise_step.item() / warmup, 1.0)
+        else:
+            progress = 1.0
+        noise_ratio = self.geo_config.coord_noise_max_ratio * progress
+
+        if noise_ratio <= 0:
+            return decoder_coordinates
+
+        batch_size, seq_len, _ = decoder_coordinates.shape
+        device = decoder_coordinates.device
+
+        # Per-position mask: each position independently decides whether to be noised
+        noise_mask = (
+            torch.rand(batch_size, seq_len, 1, device=device) < noise_ratio
+        ).float()
+
+        # Build per-axis noise scale: [std_xy, std_xy, std_z]
+        noise_scale = torch.tensor(
+            [self.geo_config.coord_noise_std_xy,
+             self.geo_config.coord_noise_std_xy,
+             self.geo_config.coord_noise_std_z],
+            device=device, dtype=torch.float32,
+        )
+
+        if self.geo_config.coord_noise_cumulative:
+            # Cumulative noise: small per-step perturbations that drift over time.
+            # This better simulates inference error accumulation where each wrong
+            # prediction adds a persistent offset to all subsequent coordinates.
+            #
+            # step_noise[t] ~ N(0, scale/sqrt(seq_len))  per step
+            # cumulative[t] = sum(step_noise[0:t])
+            # E[||cumulative[t]||] ~ scale * sqrt(t/seq_len)
+            #
+            # At t=seq_len: E[||noise||] ~ scale (matches configured std)
+            # At t=1: E[||noise||] ~ scale/sqrt(seq_len) (small, just started)
+            per_step_scale = noise_scale / max(seq_len, 1) ** 0.5
+            step_noise = torch.randn(
+                batch_size, seq_len, 3, device=device, dtype=torch.float32
+            ) * per_step_scale
+            # Position 0 (driver position) should stay clean — zero out its noise
+            step_noise[:, 0, :] = 0.0
+            cumulative_noise = torch.cumsum(step_noise, dim=1)
+            noised = decoder_coordinates + cumulative_noise * noise_mask
+        else:
+            # Uniform noise: independent Gaussian at each position
+            noise = torch.randn(
+                batch_size, seq_len, 3, device=device, dtype=torch.float32
+            ) * noise_scale
+            # Keep position 0 (driver position) clean
+            noise[:, 0, :] = 0.0
+            noised = decoder_coordinates + noise * noise_mask
+
+        return noised
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1309,6 +1422,13 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             if decoder_coordinates is not None and labels is not None:
                 decoder_coordinates = self._shift_decoder_coordinates(
                     decoder_coordinates, encoder_abs_positions
+                )
+
+            # Apply coordinate noise during training to bridge train-test gap.
+            # Must be AFTER shift so noise is applied to the correctly-aligned coords.
+            if decoder_coordinates is not None and labels is not None:
+                decoder_coordinates = self._apply_coordinate_noise(
+                    decoder_coordinates
                 )
 
             # Prepare encoder attention mask
@@ -1671,11 +1791,15 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         model.encoder_fourier_pe = None
         model.decoder_fourier_pe = None
 
+        # T5GemmaConfig stores hidden_size in encoder/decoder sub-configs;
+        # the top-level attribute may not exist when loaded from disk.
+        hidden_size = config.encoder.hidden_size
+
         if model.geo_config.use_advanced_geo_pe:
-            geope_config = model.geo_config.to_geope_config(config.hidden_size)
+            geope_config = model.geo_config.to_geope_config(hidden_size)
             model.encoder_geo_pe = GeometryAwarePositionEmbedding(geope_config)
             model.decoder_fourier_pe = FourierPositionEmbedding(
-                hidden_size=config.hidden_size,
+                hidden_size=hidden_size,
                 num_frequencies=model.geo_config.num_frequencies,
                 max_wavelength=model.geo_config.max_wavelength,
                 min_wavelength=model.geo_config.min_wavelength,
@@ -1686,10 +1810,10 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 max_sequence_length=model.geo_config.max_sequence_length,
             )
         elif model.geo_config.use_metal_layer_only_pe:
-            geope_config = model.geo_config.to_geope_config(config.hidden_size)
+            geope_config = model.geo_config.to_geope_config(hidden_size)
             model.encoder_geo_pe = GeometryAwarePositionEmbeddingTMP(geope_config)
             model.decoder_fourier_pe = FourierPositionEmbedding(
-                hidden_size=config.hidden_size,
+                hidden_size=hidden_size,
                 num_frequencies=model.geo_config.num_frequencies,
                 max_wavelength=model.geo_config.max_wavelength,
                 min_wavelength=model.geo_config.min_wavelength,
@@ -1701,7 +1825,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             )
         elif model.geo_config.use_basic_fourier_pe:
             model.encoder_fourier_pe = FourierPositionEmbedding(
-                hidden_size=config.hidden_size,
+                hidden_size=hidden_size,
                 num_frequencies=model.geo_config.num_frequencies,
                 max_wavelength=model.geo_config.max_wavelength,
                 min_wavelength=model.geo_config.min_wavelength,
@@ -1712,7 +1836,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 max_sequence_length=model.geo_config.max_sequence_length,
             )
             model.decoder_fourier_pe = FourierPositionEmbedding(
-                hidden_size=config.hidden_size,
+                hidden_size=hidden_size,
                 num_frequencies=model.geo_config.num_frequencies,
                 max_wavelength=model.geo_config.max_wavelength,
                 min_wavelength=model.geo_config.min_wavelength,
@@ -1730,7 +1854,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         ):
             from .vq import VectorQuantizer
             model.encoder_pe_vq = VectorQuantizer(
-                hidden_size=config.hidden_size,
+                hidden_size=hidden_size,
                 codebook_size=model.geo_config.vq_codebook_size,
                 commitment_cost=model.geo_config.vq_commitment_cost,
                 ema_decay=model.geo_config.vq_ema_decay,
@@ -1740,17 +1864,25 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         # Initialize VQ loss accumulator
         model._vq_loss = None
 
+        # Initialize coordinate noise step counter
+        model.register_buffer(
+            '_coord_noise_step',
+            torch.tensor(0, dtype=torch.long),
+            persistent=True,
+        )
+
         # Now load the state dict with all weights
         model_path = Path(pretrained_model_name_or_path)
         if (model_path / "model.safetensors").exists():
             from safetensors.torch import load_file
             state_dict = load_file(model_path / "model.safetensors")
         elif (model_path / "pytorch_model.bin").exists():
-            import torch
             state_dict = torch.load(model_path / "pytorch_model.bin", map_location="cpu")
         else:
-            # Try loading with parent method for other formats
-            state_dict = None
+            raise FileNotFoundError(
+                f"No model weights found at {model_path}. "
+                f"Expected 'model.safetensors' or 'pytorch_model.bin'."
+            )
 
         if state_dict is not None:
             # Load all weights (including geo_pe weights)
@@ -1762,9 +1894,11 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             # to point to stale random weights instead of the loaded embeddings.
             model.tie_weights()
 
-            # Filter out tied weight keys from missing keys
-            tied_keys = {'lm_head.out_proj.weight'}
-            missing_keys = [k for k in missing_keys if k not in tied_keys]
+            # Filter out expected missing keys:
+            # - tied weights (lm_head shares decoder embeddings)
+            # - coord noise step counter (new feature, not in old checkpoints)
+            expected_missing = {'lm_head.out_proj.weight', '_coord_noise_step'}
+            missing_keys = [k for k in missing_keys if k not in expected_missing]
 
             if missing_keys:
                 import logging

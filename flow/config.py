@@ -263,6 +263,17 @@ class GeometricEmbeddingConfig:
     vq_ema_decay: float = 0.99  # EMA decay rate for VQ codebook updates
     vq_dead_code_threshold: int = 2  # Usage threshold for dead code revival
 
+    # Coordinate Noise Injection (bridges train-test gap for LARA)
+    # During training, decoder coords are perfect (from GT); during inference, they
+    # accumulate errors from predicted tokens. Noise injection during training makes
+    # the model robust to imperfect coords at inference time.
+    coord_noise_enabled: bool = False       # Enable coordinate noise during training
+    coord_noise_std_xy: float = 500.0       # Noise std for x,y axes (chip coord scale)
+    coord_noise_std_z: float = 1.0          # Noise std for z axis (metal layer scale)
+    coord_noise_max_ratio: float = 0.5      # Max probability of applying noise per position
+    coord_noise_warmup_steps: int = 5000    # Ramp noise from 0 to max_ratio over N steps
+    coord_noise_cumulative: bool = True     # Cumulative noise (simulates error drift)
+
 
 @dataclass
 class TrainingModel:

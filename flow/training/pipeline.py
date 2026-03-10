@@ -412,7 +412,13 @@ class TrainingPipeline:
                 vq_ema_decay=getattr(geo_config, 'vq_ema_decay', 0.99),
                 vq_dead_code_threshold=getattr(geo_config, 'vq_dead_code_threshold', 2),
                 use_metal_layer_only_pe=getattr(geo_config, 'use_metal_layer_only_pe', False),
-    
+                # Coordinate Noise Injection (bridges train-test gap for LARA)
+                coord_noise_enabled=getattr(geo_config, 'coord_noise_enabled', False),
+                coord_noise_std_xy=getattr(geo_config, 'coord_noise_std_xy', 500.0),
+                coord_noise_std_z=getattr(geo_config, 'coord_noise_std_z', 1.0),
+                coord_noise_max_ratio=getattr(geo_config, 'coord_noise_max_ratio', 0.5),
+                coord_noise_warmup_steps=getattr(geo_config, 'coord_noise_warmup_steps', 5000),
+                coord_noise_cumulative=getattr(geo_config, 'coord_noise_cumulative', True),
             )
             model = GeoT5GemmaForConditionalGeneration(config, geo_config_dict)
 
@@ -431,6 +437,11 @@ class TrainingPipeline:
             logging.info(f"  - Encoder: {'LARA' if geo_config_dict.enable_encoder_lara else 'Standard Attention'}")
             logging.info(f"  - Decoder Self-Attention: {'LARA' if geo_config_dict.use_geo_self_attn else 'Standard Attention'}")
             logging.info(f"  - Cross-Attention: {'LARA' if geo_config_dict.use_geo_cross_attn else 'Standard Attention'}")
+            if geo_config_dict.coord_noise_enabled:
+                logging.info("Coordinate Noise Injection: ENABLED")
+                logging.info(f"  - std_xy={geo_config_dict.coord_noise_std_xy}, std_z={geo_config_dict.coord_noise_std_z}")
+                logging.info(f"  - max_ratio={geo_config_dict.coord_noise_max_ratio}, warmup_steps={geo_config_dict.coord_noise_warmup_steps}")
+                logging.info(f"  - cumulative={geo_config_dict.coord_noise_cumulative}")
         else:
             model = T5GemmaForConditionalGeneration(config)
             logging.info("Using standard T5GemmaForConditionalGeneration")
