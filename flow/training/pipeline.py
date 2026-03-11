@@ -490,7 +490,12 @@ class TrainingPipeline:
             eval_strategy=self.hyperparameters_config.eval_strategy,
             save_strategy=self.hyperparameters_config.save_strategy,
             # average_tokens_across_devices= True,
-            load_best_model_at_end=True,   
+            # NOTE: load_best_model_at_end=True causes NCCL deadlock with
+            # DeepSpeed ZeRO-3 + custom GeoT5Gemma modules (geo_pe params are
+            # not tracked by DeepSpeed's load_checkpoint, causing mismatched
+            # collective ops across ranks: some do ALLREDUCE, others ALLGATHER).
+            # The final model is saved explicitly via trainer.save_model() below.
+            load_best_model_at_end=False,
             metric_for_best_model="eval_loss",
             greater_is_better=False,
             save_total_limit=10,
