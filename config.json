@@ -51,7 +51,7 @@
             "head_dim": 64,
             "max_position_embeddings": 256,
             "sliding_window": 128,
-            "dropout_rate": 0.05,
+            "dropout_rate": 0.1,
             "geometric_config": {
                 "use_basic_fourier_pe": false,
                 "use_advanced_geo_pe": true,
@@ -83,10 +83,10 @@
                 "vq_ema_decay": 0.99, 
                 "vq_dead_code_threshold":2, 
                 "coord_noise_enabled": true,
-                "coord_noise_std_xy": 5000.0,
-                "coord_noise_std_z": 2.0,
-                "coord_noise_max_ratio": 0.5,
-                "coord_noise_warmup_steps": 5000,
+                "coord_noise_std_xy": 10000.0,
+                "coord_noise_std_z": 3.0,
+                "coord_noise_max_ratio": 0.8,
+                "coord_noise_warmup_steps": 10000,
                 "coord_noise_cumulative": true
             }
         },
@@ -122,10 +122,10 @@
     },
     "evaluation": {
         "paths": {
-            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_nosie",
-            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_nosie/metrics",
-            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_nosie/plots",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_nosie/logs"
+            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_nosie_new",
+            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_nosie_new/metrics",
+            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_nosie_new/plots",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_nosie_new/logs"
         },
         "generation": {
             "max_new_tokens": 512,

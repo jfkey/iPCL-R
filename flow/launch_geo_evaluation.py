@@ -76,9 +76,9 @@ def load_components(
     target_split = dataset_config.validation_split
     dataset = load_corpus_dataset(dataset_config, split=target_split)
 
-    # Filter to only include nets from design 's713'
-    eval_design = "s713"
-    dataset = dataset.filter(lambda x: x["source_design"] == eval_design)
+    # Filter to only include nets from design 's713', 'apb4_wdg', 'ASIC' 
+    eval_design = ["s713", "apb4_wdg", "ASIC"] 
+    dataset = dataset.filter(lambda x: x["source_design"] in eval_design)
     logging.info(f"Filtered to design '{eval_design}': {len(dataset)} samples")
 
     tokenization_pipeline = TokenizationPipeline(config)
