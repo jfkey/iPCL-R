@@ -13,10 +13,12 @@
 from .position_embedding import FourierPositionEmbedding
 from .geometric_attention import GeometricPositionEmbedding, LieAlgebraRelativeAttention
 from .geo_t5gemma import GeoT5GemmaForConditionalGeneration
+from .coordinate_vq import CoordinateVQ
 
 __all__ = [
     "FourierPositionEmbedding",
     "GeometricPositionEmbedding",
     "LieAlgebraRelativeAttention",
     "GeoT5GemmaForConditionalGeneration",
+    "CoordinateVQ",
 ]

@@ -256,12 +256,16 @@ class GeometricEmbeddingConfig:
     bias_num_freqs: int = 16               # Fourier frequency bands for factorized geo bias
     bias_rank_per_head: int = 8            # Rank per head for factorized geo bias
 
-    # Vector Quantization (VQ) parameters
-    use_vq: bool = False  # Enable Vector Quantization
-    vq_codebook_size: int = 1024  # Size of VQ codebook
-    vq_commitment_cost: float = 0.25  # Commitment cost for VQ
-    vq_ema_decay: float = 0.99  # EMA decay rate for VQ codebook updates
-    vq_dead_code_threshold: int = 2  # Usage threshold for dead code revival
+    # Coordinate-level Vector Quantization (3D) — KEY for generalization
+    # Quantizes raw 3D coordinates BEFORE Fourier encoding.
+    # Creates spatial coarsening: nearby positions map to same codebook entry,
+    # so sin(ω·VQ(x)) is identical for nearby x → robust generalization.
+    # Applied at 3 points: ① Encoder PE, ② Decoder LARA, ③ CrossLARA (per-layer codebooks)
+    use_coord_vq: bool = False
+    coord_vq_codebook_size: int = 256  # K entries, info = log2(K) bits per position
+    coord_vq_commitment_cost: float = 0.25  # β for commitment loss
+    coord_vq_ema_decay: float = 0.99  # EMA decay for codebook updates
+    coord_vq_dead_code_threshold: int = 2  # Usage threshold for dead code revival
 
     # Coordinate Noise Injection (bridges train-test gap for LARA)
     # During training, decoder coords are perfect (from GT); during inference, they

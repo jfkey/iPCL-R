@@ -39,8 +39,8 @@
     "training": {
         "paths": {
             "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/split_dataset",
-            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_all_nosie",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_all_nosie/logs"
+            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_vq",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_vq/logs"
         },
         "model": {
             "hidden_size": 512,
@@ -77,11 +77,11 @@
                 "use_value_rotation": false,
                 "bias_num_freqs": 16,
                 "bias_rank_per_head": 8,
-                "use_vq": false,
-                "vq_codebook_size": 512,
-                "vq_commitment_cost": 0.25,
-                "vq_ema_decay": 0.99, 
-                "vq_dead_code_threshold":2, 
+                "use_coord_vq": true,
+                "coord_vq_codebook_size": 256,
+                "coord_vq_commitment_cost": 0.25,
+                "coord_vq_ema_decay": 0.99,
+                "coord_vq_dead_code_threshold": 2,
                 "coord_noise_enabled": true,
                 "coord_noise_std_xy": 10000.0,
                 "coord_noise_std_z": 3.0,
@@ -95,7 +95,7 @@
             "max_src_len": 128,
             "max_tgt_len": 256,
             "train_split_ratio": 0.9,
-            "num_train_epochs": 30,
+            "num_train_epochs": 20,
             "batch_size_per_device": 128,
             "gradient_accumulation_steps": 1,
             "learning_rate": 2e-4,
@@ -122,10 +122,10 @@
     },
     "evaluation": {
         "paths": {
-            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_nosie_new",
-            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_nosie_new/metrics",
-            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_nosie_new/plots",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_all_nosie_new/logs"
+            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_vq",
+            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_vq/metrics",
+            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_vq/plots",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_vq/logs"
         },
         "generation": {
             "max_new_tokens": 512,

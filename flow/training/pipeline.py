@@ -405,13 +405,13 @@ class TrainingPipeline:
                 use_value_rotation=getattr(geo_config, 'use_value_rotation', True),
                 bias_num_freqs=getattr(geo_config, 'bias_num_freqs', 16),
                 bias_rank_per_head=getattr(geo_config, 'bias_rank_per_head', 8),
-                # Vector Quantization (VQ) parameters
-                use_vq=getattr(geo_config, 'use_vq', False),
-                vq_codebook_size=getattr(geo_config, 'vq_codebook_size', 1024),
-                vq_commitment_cost=getattr(geo_config, 'vq_commitment_cost', 0.25),
-                vq_ema_decay=getattr(geo_config, 'vq_ema_decay', 0.99),
-                vq_dead_code_threshold=getattr(geo_config, 'vq_dead_code_threshold', 2),
                 use_metal_layer_only_pe=getattr(geo_config, 'use_metal_layer_only_pe', False),
+                # Coordinate-level Vector Quantization (spatial coarsening)
+                use_coord_vq=getattr(geo_config, 'use_coord_vq', False),
+                coord_vq_codebook_size=getattr(geo_config, 'coord_vq_codebook_size', 256),
+                coord_vq_commitment_cost=getattr(geo_config, 'coord_vq_commitment_cost', 0.25),
+                coord_vq_ema_decay=getattr(geo_config, 'coord_vq_ema_decay', 0.99),
+                coord_vq_dead_code_threshold=getattr(geo_config, 'coord_vq_dead_code_threshold', 2),
                 # Coordinate Noise Injection (bridges train-test gap for LARA)
                 coord_noise_enabled=getattr(geo_config, 'coord_noise_enabled', False),
                 coord_noise_std_xy=getattr(geo_config, 'coord_noise_std_xy', 500.0),
@@ -498,7 +498,7 @@ class TrainingPipeline:
             load_best_model_at_end=False,
             metric_for_best_model="eval_loss",
             greater_is_better=False,
-            save_total_limit=10,
+            save_total_limit=None,  # Keep all epoch checkpoints
             # Logging
             logging_dir=os.path.join(
                 self.paths_config.logging_dir,
