@@ -533,17 +533,11 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
         """
 
         # Coordinate-level VQ: quantize coordinates before passing to attention
-        self._coord_vq_loss = None
         if self.coord_vq is not None:
             if decoder_coordinates is not None:
-                decoder_coordinates, dec_vq_loss, _ = self.coord_vq(decoder_coordinates)
-                self._coord_vq_loss = dec_vq_loss
+                decoder_coordinates, _, _ = self.coord_vq(decoder_coordinates)
             if encoder_coordinates is not None:
-                encoder_coordinates, enc_vq_loss, _ = self.coord_vq(encoder_coordinates)
-                if self._coord_vq_loss is None:
-                    self._coord_vq_loss = enc_vq_loss
-                else:
-                    self._coord_vq_loss = self._coord_vq_loss + enc_vq_loss
+                encoder_coordinates, _, _ = self.coord_vq(encoder_coordinates)
 
         # Self-Attention
         residual = hidden_states
@@ -1045,9 +1039,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 dead_code_threshold=self.geo_config.coord_vq_dead_code_threshold,
             )
 
-        # Coordinate VQ loss accumulator
-        self._coord_vq_loss = None
-
         # Coordinate noise step counter for warmup scheduling.
         # Uses register_buffer so it persists across checkpoints and device moves.
         self.register_buffer(
@@ -1110,17 +1101,12 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             # This ensures sin(ω·VQ(x)) is identical for nearby positions,
             # preventing over-specific representations that cause test degradation.
             if self.encoder_coord_vq is not None:
-                abs_positions, abs_vq_loss, _ = self.encoder_coord_vq(
+                abs_positions, _, _ = self.encoder_coord_vq(
                     abs_positions, attention_mask
                 )
-                rel_positions, rel_vq_loss, _ = self.encoder_coord_vq(
+                rel_positions, _, _ = self.encoder_coord_vq(
                     rel_positions, attention_mask
                 )
-                coord_vq_loss = abs_vq_loss + rel_vq_loss
-                if self._coord_vq_loss is None:
-                    self._coord_vq_loss = coord_vq_loss
-                else:
-                    self._coord_vq_loss = self._coord_vq_loss + coord_vq_loss
 
             # GeometryAwarePositionEmbedding expects (abs_pos, rel_pos)
             # Note: Module handles dtype internally for fp16 compatibility
@@ -1150,13 +1136,9 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         if self.encoder_fourier_pe is not None and abs_positions is not None:
             # Coordinate-level VQ for simple Fourier PE
             if self.encoder_coord_vq is not None:
-                abs_positions, coord_vq_loss, _ = self.encoder_coord_vq(
+                abs_positions, _, _ = self.encoder_coord_vq(
                     abs_positions, attention_mask
                 )
-                if self._coord_vq_loss is None:
-                    self._coord_vq_loss = coord_vq_loss
-                else:
-                    self._coord_vq_loss = self._coord_vq_loss + coord_vq_loss
 
             # Note: Module handles dtype internally for fp16 compatibility
             geo_embeds = self.encoder_fourier_pe(abs_positions, attention_mask)
@@ -1530,15 +1512,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 # logits to FP32 before computing cross-entropy for numerical stability.
                 loss = self.loss_function(lm_logits, labels, self.config.vocab_size, **kwargs )
 
-                # Add coordinate VQ loss (encoder + per-layer decoder)
-                if self._coord_vq_loss is not None:
-                    loss = loss + self._coord_vq_loss
-                    self._coord_vq_loss = None  # Reset
-                for layer in decoder.layers:
-                    if hasattr(layer, '_coord_vq_loss') and layer._coord_vq_loss is not None:
-                        loss = loss + layer._coord_vq_loss
-                        layer._coord_vq_loss = None
-
             if not return_dict:
                 output = (lm_logits,) + decoder_outputs[1:]
                 return ((loss,) + output) if loss is not None else output
@@ -1909,9 +1882,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 ema_decay=model.geo_config.coord_vq_ema_decay,
                 dead_code_threshold=model.geo_config.coord_vq_dead_code_threshold,
             )
-
-        # Initialize coordinate VQ loss accumulator
-        model._coord_vq_loss = None
 
         # Initialize coordinate noise step counter
         model.register_buffer(

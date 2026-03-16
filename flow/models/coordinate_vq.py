@@ -159,13 +159,18 @@ class CoordinateVQ(nn.Module):
 
         Flow: raw coords → scale → VQ in normalized space → unscale → output
 
+        Unlike standard VQ-VAE, commitment loss is NOT added to the total loss
+        because coordinates are fixed data inputs (not learnable encoder outputs).
+        The codebook is updated solely via EMA, and the straight-through estimator
+        provides gradient flow for downstream modules.
+
         Args:
             coordinates: Raw coordinates (batch, seq_len, 3)
             attention_mask: Optional mask (batch, seq_len), 1=valid, 0=pad
 
         Returns:
             quantized_coords: Quantized in original scale (batch, seq_len, 3)
-            vq_loss: Scalar commitment loss
+            vq_loss: Always 0 (coordinates are not learnable, commitment loss is meaningless)
             indices: Codebook indices (batch, seq_len)
         """
         batch_size, seq_len, D = coordinates.shape
@@ -188,8 +193,9 @@ class CoordinateVQ(nn.Module):
             flat_scaled = coords_scaled.reshape(-1, D)  # (B*T, 3)
             flat_valid = flat_scaled[valid_flat]  # (N_valid, 3)
 
+            zero_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+
             if flat_valid.shape[0] == 0:
-                zero_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
                 return coordinates, zero_loss, torch.zeros(
                     batch_size, seq_len, dtype=torch.long, device=device
                 )
@@ -208,10 +214,6 @@ class CoordinateVQ(nn.Module):
 
             indices_valid = distances.argmin(dim=-1)  # (N_valid,)
             quantized_valid = F.embedding(indices_valid, cb)  # (N_valid, 3)
-
-            # Commitment loss: encoder output → codebook
-            commitment_loss = F.mse_loss(flat_valid, quantized_valid.detach())
-            vq_loss = self.commitment_cost * commitment_loss
 
             # EMA codebook update (training only)
             if self.training:
@@ -242,7 +244,7 @@ class CoordinateVQ(nn.Module):
                     )
                     self._revive_dead_codes(flat_valid)
 
-            # Straight-through estimator
+            # Straight-through estimator: forward uses quantized, backward passes through
             quantized_valid = flat_valid + (quantized_valid - flat_valid).detach()
 
             # Scatter back to full tensor
@@ -255,7 +257,7 @@ class CoordinateVQ(nn.Module):
             # Unscale back to original coordinate space
             quantized_coords = quantized_flat.reshape(batch_size, seq_len, D) / self.coord_scale
 
-        return quantized_coords.to(input_dtype), vq_loss, indices_flat.reshape(batch_size, seq_len)
+        return quantized_coords.to(input_dtype), zero_loss, indices_flat.reshape(batch_size, seq_len)
 
     def extra_repr(self) -> str:
         return (
