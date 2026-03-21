@@ -77,9 +77,9 @@ def load_components(
     dataset = load_corpus_dataset(dataset_config, split=target_split)
 
     # Filter to only include nets from design 's713', 'apb4_wdg', 'ASIC' 
-    eval_design = ["s713", "apb4_wdg", "ASIC"] 
-    dataset = dataset.filter(lambda x: x["source_design"] in eval_design)
-    logging.info(f"Filtered to design '{eval_design}': {len(dataset)} samples")
+    # eval_design = ["s713", "apb4_wdg", "ASIC"] 
+    # dataset = dataset.filter(lambda x: x["source_design"] in eval_design)
+    # logging.info(f"Filtered to design '{eval_design}': {len(dataset)} samples")
 
     tokenization_pipeline = TokenizationPipeline(config)
     dataset = tokenization_pipeline.preprocess_corpus(dataset)
@@ -544,4 +544,4 @@ if __name__ == "__main__":
     main()
 
 # Usage:1
-# accelerate launch --config_file /home/liujunfeng/.cache/huggingface/accelerate/fast_evaluation.yaml -m flow.launch_geo_evaluation --flow-config config.json
+# accelerate launch -m  --config_file /home/liujunfeng/.cache/huggingface/accelerate/fast_evaluation.yaml  flow.launch_geo_evaluation --flow-config /mnt/local_data1/liujunfeng/exp/Large-GeoPE/stage_training/model_wope/config.json 
