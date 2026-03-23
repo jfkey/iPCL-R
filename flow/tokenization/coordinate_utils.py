@@ -501,27 +501,73 @@ def extract_source_positions_from_raw_data(
     rel_positions = []
     load_idx = 0
 
+    # Patterns for indexed and generic RLOAD/ALOAD tokens
+    import re
+    from flow.utils.special_tokens import SpecialTokenManager
+    rload_indexed_pattern = re.compile(r"^<RLOAD(\d+)>$")
+    aload_indexed_pattern = re.compile(r"^<ALOAD(\d+)>$")
+
+    # Counter for generic overflow tokens (<RLOAD> / <ALOAD>)
+    # Overflow tokens correspond to loads beyond MAX_INDEXED_LOADS
+    max_indexed = SpecialTokenManager.MAX_INDEXED_LOADS
+    generic_rload_idx = max_indexed
+    generic_aload_idx = max_indexed
+
     for token in token_list:
         token_stripped = token.strip()
 
         if token_stripped == "<DRIVER>":
-            # Driver token: absolute position, relative = (0, 0, 0)
             abs_positions.append(driver_pos)
             rel_positions.append((0, 0, 0))
         elif token_stripped == "<LOAD>":
-            # Load token: absolute position + relative position
+            # Legacy LOAD token
             if load_idx < len(load_positions):
                 abs_positions.append(load_positions[load_idx])
                 rel_positions.append(load_relative_positions[load_idx])
                 load_idx += 1
             else:
-                # Fallback if more <LOAD> tokens than loads
+                abs_positions.append(SPECIAL_POS)
+                rel_positions.append(SPECIAL_POS)
+        elif token_stripped == "<RLOAD>":
+            # Generic overflow RLOAD: assign next available load sequentially
+            if generic_rload_idx < len(load_positions):
+                abs_positions.append(load_positions[generic_rload_idx])
+                rel_positions.append(load_relative_positions[generic_rload_idx])
+                generic_rload_idx += 1
+            else:
+                abs_positions.append(SPECIAL_POS)
+                rel_positions.append(SPECIAL_POS)
+        elif token_stripped == "<ALOAD>":
+            # Generic overflow ALOAD: assign next available load sequentially
+            if generic_aload_idx < len(load_positions):
+                abs_positions.append(load_positions[generic_aload_idx])
+                rel_positions.append(load_relative_positions[generic_aload_idx])
+                generic_aload_idx += 1
+            else:
                 abs_positions.append(SPECIAL_POS)
                 rel_positions.append(SPECIAL_POS)
         else:
-            # Other tokens (BOS, direction tokens, SRC_END, etc.): no position
-            abs_positions.append(SPECIAL_POS)
-            rel_positions.append(SPECIAL_POS)
+            rload_match = rload_indexed_pattern.match(token_stripped)
+            aload_match = aload_indexed_pattern.match(token_stripped)
+            if rload_match:
+                idx = int(rload_match.group(1)) - 1
+                if idx < len(load_positions):
+                    abs_positions.append(load_positions[idx])
+                    rel_positions.append(load_relative_positions[idx])
+                else:
+                    abs_positions.append(SPECIAL_POS)
+                    rel_positions.append(SPECIAL_POS)
+            elif aload_match:
+                idx = int(aload_match.group(1)) - 1
+                if idx < len(load_positions):
+                    abs_positions.append(load_positions[idx])
+                    rel_positions.append(load_relative_positions[idx])
+                else:
+                    abs_positions.append(SPECIAL_POS)
+                    rel_positions.append(SPECIAL_POS)
+            else:
+                abs_positions.append(SPECIAL_POS)
+                rel_positions.append(SPECIAL_POS)
 
     return abs_positions, rel_positions
 
@@ -709,3 +755,27 @@ def validate_coordinate_alignment(
         )
         return False
     return True
+
+
+def compute_relative_target_coordinates(
+    tgt_coords: List[Tuple[int, int, int]],
+    driver_coord: Optional[CoordinatePoint] = None,
+) -> List[Tuple[int, int, int]]:
+    """
+    Compute relative target coordinates by subtracting driver's absolute position.
+
+    Each target token's absolute coordinate is shifted so that the driver
+    position becomes the origin (0, 0, 0).
+
+    Args:
+        tgt_coords: List of absolute (x, y, m) tuples for target tokens
+        driver_coord: Driver's absolute coordinate. If None, uses (0, 0, 0).
+
+    Returns:
+        List of relative (x, y, m) tuples, one per target token
+    """
+    if driver_coord is None:
+        driver_coord = CoordinatePoint(0, 0, 0)
+
+    dx, dy, dm = driver_coord.x, driver_coord.y, driver_coord.m
+    return [(x - dx, y - dy, m - dm) for x, y, m in tgt_coords]

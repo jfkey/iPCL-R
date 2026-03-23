@@ -30,6 +30,7 @@ from .coordinate_utils import (
     CoordinateTracker,
     extract_source_positions_from_raw_data,
     compute_target_coordinates_from_tokens,
+    compute_relative_target_coordinates,
     parse_coordinate_string,
     SPECIAL_POS,
     BRANCH_POS,
@@ -60,7 +61,7 @@ class TokenizationPipeline:
         corpus_dataset = self.read_data_synthesis()
 
         # # DEBUG: Only use top 100000 samples for testing
-        # corpus_dataset = corpus_dataset.select(range(min(100000, len(corpus_dataset))))
+        # corpus_dataset = corpus_dataset.select(range(min(10000, len(corpus_dataset))))
         # logging.info(f"DEBUG: Using only {len(corpus_dataset)} samples for testing")
 
         # Step 2: Preprocess and refine tree_seq in corpus dataset
@@ -171,7 +172,7 @@ class TokenizationPipeline:
                 self.unified_tokenizer.remove_special_token(
                     self.unified_tokenizer.convert_source_to_directional_token(
                         driver, loads, overlap_info, connected_info
-                    )
+                    )[0]
                 )
                 for driver, loads, overlap_info, connected_info in zip(
                     batch_driver, batch_loads, batch_overlap_info, batch_connected_info
@@ -243,7 +244,7 @@ class TokenizationPipeline:
                     sample.get("overlap_info", {}),
                     sample.get("connected_info", {}),
                 )
-                source_text = (
+                source_text, _ = (
                     self.unified_tokenizer.convert_source_to_directional_token(
                         driver, loads, overlap_info, connected_info
                     )
@@ -270,23 +271,23 @@ class TokenizationPipeline:
                 logging.info(f"Sample {i + 1} Net {sample.get('net_name')}:")
                 logging.info(f"  [Source] Driver: {sample.get('driver', 'N/A')}")
                 logging.info(
-                    f"  [Source] Loads: {sample.get('loads', 'N/A')[:4]}{'...' if len(sample.get('loads', [])) > 4 else ''}"
+                    f"  [Source] Loads: {sample.get('loads', 'N/A')[:50]}{'...' if len(sample.get('loads', [])) > 50 else ''}"
                 )
                 logging.info(
-                    f"  [Source -> Directional Token]: {source_directional_tokens[:10]}{'...' if len(source_directional_tokens) > 10 else ''}"
+                    f"  [Source -> Directional Token]: {source_directional_tokens[:1000]}{'...' if len(source_directional_tokens) > 1000 else ''}"
                 )
                 logging.info(
-                    f"  [Directional Token -> Tokenized Token] : {source_tokenized_tokens[:10]}{'...' if len(source_tokenized_tokens) > 10 else ''}"
+                    f"  [Directional Token -> Tokenized Token] : {source_tokenized_tokens[:1000]}{'...' if len(source_tokenized_tokens) > 1000 else ''}"
                 )
                 logging.info(
                     f"  # Source tokenized length: {len(source_tokenized_tokens)}"
                 )
                 logging.info(f"  [Target] Tree Sequence: {relative_tree_seq}")
                 logging.info(
-                    f"  [Target -> Directional Token]: {target_directional_tokens[:10]}{'...' if len(target_directional_tokens) > 10 else ''}"
+                    f"  [Target -> Directional Token]: {target_directional_tokens[:1000]}{'...' if len(target_directional_tokens) > 1000 else ''}"
                 )
                 logging.info(
-                    f"  [Directional Token -> Tokenized Token]: {target_tokenized_tokens[:10]}{'...' if len(target_tokenized_tokens) > 10 else ''}"
+                    f"  [Directional Token -> Tokenized Token]: {target_tokenized_tokens[:1000]}{'...' if len(target_tokenized_tokens) > 1000 else ''}"
                 )
                 logging.info(f"  # Target length: {len(relative_tree_seq)}")
                 logging.info(
@@ -315,7 +316,7 @@ class TokenizationPipeline:
                     sample.get("overlap_info", {}),
                     sample.get("connected_info", {}),
                 )
-                source_text = (
+                source_text, _ = (
                     self.unified_tokenizer.convert_source_to_directional_token(
                         driver, loads, overlap_info, connected_info
                     )
@@ -403,6 +404,8 @@ class TokenizationPipeline:
             batch_src_rel_pos = []
             # Target: cumulative positions from tokens
             batch_tgt_coords = []
+            # Target: relative positions (tgt_coords - driver)
+            batch_relative_tgt_coords = []
             # Per-sample coordinate stats for aggregation
             batch_src_min_x, batch_src_max_x = [], []
             batch_src_min_y, batch_src_max_y = [], []
@@ -421,7 +424,7 @@ class TokenizationPipeline:
                 )
             ):
                 # Convert to directional tokens
-                source_tokens = self.unified_tokenizer.convert_source_to_directional_token(
+                source_tokens, ordered_loads = self.unified_tokenizer.convert_source_to_directional_token(
                     driver, loads, overlap_info, connected_info
                 )
                 target_tokens = self.unified_tokenizer.convert_relative_target_to_directional_token(
@@ -431,11 +434,12 @@ class TokenizationPipeline:
                 batch_source_tokens.append(source_tokens)
                 batch_target_tokens.append(target_tokens)
 
-                # 1. Extract source positions directly from raw data (NOT from tokens)
+                # 1. Extract source positions from raw data using ordered_loads
+                #    (ordered_loads matches the RLOAD/ALOAD index order in tokens)
                 try:
                     src_abs_pos, src_rel_pos = extract_source_positions_from_raw_data(
                         driver_str=driver,
-                        loads=loads,
+                        loads=ordered_loads,
                         source_tokens=source_tokens,
                     )
                     batch_src_abs_pos.append(src_abs_pos)
@@ -455,11 +459,17 @@ class TokenizationPipeline:
                         target_tokens, driver_coord
                     )
                     batch_tgt_coords.append(tgt_coords)
+                    # Compute relative target coordinates (tgt_coords - driver)
+                    rel_tgt_coords = compute_relative_target_coordinates(
+                        tgt_coords, driver_coord
+                    )
+                    batch_relative_tgt_coords.append(rel_tgt_coords)
                 except Exception as e:
                     logging.warning(f"Failed to compute target coordinates for sample {i}: {e}")
                     tgt_len = len(target_tokens.split())
                     tgt_coords = [SPECIAL_POS] * tgt_len
                     batch_tgt_coords.append(tgt_coords)
+                    batch_relative_tgt_coords.append([SPECIAL_POS] * tgt_len)
 
                 # 3. Compute per-sample min/max coordinates for aggregation
                 # src_abs_pos stats
@@ -490,6 +500,7 @@ class TokenizationPipeline:
                 "src_abs_pos": batch_src_abs_pos,
                 "src_rel_pos": batch_src_rel_pos,
                 "tgt_coords": batch_tgt_coords,
+                "relative_tgt_coords": batch_relative_tgt_coords,
                 # Coordinate stats columns (temporary, for aggregation)
                 "_src_min_x": batch_src_min_x, "_src_max_x": batch_src_max_x,
                 "_src_min_y": batch_src_min_y, "_src_max_y": batch_src_max_y,
@@ -614,6 +625,7 @@ class TokenizationPipeline:
                 "src_abs_pos",
                 "src_rel_pos",
                 "tgt_coords",
+                "relative_tgt_coords",
                 "net_name",
                 "driver",
                 "loads",
@@ -634,6 +646,7 @@ class TokenizationPipeline:
         logging.info("  - src_abs_pos: Absolute positions for <DRIVER>/<LOAD> tokens")
         logging.info("  - src_rel_pos: Relative positions (load - driver) for <LOAD> tokens")
         logging.info("  - tgt_coords: Cumulative absolute positions for target tokens")
+        logging.info("  - relative_tgt_coords: Relative positions (tgt_coords - driver) for target tokens")
 
         if "src_abs_pos" in corpus_dataset.column_names:
             sample = corpus_dataset[0]
@@ -642,13 +655,15 @@ class TokenizationPipeline:
             sample_src_abs_pos = sample["src_abs_pos"]
             sample_src_rel_pos = sample["src_rel_pos"]
             sample_tgt_coords = sample["tgt_coords"]
+            sample_relative_tgt_coords = sample.get("relative_tgt_coords", [])
 
             logging.info(f"\nSample 0:")
-            logging.info(f"  source_tokens ({len(sample_src_tokens.split())} tokens): {sample_src_tokens[:300]}...")
-            logging.info(f"  target_tokens ({len(sample_tgt_tokens.split())} tokens): {sample_tgt_tokens[:300]}...")
-            logging.info(f"  src_abs_pos ({len(sample_src_abs_pos)} positions): {sample_src_abs_pos[:50]}...")
-            logging.info(f"  src_rel_pos ({len(sample_src_rel_pos)} positions): {sample_src_rel_pos[:50]}...")
-            logging.info(f"  tgt_coords ({len(sample_tgt_coords)} positions): {sample_tgt_coords[:50]}...")
+            logging.info(f"  source_tokens ({len(sample_src_tokens.split())} tokens): {sample_src_tokens[:1000]}...")
+            logging.info(f"  target_tokens ({len(sample_tgt_tokens.split())} tokens): {sample_tgt_tokens[:1000]}...")
+            logging.info(f"  src_abs_pos ({len(sample_src_abs_pos)} positions): {sample_src_abs_pos[:1000]}...")
+            logging.info(f"  src_rel_pos ({len(sample_src_rel_pos)} positions): {sample_src_rel_pos[:1000]}...")
+            logging.info(f"  tgt_coords ({len(sample_tgt_coords)} positions): {sample_tgt_coords[:1000]}...")
+            logging.info(f"  relative_tgt_coords ({len(sample_relative_tgt_coords)} positions): {sample_relative_tgt_coords[:1000]}...")
 
             # Verify alignment
             src_token_count = len(sample_src_tokens.split())

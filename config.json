@@ -13,9 +13,9 @@
     },
     "tokenization": {
         "paths": {
-            "token_dataset_dir": "/mnt/local_data1/liujunfeng/exp/universal_token/token_dataset",
-            "tokenizer_save_dir": "/mnt/local_data1/liujunfeng/exp/universal_token/tokenizer",
-            "output_metadata_path": "/mnt/local_data1/liujunfeng/exp/universal_token/output_metadata.json"
+            "token_dataset_dir": "/mnt/local_data1/liujunfeng/exp/universal_token_update/token_dataset",
+            "tokenizer_save_dir": "/mnt/local_data1/liujunfeng/exp/universal_token_update/tokenizer",
+            "output_metadata_path": "/mnt/local_data1/liujunfeng/exp/universal_token_update/output_metadata.json"
         },
         "workflow": {
             "tokenizer_algorithm": "DecimalWordLevel",
