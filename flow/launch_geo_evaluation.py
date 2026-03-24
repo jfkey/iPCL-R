@@ -4,20 +4,17 @@
 @File    :   launch_geo_evaluation.py
 @Time    :   2025/01/30
 @Author  :   Junfeng Liu
-@Version :   1.0
-@Desc    :   Command-line launcher for GeoT5GemmaForConditionalGeneration evaluation.
+@Version :   2.0
+@Desc    :   Unified evaluation script for GeoT5GemmaForConditionalGeneration.
 
-             This evaluation script handles the 5-field data format:
-             - source_tokens: Encoder input tokens
-             - target_tokens: Decoder target tokens (ground truth)
-             - src_abs_pos: Absolute positions for <DRIVER>/<LOAD> tokens
-             - src_rel_pos: Relative positions (load - driver) for <LOAD> tokens
-             - tgt_coords: Generated in real-time using InferenceCoordinateTracker
+             Follows the same pattern as launch_evaluation.py (T5Gemma):
+             - Flow config.json controls paths, data, generation params
+             - Model config (including geometric_config) is read from checkpoint
 
-             Key difference from launch_evaluation.py:
-             - Uses GeoT5GemmaForConditionalGeneration instead of T5GemmaForConditionalGeneration
-             - Handles coordinate inputs (encoder_abs_positions, encoder_rel_positions)
-             - Uses InferenceCoordinateTracker for real-time tgt_coords generation during inference
+             Automatically branches behavior based on model.geo_config:
+             - Baseline (all geo off): identical to launch_evaluation.py
+             - PE only (no LARA):      standard generate with encoder coordinates
+             - LARA enabled:           per-sample generate with coordinate tracking
 """
 
 import argparse
@@ -41,126 +38,69 @@ from flow.config import FlowConfig
 from flow.evaluation import EvaluationPipeline
 from flow.tokenization import TokenizationPipeline, UnifiedTokenizer
 from flow.utils import load_corpus_dataset, setup_logging
-from flow.models.geo_t5gemma import GeoT5GemmaForConditionalGeneration
+from flow.models.geo_t5gemma import GeoT5GemmaForConditionalGeneration, GeoConfig
 
 
-def extract_driver_position(src_abs_pos: List[Tuple[int, int, int]]) -> Tuple[int, int, int]:
-    """
-    Extract driver position from source absolute positions.
+# =============================================================================
+#  Geo feature detection
+# =============================================================================
 
-    The driver position is typically at index 1 (after <BOS> at index 0).
-    We look for the first non-zero position in src_abs_pos.
-
-    Args:
-        src_abs_pos: List of (x, y, m) absolute positions for source tokens
+def detect_geo_mode(model: GeoT5GemmaForConditionalGeneration):
+    """Detect which geo features are active from the loaded model.
 
     Returns:
-        Driver position (x, y, m)
+        (has_pe, has_lara) — two booleans
     """
+    geo = model.geo_config
+    has_pe = (
+        geo.use_advanced_geo_pe
+        or geo.use_basic_fourier_pe
+        or geo.use_metal_layer_only_pe
+    )
+    has_lara = geo.use_geo_self_attn or geo.use_geo_cross_attn
+    return has_pe, has_lara
+
+
+# =============================================================================
+#  Data collators
+# =============================================================================
+
+def make_baseline_collator(tokenizer, max_src_len):
+    """Same collator as launch_evaluation.py — tokens only."""
+    def collate_fn(batch):
+        source_tokens = [item["source_tokens"] for item in batch]
+        encs = tokenizer(
+            source_tokens,
+            return_tensors="pt",
+            add_special_tokens=False,
+            truncation=True,
+            padding="max_length",
+            max_length=max_src_len,
+        )
+        return encs
+    return collate_fn
+
+
+def _extract_driver_position(src_abs_pos):
+    """Extract the first non-zero (x, y, m) from src_abs_pos."""
     for pos in src_abs_pos:
         if isinstance(pos, (list, tuple)) and len(pos) >= 3:
             x, y, m = pos[0], pos[1], pos[2]
             if x != 0 or y != 0 or m != 0:
                 return (x, y, m)
-    # Fallback: return origin if no driver position found
     return (0, 0, 0)
 
 
-def load_components(
-    config: FlowConfig,
-) -> Union[Dataset, PreTrainedTokenizerFast, GeoT5GemmaForConditionalGeneration]:
-    """Load evaluation dataset, tokenizer, and GeoT5Gemma model from config"""
+class GeoDataCollator:
+    """Collator that also pads encoder coordinate fields."""
 
-    # Dataset
-    dataset_config = config.dataset
-    target_split = dataset_config.validation_split
-    dataset = load_corpus_dataset(dataset_config, split=target_split)
-
-    # Filter to only include nets from design 's713', 'apb4_wdg', 'ASIC' 
-    # eval_design = ["s713", "apb4_wdg", "ASIC"] 
-    # dataset = dataset.filter(lambda x: x["source_design"] in eval_design)
-    # logging.info(f"Filtered to design '{eval_design}': {len(dataset)} samples")
-
-    tokenization_pipeline = TokenizationPipeline(config)
-    dataset = tokenization_pipeline.preprocess_corpus(dataset)
-    # Set remove_columns=False to keep original columns for evaluation ('source_design')
-    dataset = tokenization_pipeline.build_token_dataset(dataset, remove_columns=False)
-
-    dataset_source = (
-        dataset_config.hub_id
-        if dataset_config.use_hub()
-        else dataset_config.local_path_for_split(target_split)
-    )
-    logging.info(f"Dataset loaded with {len(dataset)} samples from {dataset_source}")
-
-    # Verify dataset has required coordinate columns
-    required_columns = ["source_tokens", "target_tokens", "src_abs_pos", "src_rel_pos", "tgt_coords"]
-    missing_columns = [col for col in required_columns if col not in dataset.column_names]
-    if missing_columns:
-        logging.warning(f"Dataset missing coordinate columns: {missing_columns}")
-        logging.warning("Coordinate-aware evaluation may not work correctly.")
-    else:
-        logging.info("Dataset has all required coordinate columns for GeoT5Gemma evaluation")
-
-    # Tokenizer & Model
-    unified_tokenizer = UnifiedTokenizer.from_pretrained(
-        config.tokenization.paths.tokenizer_save_dir
-    )
-    tokenizer = unified_tokenizer.tokenizer
-    logging.info(
-        f"Tokenizer loaded from {config.tokenization.paths.tokenizer_save_dir}"
-    )
-
-    # Try to load GeoT5GemmaForConditionalGeneration
-    model_path = config.training.paths.model_save_dir
-    try:
-        model = GeoT5GemmaForConditionalGeneration.from_pretrained(model_path).eval()
-        logging.info(f"GeoT5GemmaForConditionalGeneration loaded from {model_path}")
-    except Exception as e:
-        # Try loading from checkpoint
-        checkpoints = list(Path(model_path).glob("checkpoint-*"))
-        if checkpoints:
-            last_checkpoint = max(checkpoints, key=lambda x: int(x.name.split("-")[-1]))
-            logging.info(f"Loading GeoT5Gemma model from last checkpoint: {last_checkpoint}")
-            model = GeoT5GemmaForConditionalGeneration.from_pretrained(last_checkpoint).eval()
-        else:
-            logging.error(f"Failed to load GeoT5Gemma model from {model_path}: {e}")
-            raise e
-
-    # Set tokenizer reference for coordinate tracking during generation
-    model._tokenizer = tokenizer
-
-    return dataset, tokenizer, model
-
-
-class GeoDataCollatorForEvaluation:
-    """
-    Custom data collator for GeoT5Gemma evaluation.
-
-    Handles:
-    - source_tokens: Tokenized and padded to input_ids
-    - src_abs_pos: Padded to encoder_abs_positions (batch, src_len, 3)
-    - src_rel_pos: Padded to encoder_rel_positions (batch, src_len, 3)
-
-    Note: tgt_coords is NOT included in the batch because it's generated
-    in real-time during inference using InferenceCoordinateTracker.
-    """
-
-    def __init__(
-        self,
-        tokenizer: PreTrainedTokenizerFast,
-        max_src_len: int,
-        coord_pad_value: int = 0,
-    ):
+    def __init__(self, tokenizer, max_src_len, need_driver_positions=False):
         self.tokenizer = tokenizer
         self.max_src_len = max_src_len
-        self.coord_pad_value = coord_pad_value
+        self.need_driver_positions = need_driver_positions
 
-    def __call__(self, batch: List[dict]) -> dict:
-        """Collate batch with coordinate handling."""
+    def __call__(self, batch):
         source_tokens = [item["source_tokens"] for item in batch]
-
-        # Tokenize source tokens
         encs = self.tokenizer(
             source_tokens,
             return_tensors="pt",
@@ -170,208 +110,154 @@ class GeoDataCollatorForEvaluation:
             max_length=self.max_src_len,
         )
 
-        padded_src_len = encs["input_ids"].shape[1]
         batch_size = len(batch)
+        padded_src_len = encs["input_ids"].shape[1]
 
-        # Pad source absolute positions
-        encoder_abs_positions = torch.full(
-            (batch_size, padded_src_len, 3),
-            self.coord_pad_value,
-            dtype=torch.long
-        )
-
-        # Pad source relative positions
-        encoder_rel_positions = torch.full(
-            (batch_size, padded_src_len, 3),
-            self.coord_pad_value,
-            dtype=torch.long
-        )
-
-        # Extract driver positions for coordinate tracking
+        encoder_abs_positions = torch.zeros(batch_size, padded_src_len, 3, dtype=torch.long)
+        encoder_rel_positions = torch.zeros(batch_size, padded_src_len, 3, dtype=torch.long)
         driver_positions = []
 
         for i, item in enumerate(batch):
-            # Extract and pad src_abs_pos
             if "src_abs_pos" in item:
-                src_abs_pos = item["src_abs_pos"]
-                seq_len = min(len(src_abs_pos), padded_src_len)
+                src_abs = item["src_abs_pos"]
+                seq_len = min(len(src_abs), padded_src_len)
                 for j in range(seq_len):
-                    if isinstance(src_abs_pos[j], (list, tuple)) and len(src_abs_pos[j]) >= 3:
-                        encoder_abs_positions[i, j, 0] = src_abs_pos[j][0]
-                        encoder_abs_positions[i, j, 1] = src_abs_pos[j][1]
-                        encoder_abs_positions[i, j, 2] = src_abs_pos[j][2]
+                    if isinstance(src_abs[j], (list, tuple)) and len(src_abs[j]) >= 3:
+                        encoder_abs_positions[i, j, 0] = src_abs[j][0]
+                        encoder_abs_positions[i, j, 1] = src_abs[j][1]
+                        encoder_abs_positions[i, j, 2] = src_abs[j][2]
+                if self.need_driver_positions:
+                    driver_positions.append(_extract_driver_position(src_abs))
+            elif self.need_driver_positions:
+                driver_positions.append((0, 0, 0))
 
-                # Extract driver position for this sample
-                driver_pos = extract_driver_position(src_abs_pos)
-                driver_positions.append(driver_pos)
-            else:
-                driver_positions.append((0, 0, 0)) 
-
-            # Extract and pad src_rel_pos
             if "src_rel_pos" in item:
-                src_rel_pos = item["src_rel_pos"]
-                seq_len = min(len(src_rel_pos), padded_src_len)
+                src_rel = item["src_rel_pos"]
+                seq_len = min(len(src_rel), padded_src_len)
                 for j in range(seq_len):
-                    if isinstance(src_rel_pos[j], (list, tuple)) and len(src_rel_pos[j]) >= 3:
-                        encoder_rel_positions[i, j, 0] = src_rel_pos[j][0]
-                        encoder_rel_positions[i, j, 1] = src_rel_pos[j][1]
-                        encoder_rel_positions[i, j, 2] = src_rel_pos[j][2]
+                    if isinstance(src_rel[j], (list, tuple)) and len(src_rel[j]) >= 3:
+                        encoder_rel_positions[i, j, 0] = src_rel[j][0]
+                        encoder_rel_positions[i, j, 1] = src_rel[j][1]
+                        encoder_rel_positions[i, j, 2] = src_rel[j][2]
 
-        return {
+        result = {
             "input_ids": encs["input_ids"],
             "attention_mask": encs["attention_mask"],
             "encoder_abs_positions": encoder_abs_positions,
             "encoder_rel_positions": encoder_rel_positions,
-            "driver_positions": driver_positions,  # For coordinate tracking
         }
+        if self.need_driver_positions:
+            result["driver_positions"] = driver_positions
+        return result
 
 
-def check_model_supports_coordinates(model) -> bool:
-    """Check if the model supports coordinate-aware generation."""
-    from flow.models.geo_t5gemma import GeoT5GemmaDecoder
+# =============================================================================
+#  Load components
+# =============================================================================
 
-    if not hasattr(model, 'get_decoder'):
-        return False
+def load_components(config: FlowConfig):
+    """Load dataset, tokenizer, and model.
 
-    decoder = model.get_decoder()
-    return isinstance(decoder, GeoT5GemmaDecoder)
-
-
-def generate_with_coordinates(
-    model: GeoT5GemmaForConditionalGeneration,
-    tokenizer: PreTrainedTokenizerFast,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    encoder_abs_positions: torch.Tensor,
-    encoder_rel_positions: torch.Tensor,
-    driver_positions: List[Tuple[int, int, int]],
-    generation_config: GenerationConfig,
-    use_coordinate_tracking: bool = True,
-) -> List[str]:
+    Model is loaded via from_pretrained — geo_config comes from checkpoint.
     """
-    Generate sequences with real-time coordinate tracking.
+    # Dataset
+    dataset_config = config.dataset
+    target_split = dataset_config.validation_split
+    dataset = load_corpus_dataset(dataset_config, split=target_split)
 
-    This function handles batch generation where each sample may have
-    a different driver position for coordinate tracking.
+    # Filter to only include nets from design 's713', 'apb4_wdg', 'ASIC' 
+    eval_design = ["s713"] 
+    dataset = dataset.filter(lambda x: x["source_design"] in eval_design)
+    logging.info(f"Filtered to design '{eval_design}': {len(dataset)} samples")
 
-    For batch_size > 1, we process samples one at a time to properly
-    track coordinates. For batch_size == 1, we use the model's built-in
-    coordinate tracking.
+    tokenization_pipeline = TokenizationPipeline(config)
+    dataset = tokenization_pipeline.preprocess_corpus(dataset)
+    dataset = tokenization_pipeline.build_token_dataset(dataset, remove_columns=False)
 
-    Args:
-        model: GeoT5GemmaForConditionalGeneration model
-        tokenizer: Tokenizer for decoding
-        input_ids: Encoder input IDs (batch, src_len)
-        attention_mask: Encoder attention mask (batch, src_len)
-        encoder_abs_positions: Absolute positions (batch, src_len, 3)
-        encoder_rel_positions: Relative positions (batch, src_len, 3)
-        driver_positions: List of driver positions for each sample
-        generation_config: Generation parameters
-        use_coordinate_tracking: Whether to use real-time coordinate tracking
+    dataset_source = (
+        dataset_config.hub_id
+        if dataset_config.use_hub()
+        else dataset_config.local_path_for_split(target_split)
+    )
+    logging.info(f"Dataset loaded with {len(dataset)} samples from {dataset_source}")
 
-    Returns:
-        List of decoded prediction strings
-    """
-    batch_size = input_ids.shape[0]
-    device = input_ids.device
-    predictions = []
+    # Tokenizer
+    unified_tokenizer = UnifiedTokenizer.from_pretrained(
+        config.tokenization.paths.tokenizer_save_dir
+    )
+    tokenizer = unified_tokenizer.tokenizer
+    logging.info(f"Tokenizer loaded from {config.tokenization.paths.tokenizer_save_dir}")
 
-    # Check if model supports coordinate tracking
-    supports_coords = check_model_supports_coordinates(model)
+    # Model — same pattern as launch_evaluation.py
+    model_path = config.training.paths.model_save_dir
+    try:
+        model = GeoT5GemmaForConditionalGeneration.from_pretrained(model_path).eval()
+        logging.info(f"Model loaded from {model_path}")
+    except Exception as e:
+        checkpoints = list(Path(model_path).glob("checkpoint-*"))
+        if checkpoints:
+            last_checkpoint = max(checkpoints, key=lambda x: int(x.name.split("-")[-1]))
+            logging.info(f"Loading model from last checkpoint: {last_checkpoint}")
+            model = GeoT5GemmaForConditionalGeneration.from_pretrained(last_checkpoint).eval()
+        else:
+            logging.error(f"Failed to load model from {model_path}: {e}")
+            raise e
 
-    if not supports_coords:
-        # Fallback: Generate without coordinate tracking
-        logging.debug("Model does not support coordinate tracking, using standard generation")
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                encoder_abs_positions=encoder_abs_positions,
-                encoder_rel_positions=encoder_rel_positions,
-                generation_config=generation_config,
-            )
+    return dataset, tokenizer, model
 
-        for i in range(batch_size):
-            pred = tokenizer.decode(outputs[i], skip_special_tokens=True)
-            predictions.append(pred)
-        return predictions
 
-    # Process each sample individually for proper coordinate tracking
-    # This is necessary because each sample has a different driver position
-    for i in range(batch_size):
-        # Extract single sample
-        sample_input_ids = input_ids[i:i+1]
-        sample_attention_mask = attention_mask[i:i+1]
-        sample_encoder_abs = encoder_abs_positions[i:i+1]
-        sample_encoder_rel = encoder_rel_positions[i:i+1]
-        driver_pos = driver_positions[i]
-
-        # Generate with coordinate tracking
-        with torch.no_grad():
-            try:
-                outputs = model.generate(
-                    input_ids=sample_input_ids,
-                    attention_mask=sample_attention_mask,
-                    encoder_abs_positions=sample_encoder_abs,
-                    encoder_rel_positions=sample_encoder_rel,
-                    driver_pos=driver_pos,
-                    use_coordinate_tracking=use_coordinate_tracking,
-                    generation_config=generation_config,
-                )
-            except Exception as e:
-                # Fallback if coordinate tracking fails
-                logging.warning(f"Coordinate tracking failed for sample {i}: {e}, using fallback")
-                outputs = model.generate(
-                    input_ids=sample_input_ids,
-                    attention_mask=sample_attention_mask,
-                    encoder_abs_positions=sample_encoder_abs,
-                    encoder_rel_positions=sample_encoder_rel,
-                    generation_config=generation_config,
-                )
-
-        # Decode prediction
-        pred = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        predictions.append(pred)
-
-    return predictions
-
+# =============================================================================
+#  Run evaluation
+# =============================================================================
 
 def run_evaluation(config: FlowConfig):
-    """Run GeoT5Gemma evaluation with coordinate support"""
+    """Run evaluation — branching on model.geo_config."""
     evaluation_config = config.evaluation
-    training_paths_config = config.training.paths
     training_hyperparameters_config = config.training.hyperparameters
-    tokenization_paths_config = config.tokenization.paths
     evaluation_paths_config = evaluation_config.paths
     dataset_config = config.dataset
     performance_config = evaluation_config.performance
     generation_config = evaluation_config.generation
 
-    logging.info("🚀 Initializing GeoT5Gemma evaluation pipeline")
+    logging.info("Initializing evaluation pipeline")
     dataset_source = (
         dataset_config.hub_id
         if dataset_config.use_hub()
         else dataset_config.local_path_for_split(dataset_config.validation_split)
     )
-    logging.info(
-        f"   Dataset: {dataset_source} (split: {dataset_config.validation_split})"
-    )
-    logging.info(f"   Tokenizer: {tokenization_paths_config.tokenizer_save_dir}")
-    logging.info(f"   Model: {training_paths_config.model_save_dir}")
+    logging.info(f"   Dataset: {dataset_source} (split: {dataset_config.validation_split})")
+    logging.info(f"   Tokenizer: {config.tokenization.paths.tokenizer_save_dir}")
+    logging.info(f"   Model: {config.training.paths.model_save_dir}")
     logging.info(f"   Output: {evaluation_paths_config.output_dir}")
 
     accelerator = Accelerator()
 
-    # Load dataset, tokenizer, and model
+    # Load components
     with PartialState().main_process_first():
         dataset, tokenizer, model = load_components(config)
-        logging.info("✅ GeoT5Gemma components loaded successfully")
 
-    # Create custom collator for GeoT5Gemma
-    collate_fn = GeoDataCollatorForEvaluation(
-        tokenizer=tokenizer,
-        max_src_len=training_hyperparameters_config.max_src_len,
-    )
+    # Detect geo mode from loaded model
+    has_pe, has_lara = detect_geo_mode(model)
+    geo_active = has_pe or has_lara
+
+    if has_lara:
+        mode_str = "LARA (per-sample coordinate tracking, use_cache=False)"
+    elif has_pe:
+        mode_str = "PE only (batch generate with encoder coordinates)"
+    else:
+        mode_str = "Baseline (standard T5Gemma generate)"
+    logging.info(f"   Geo mode: {mode_str}")
+
+    # Select collator based on geo mode
+    max_src_len = training_hyperparameters_config.max_src_len
+    if geo_active:
+        collate_fn = GeoDataCollator(
+            tokenizer=tokenizer,
+            max_src_len=max_src_len,
+            need_driver_positions=has_lara,
+        )
+    else:
+        collate_fn = make_baseline_collator(tokenizer, max_src_len)
 
     dataloader = DataLoader(
         dataset,
@@ -384,124 +270,141 @@ def run_evaluation(config: FlowConfig):
 
     model, dataloader = accelerator.prepare(model, dataloader)
 
-    # Configure generation parameters
-    # NOTE: use_cache=False is REQUIRED for LARA attention because:
-    # - LARA recomputes K,V from hidden_states each pass (no KV caching support)
-    # - With use_cache=True, HuggingFace passes only the last token's hidden_states
-    #   but attention_mask covers all tokens, causing shape mismatch in matmul
+    # Generation config — use_cache depends on whether LARA is active
     model_generation_config = GenerationConfig(
         max_new_tokens=generation_config.max_new_tokens,
         num_beams=generation_config.num_beams,
         do_sample=generation_config.do_sample,
-        temperature=generation_config.temperature
-        if generation_config.do_sample
-        else None,
+        temperature=generation_config.temperature if generation_config.do_sample else None,
         top_p=generation_config.top_p if generation_config.do_sample else None,
         top_k=generation_config.top_k if generation_config.do_sample else None,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,
         decoder_start_token_id=tokenizer.bos_token_id,
-        use_cache=False,  # Required for LARA - no KV caching support
+        use_cache=not has_lara,  # LARA does not support KV cache
     )
 
-    logging.info("🎯 Generation parameters:")
     logging.info(f"   Max new tokens: {generation_config.max_new_tokens}")
-    logging.info(f"   Beam search: {generation_config.num_beams}")
+    logging.info(f"   Num beams: {generation_config.num_beams}")
     logging.info(f"   Do sample: {generation_config.do_sample}")
-    if generation_config.do_sample:
-        logging.info(f"   Temperature: {generation_config.temperature}")
-        logging.info(f"   Top-p: {generation_config.top_p}")
-        logging.info(f"   Top-k: {generation_config.top_k}")
+    logging.info(f"   use_cache: {not has_lara}")
     logging.info(f"   Batch size: {performance_config.batch_size}")
 
-    # Check coordinate tracking support
-    supports_coord_tracking = check_model_supports_coordinates(accelerator.unwrap_model(model))
-    if supports_coord_tracking:
-        logging.info("   Coordinate tracking: Enabled (InferenceCoordinateTracker + LARA)")
-        # Warn about LARA + beam search compatibility
-        if generation_config.num_beams > 1:
-            logging.warning("⚠️  LARA attention does not support KV caching.")
-            logging.warning("   With beam search (num_beams > 1), LARA decoder may not work optimally.")
-            logging.warning("   Consider setting num_beams=1 for LARA models, or disable LARA (use_geo_self_attn=False).")
-    else:
-        logging.info("   Coordinate tracking: Disabled (model uses standard attention)")
-        logging.info("   Note: Encoder position embeddings are still used for geometry-aware input")
-
-    # Print sample data for verification
-    if accelerator.is_main_process:
-        sample = dataset[0]
-        logging.info("\n📋 Sample data format verification:")
-        logging.info(f"   source_tokens: {sample['source_tokens'][:100]}...")
-        if 'src_abs_pos' in sample:
-            driver_pos = extract_driver_position(sample['src_abs_pos'])
-            logging.info(f"   driver_pos extracted: {driver_pos}")
-            logging.info(f"   src_abs_pos[0:5]: {sample['src_abs_pos'][:5]}")
-        if 'src_rel_pos' in sample:
-            logging.info(f"   src_rel_pos[0:5]: {sample['src_rel_pos'][:5]}")
-        if 'tgt_coords' in sample:
-            logging.info(f"   tgt_coords[0:5] (ground truth): {sample['tgt_coords'][:5]}")
-
     # Run inference
-    logging.info("⚡ Running GeoT5Gemma inference with coordinate tracking...")
+    logging.info("Running inference...")
     inference_start_time = time.time()
 
     predictions = []
     for batch in tqdm(
         dataloader, desc="Evaluating", disable=not accelerator.is_local_main_process
     ):
+        unwrapped_model = accelerator.unwrap_model(model)
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
-        encoder_abs_positions = batch["encoder_abs_positions"]
-        encoder_rel_positions = batch["encoder_rel_positions"]
-        driver_positions = batch["driver_positions"]
 
-        # Generate with coordinate tracking
-        preds = generate_with_coordinates(
-            model=accelerator.unwrap_model(model),
-            tokenizer=tokenizer,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            encoder_abs_positions=encoder_abs_positions,
-            encoder_rel_positions=encoder_rel_positions,
-            driver_positions=driver_positions,
-            generation_config=model_generation_config,
-        )
+        if has_lara:
+            # LARA: per-sample generation with coordinate tracking
+            preds = _generate_with_lara(
+                model=unwrapped_model,
+                tokenizer=tokenizer,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                encoder_abs_positions=batch["encoder_abs_positions"],
+                encoder_rel_positions=batch["encoder_rel_positions"],
+                driver_positions=batch["driver_positions"],
+                generation_config=model_generation_config,
+            )
+        elif has_pe:
+            # PE only: standard batch generate, but pass coordinates
+            with torch.no_grad():
+                outputs = unwrapped_model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    encoder_abs_positions=batch["encoder_abs_positions"],
+                    encoder_rel_positions=batch["encoder_rel_positions"],
+                    generation_config=model_generation_config,
+                )
+            preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        else:
+            # Baseline: identical to launch_evaluation.py
+            with torch.no_grad():
+                outputs = unwrapped_model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    generation_config=model_generation_config,
+                )
+            preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
         gathered_preds = accelerator.gather_for_metrics(preds)
-
         if accelerator.is_main_process:
             predictions.extend(gathered_preds)
 
     inference_time = time.time() - inference_start_time
-    logging.info(f"✅ Inference completed in {inference_time:.2f}s")
+    logging.info(f"Inference completed in {inference_time:.2f}s")
     logging.info(f"   Throughput: {len(dataset) / inference_time:.2f} samples/sec")
 
-    # Use existing metrics system for evaluation
-    logging.info("📊 Calculating evaluation metrics...")
-
+    # Metrics & save
+    logging.info("Calculating evaluation metrics...")
     if accelerator.is_main_process:
-        # Sort predictions by original indices to ensure correct order
         if len(predictions) != len(dataset):
-            logging.error(
-                f"Number of predictions ({len(predictions)}) does not match dataset size ({len(dataset)}). Truncating."
+            raise ValueError(
+                f"Prediction count ({len(predictions)}) != dataset size ({len(dataset)})"
             )
-            raise ValueError("Inconsistent prediction and dataset sizes")
 
         dataset = dataset.add_column("predictions", predictions)
 
-        # Evaluation pipeline
         evaluation_pipeline = EvaluationPipeline(config)
         dataset = evaluation_pipeline.calculate_metrics(dataset)
-
-        # Save DEF inference metadata for EDA tool evaluation
         evaluation_pipeline.save_def_inference_metadata(dataset)
         evaluation_pipeline.save_def_inference_metadata_txt(dataset)
 
-        # Save results
-        logging.info("💾 Saving evaluation results...")
+        logging.info(f"Saving results to {evaluation_paths_config.output_dir}")
         dataset.save_to_disk(evaluation_paths_config.output_dir)
 
+
+def _generate_with_lara(
+    model, tokenizer, input_ids, attention_mask,
+    encoder_abs_positions, encoder_rel_positions,
+    driver_positions, generation_config,
+) -> List[str]:
+    """Per-sample generation with LARA coordinate tracking."""
+    batch_size = input_ids.shape[0]
+    predictions = []
+
+    # Set tokenizer for coordinate tracking
+    model._tokenizer = tokenizer
+
+    for i in range(batch_size):
+        with torch.no_grad():
+            try:
+                outputs = model.generate(
+                    input_ids=input_ids[i:i+1],
+                    attention_mask=attention_mask[i:i+1],
+                    encoder_abs_positions=encoder_abs_positions[i:i+1],
+                    encoder_rel_positions=encoder_rel_positions[i:i+1],
+                    driver_pos=driver_positions[i],
+                    use_coordinate_tracking=True,
+                    generation_config=generation_config,
+                )
+            except Exception as e:
+                logging.warning(f"Coordinate tracking failed for sample {i}: {e}, fallback")
+                outputs = model.generate(
+                    input_ids=input_ids[i:i+1],
+                    attention_mask=attention_mask[i:i+1],
+                    encoder_abs_positions=encoder_abs_positions[i:i+1],
+                    encoder_rel_positions=encoder_rel_positions[i:i+1],
+                    generation_config=generation_config,
+                )
+
+        predictions.append(tokenizer.decode(outputs[0], skip_special_tokens=True))
+
+    return predictions
+
+
+# =============================================================================
+#  Main
+# =============================================================================
 
 def main():
     setup_logging()
@@ -512,30 +415,22 @@ def main():
         required=True,
         help="Path to flow configuration JSON file",
     )
-
     args = parser.parse_args()
 
-    # Load flow configuration
     try:
         flow_config = FlowConfig.from_config_file(Path(args.flow_config))
     except Exception as e:
-        logging.info(f"❌ Error loading config from {args.flow_config}: {e}")
+        logging.info(f"Error loading config from {args.flow_config}: {e}")
         sys.exit(1)
 
-    logging.info("🔍 Starting GeoT5Gemma evaluation")
-    logging.info(f"   Config: {args.flow_config}")
+    logging.info(f"Starting evaluation with config: {args.flow_config}")
 
     try:
-        # Run evaluation
         run_evaluation(flow_config)
-
-        logging.info("✅ GeoT5Gemma evaluation completed successfully!")
-        logging.info(f"   Results saved to: {flow_config.evaluation.paths.output_dir}")
-
+        logging.info(f"Evaluation completed. Results: {flow_config.evaluation.paths.output_dir}")
     except Exception as e:
-        logging.info(f"❌ Evaluation failed: {e}")
+        logging.info(f"Evaluation failed: {e}")
         import traceback
-
         traceback.print_exc()
         sys.exit(1)
 
@@ -543,5 +438,5 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Usage:1
-# accelerate launch -m  --config_file /home/liujunfeng/.cache/huggingface/accelerate/fast_evaluation.yaml  flow.launch_geo_evaluation --flow-config /mnt/local_data1/liujunfeng/exp/Large-GeoPE/stage_training/model_wope/config.json 
+# Usage:
+# accelerate launch -m --config_file /home/liujunfeng/.cache/huggingface/accelerate/fast_evaluation.yaml flow.launch_geo_evaluation --flow-config /path/to/config.json

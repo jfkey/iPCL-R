@@ -289,29 +289,16 @@ class TrainingPipeline:
 
     def _initialize_T5Gemma_model(
         self, tokenizer: PreTrainedTokenizerFast
-    ) -> Union[T5GemmaForConditionalGeneration, GeoT5GemmaForConditionalGeneration]:
-        """Initialize model with configuration matching the original version.
+    ) -> GeoT5GemmaForConditionalGeneration:
+        """Initialize GeoT5Gemma model with configuration.
 
-        If geometric_config is enabled, returns GeoT5GemmaForConditionalGeneration
-        with Fourier Position Embedding support. Otherwise, returns standard
-        T5GemmaForConditionalGeneration.
+        Always returns GeoT5GemmaForConditionalGeneration. When all geo
+        features are disabled it behaves as a pure baseline, but the
+        unified model class ensures config.json always contains
+        geometric_config for correct from_pretrained reconstruction.
         """
         logging.info("Initializing model for net routing generation")
         logging.info("vocab size: %s", len(tokenizer.get_vocab()))
-
-        # Check if geometry-aware mode is enabled.
-        # GeoT5Gemma is needed when ANY geo feature is active (PE or LARA).
-        use_geo = False
-        if hasattr(self.model_config, 'geometric_config'):
-            geo_cfg = self.model_config.geometric_config
-            use_geo = (
-                getattr(geo_cfg, 'use_advanced_geo_pe', False) or
-                getattr(geo_cfg, 'use_basic_fourier_pe', False) or
-                getattr(geo_cfg, 'use_metal_layer_only_pe', False) or
-                getattr(geo_cfg, 'use_geo_self_attn', False) or
-                getattr(geo_cfg, 'use_geo_cross_attn', False) or
-                getattr(geo_cfg, 'enable_encoder_lara', False)
-            )
 
         vocab_size = len(tokenizer.get_vocab())
 
@@ -371,23 +358,20 @@ class TrainingPipeline:
             use_cache=True,
         )
 
-        # Create model (GeoT5Gemma or standard T5Gemma)
-        if use_geo:
+        # Always use GeoT5GemmaForConditionalGeneration.
+        # When all geo features are disabled, it behaves identically to base
+        # T5Gemma but ensures config.json always saves geometric_config,
+        # so from_pretrained can reconstruct the exact same model structure.
+        if hasattr(self.model_config, 'geometric_config'):
             geo_config = self.model_config.geometric_config
-            # Build GeoConfig with both legacy and new parameters
             geo_config_dict = GeoConfig(
-                # New: Geometry-Aware Position Embedding (recommended)
                 use_advanced_geo_pe=getattr(geo_config, 'use_advanced_geo_pe', False),
-                # Legacy: Simple Fourier Position Embedding
                 use_basic_fourier_pe=getattr(geo_config, 'use_basic_fourier_pe', False),
-                # LARA (Lie Algebra Relative Attention) configuration
                 use_geo_self_attn=getattr(geo_config, 'use_geo_self_attn', False),
                 use_geo_cross_attn=getattr(geo_config, 'use_geo_cross_attn', False),
                 enable_encoder_lara=getattr(geo_config, 'enable_encoder_lara', False),
-                # Coordinate scaling
                 coord_scale=getattr(geo_config, 'coord_scale', 1e-5),
                 coord_scale_z=getattr(geo_config, 'coord_scale_z', 0.3),
-                # Fourier / GeoPE parameters
                 num_frequencies=getattr(geo_config, 'num_frequencies', 32),
                 num_harmonics=getattr(geo_config, 'num_harmonics', 8),
                 max_metal_layers=getattr(geo_config, 'max_metal_layers', 16),
@@ -399,20 +383,17 @@ class TrainingPipeline:
                 floor_freq_ratio=getattr(geo_config, 'floor_freq_ratio', 1.0),
                 max_sequence_length=self.hyperparameters_config.max_src_len,
                 pe_dropout=getattr(geo_config, 'pe_dropout', 0.1),
-                # Geometric Attention (LARA) parameters
                 self_attn_geometric_bias=getattr(geo_config, 'self_attn_geometric_bias', True),
                 cross_attn_geometric_bias=getattr(geo_config, 'cross_attn_geometric_bias', True),
                 use_value_rotation=getattr(geo_config, 'use_value_rotation', True),
                 bias_num_freqs=getattr(geo_config, 'bias_num_freqs', 16),
                 bias_rank_per_head=getattr(geo_config, 'bias_rank_per_head', 8),
-                # Vector Quantization (VQ) parameters
                 use_vq=getattr(geo_config, 'use_vq', False),
                 vq_codebook_size=getattr(geo_config, 'vq_codebook_size', 1024),
                 vq_commitment_cost=getattr(geo_config, 'vq_commitment_cost', 0.25),
                 vq_ema_decay=getattr(geo_config, 'vq_ema_decay', 0.99),
                 vq_dead_code_threshold=getattr(geo_config, 'vq_dead_code_threshold', 2),
                 use_metal_layer_only_pe=getattr(geo_config, 'use_metal_layer_only_pe', False),
-                # Coordinate Noise Injection (bridges train-test gap for LARA)
                 coord_noise_enabled=getattr(geo_config, 'coord_noise_enabled', False),
                 coord_noise_std_xy=getattr(geo_config, 'coord_noise_std_xy', 500.0),
                 coord_noise_std_z=getattr(geo_config, 'coord_noise_std_z', 1.0),
@@ -420,31 +401,32 @@ class TrainingPipeline:
                 coord_noise_warmup_steps=getattr(geo_config, 'coord_noise_warmup_steps', 5000),
                 coord_noise_cumulative=getattr(geo_config, 'coord_noise_cumulative', True),
             )
-            model = GeoT5GemmaForConditionalGeneration(config, geo_config_dict)
-
-            # Log which PE mode is being used
-            if geo_config_dict.use_advanced_geo_pe:
-                logging.info("Using GeoT5GemmaForConditionalGeneration with Geometry-Aware PE")
-                logging.info("  - XY coordinates: Fourier encoding (multi-frequency)")
-                logging.info("  - Metal layer: Learnable embedding with direction awareness")
-                logging.info("  - Relative position: Polar + Circular Harmonics")
-                logging.info("  - Layer delta: Signed embedding for via traversal")
-            else:
-                logging.info("Using GeoT5GemmaForConditionalGeneration with Simple Fourier PE")
-
-            # Log LARA configuration
-            logging.info("LARA (Lie Algebra Relative Attention) Configuration:")
-            logging.info(f"  - Encoder: {'LARA' if geo_config_dict.enable_encoder_lara else 'Standard Attention'}")
-            logging.info(f"  - Decoder Self-Attention: {'LARA' if geo_config_dict.use_geo_self_attn else 'Standard Attention'}")
-            logging.info(f"  - Cross-Attention: {'LARA' if geo_config_dict.use_geo_cross_attn else 'Standard Attention'}")
-            if geo_config_dict.coord_noise_enabled:
-                logging.info("Coordinate Noise Injection: ENABLED")
-                logging.info(f"  - std_xy={geo_config_dict.coord_noise_std_xy}, std_z={geo_config_dict.coord_noise_std_z}")
-                logging.info(f"  - max_ratio={geo_config_dict.coord_noise_max_ratio}, warmup_steps={geo_config_dict.coord_noise_warmup_steps}")
-                logging.info(f"  - cumulative={geo_config_dict.coord_noise_cumulative}")
         else:
-            model = T5GemmaForConditionalGeneration(config)
-            logging.info("Using standard T5GemmaForConditionalGeneration")
+            geo_config_dict = GeoConfig.disabled()
+
+        model = GeoT5GemmaForConditionalGeneration(config, geo_config_dict)
+
+        # Log active geo features
+        active_features = []
+        if geo_config_dict.use_advanced_geo_pe:
+            active_features.append("Geometry-Aware PE")
+        elif geo_config_dict.use_metal_layer_only_pe:
+            active_features.append("Metal-Layer-Only PE")
+        elif geo_config_dict.use_basic_fourier_pe:
+            active_features.append("Basic Fourier PE")
+        if geo_config_dict.use_geo_self_attn:
+            active_features.append("LARA Self-Attn")
+        if geo_config_dict.use_geo_cross_attn:
+            active_features.append("LARA Cross-Attn")
+        if geo_config_dict.enable_encoder_lara:
+            active_features.append("Encoder LARA")
+        if geo_config_dict.coord_noise_enabled:
+            active_features.append("Coord Noise")
+
+        if active_features:
+            logging.info(f"GeoT5Gemma active features: {', '.join(active_features)}")
+        else:
+            logging.info("GeoT5Gemma with all geo features disabled (baseline mode)")
 
         # Log model information
         total_params = sum(p.numel() for p in model.parameters())

@@ -141,6 +141,18 @@ class GeoConfig:
     vq_dead_code_threshold: int = 2  # Usage threshold for dead code revival
 
     @classmethod
+    def disabled(cls) -> "GeoConfig":
+        """Create GeoConfig with all features disabled (pure baseline)."""
+        return cls(
+            use_basic_fourier_pe=False,
+            use_advanced_geo_pe=False,
+            use_metal_layer_only_pe=False,
+            use_geo_self_attn=False,
+            use_geo_cross_attn=False,
+            enable_encoder_lara=False,
+        )
+
+    @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "GeoConfig":
         """Create GeoConfig from dictionary."""
         return cls(**{
@@ -1727,151 +1739,59 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         """
         Load pretrained GeoT5GemmaForConditionalGeneration model.
 
-        This method properly handles the geometric_config that was saved
-        with the model. If geo_config is not provided, it will be loaded
-        from the saved config.json.
+        Model structure is built entirely through ``__init__`` to guarantee
+        consistency with training-time construction and ``forward`` logic.
+        This method only resolves the config, delegates to ``__init__``,
+        and loads the saved state dict.
+
+        Config resolution order:
+            1. Caller-provided ``geo_config`` (highest priority)
+            2. ``geometric_config`` saved in the checkpoint's config.json
+            3. ``GeoConfig.disabled()`` — all features off (safe fallback
+               when the checkpoint has no geometric_config, e.g. a pure
+               T5Gemma baseline)
 
         Args:
             pretrained_model_name_or_path: Path to pretrained model or checkpoint
-            geo_config: Optional geometric config (if None, loads from saved config)
-            **kwargs: Additional arguments for from_pretrained
+            geo_config: Optional geometric config override
+            **kwargs: Additional arguments for config loading
 
         Returns:
             GeoT5GemmaForConditionalGeneration with all weights loaded
         """
-        import json
+        import logging
         from pathlib import Path
 
-        # Load config first to get geometric_config
+        # ------------------------------------------------------------------
+        # 1. Resolve geo_config
+        # ------------------------------------------------------------------
         config = T5GemmaConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
-
-        # Try to get geometric_config from saved config
         saved_geo_config = getattr(config, 'geometric_config', None)
 
-        # Use provided geo_config, or fall back to saved, or default
         if geo_config is not None:
-            # User provided geo_config
+            # Caller explicitly provided
             if isinstance(geo_config, dict):
                 final_geo_config = GeoConfig.from_dict(geo_config)
             else:
                 final_geo_config = geo_config
         elif saved_geo_config is not None:
-            # Load from saved config
+            # Loaded from checkpoint config.json
             if isinstance(saved_geo_config, dict):
                 final_geo_config = GeoConfig.from_dict(saved_geo_config)
             else:
                 final_geo_config = saved_geo_config
         else:
-            # Default config
-            final_geo_config = GeoConfig()
+            # No geometric_config in checkpoint — assume pure baseline
+            final_geo_config = GeoConfig.disabled()
 
-        # Store in config for model initialization
-        config.geometric_config = final_geo_config.to_dict()
+        # ------------------------------------------------------------------
+        # 2. Build model through __init__ (single source of truth)
+        # ------------------------------------------------------------------
+        model = cls(config, geo_config=final_geo_config)
 
-        # Create model with the geo config
-        model = cls.__new__(cls)
-
-        # Initialize geo_config before calling parent __init__
-        model.geo_config = final_geo_config
-
-        # Call parent __init__ which sets up the base model
-        T5GemmaForConditionalGeneration.__init__(model, config)
-
-        # Replace encoder/decoder with Geo versions if LARA is enabled.
-        # Must check BOTH use_geo_self_attn and use_geo_cross_attn to match __init__().
-        if model.geo_config.use_geo_self_attn or model.geo_config.use_geo_cross_attn:
-            enable_encoder_lara = config.geometric_config.get('enable_encoder_lara', False)
-            if enable_encoder_lara:
-                model.model.encoder = GeoT5GemmaEncoder(config)
-            model.model.decoder = GeoT5GemmaDecoder(config)
-
-        # Initialize Position Embedding modules
-        model.encoder_geo_pe = None
-        model.decoder_geo_pe = None
-        model.encoder_fourier_pe = None
-        model.decoder_fourier_pe = None
-
-        # T5GemmaConfig stores hidden_size in encoder/decoder sub-configs;
-        # the top-level attribute may not exist when loaded from disk.
-        hidden_size = config.encoder.hidden_size
-
-        if model.geo_config.use_advanced_geo_pe:
-            geope_config = model.geo_config.to_geope_config(hidden_size)
-            model.encoder_geo_pe = GeometryAwarePositionEmbedding(geope_config)
-            model.decoder_fourier_pe = FourierPositionEmbedding(
-                hidden_size=hidden_size,
-                num_frequencies=model.geo_config.num_frequencies,
-                max_wavelength=model.geo_config.max_wavelength,
-                min_wavelength=model.geo_config.min_wavelength,
-                coord_scale=model.geo_config.coord_scale,
-                learnable_coefficients=model.geo_config.learnable_fourier_coefficients,
-                separate_basis=model.geo_config.separate_sin_cos_basis,
-                floor_freq_ratio=model.geo_config.floor_freq_ratio,
-                max_sequence_length=model.geo_config.max_sequence_length,
-            )
-        elif model.geo_config.use_metal_layer_only_pe:
-            geope_config = model.geo_config.to_geope_config(hidden_size)
-            model.encoder_geo_pe = GeometryAwarePositionEmbeddingTMP(geope_config)
-            model.decoder_fourier_pe = FourierPositionEmbedding(
-                hidden_size=hidden_size,
-                num_frequencies=model.geo_config.num_frequencies,
-                max_wavelength=model.geo_config.max_wavelength,
-                min_wavelength=model.geo_config.min_wavelength,
-                coord_scale=model.geo_config.coord_scale,
-                learnable_coefficients=model.geo_config.learnable_fourier_coefficients,
-                separate_basis=model.geo_config.separate_sin_cos_basis,
-                floor_freq_ratio=model.geo_config.floor_freq_ratio,
-                max_sequence_length=model.geo_config.max_sequence_length,
-            )
-        elif model.geo_config.use_basic_fourier_pe:
-            model.encoder_fourier_pe = FourierPositionEmbedding(
-                hidden_size=hidden_size,
-                num_frequencies=model.geo_config.num_frequencies,
-                max_wavelength=model.geo_config.max_wavelength,
-                min_wavelength=model.geo_config.min_wavelength,
-                coord_scale=model.geo_config.coord_scale,
-                learnable_coefficients=model.geo_config.learnable_fourier_coefficients,
-                separate_basis=model.geo_config.separate_sin_cos_basis,
-                floor_freq_ratio=model.geo_config.floor_freq_ratio,
-                max_sequence_length=model.geo_config.max_sequence_length,
-            )
-            model.decoder_fourier_pe = FourierPositionEmbedding(
-                hidden_size=hidden_size,
-                num_frequencies=model.geo_config.num_frequencies,
-                max_wavelength=model.geo_config.max_wavelength,
-                min_wavelength=model.geo_config.min_wavelength,
-                coord_scale=model.geo_config.coord_scale,
-                learnable_coefficients=model.geo_config.learnable_fourier_coefficients,
-                separate_basis=model.geo_config.separate_sin_cos_basis,
-                floor_freq_ratio=model.geo_config.floor_freq_ratio,
-                max_sequence_length=model.geo_config.max_sequence_length,
-            )
-
-        # Vector Quantization module (information bottleneck for PE)
-        model.encoder_pe_vq = None
-        if model.geo_config.use_vq and (
-            model.encoder_geo_pe is not None or model.encoder_fourier_pe is not None
-        ):
-            from .vq import VectorQuantizer
-            model.encoder_pe_vq = VectorQuantizer(
-                hidden_size=hidden_size,
-                codebook_size=model.geo_config.vq_codebook_size,
-                commitment_cost=model.geo_config.vq_commitment_cost,
-                ema_decay=model.geo_config.vq_ema_decay,
-                dead_code_threshold=model.geo_config.vq_dead_code_threshold,
-            )
-
-        # Initialize VQ loss accumulator
-        model._vq_loss = None
-
-        # Initialize coordinate noise step counter
-        model.register_buffer(
-            '_coord_noise_step',
-            torch.tensor(0, dtype=torch.long),
-            persistent=True,
-        )
-
-        # Now load the state dict with all weights
+        # ------------------------------------------------------------------
+        # 3. Load state dict
+        # ------------------------------------------------------------------
         model_path = Path(pretrained_model_name_or_path)
         if (model_path / "model.safetensors").exists():
             from safetensors.torch import load_file
@@ -1884,28 +1804,23 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 f"Expected 'model.safetensors' or 'pytorch_model.bin'."
             )
 
-        if state_dict is not None:
-            # Load all weights (including geo_pe weights)
-            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
 
-            # Re-tie lm_head to decoder embed_tokens after loading weights.
-            # This is necessary because replacing the decoder with GeoT5GemmaDecoder
-            # breaks the weight tying established during __init__, causing lm_head
-            # to point to stale random weights instead of the loaded embeddings.
-            model.tie_weights()
+        # Re-tie lm_head → decoder embed_tokens after loading weights.
+        # Replacing the decoder with GeoT5GemmaDecoder breaks the weight
+        # tying established during __init__; re-tying fixes it.
+        model.tie_weights()
 
-            # Filter out expected missing keys:
-            # - tied weights (lm_head shares decoder embeddings)
-            # - coord noise step counter (new feature, not in old checkpoints)
-            expected_missing = {'lm_head.out_proj.weight', '_coord_noise_step'}
-            missing_keys = [k for k in missing_keys if k not in expected_missing]
+        # Filter out expected missing keys:
+        # - tied weights (lm_head shares decoder embeddings)
+        # - coord noise step counter (may not exist in old checkpoints)
+        expected_missing = {'lm_head.out_proj.weight', '_coord_noise_step'}
+        missing_keys = [k for k in missing_keys if k not in expected_missing]
 
-            if missing_keys:
-                import logging
-                logging.warning(f"Missing keys when loading model: {missing_keys}")
-            if unexpected_keys:
-                import logging
-                logging.warning(f"Unexpected keys when loading model: {unexpected_keys}")
+        if missing_keys:
+            logging.warning(f"Missing keys when loading model: {missing_keys}")
+        if unexpected_keys:
+            logging.warning(f"Unexpected keys when loading model: {unexpected_keys}")
 
         return model
 

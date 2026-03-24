@@ -192,7 +192,12 @@ class GeometricPositionEmbedding(nn.Module):
         # Θ = (1/3)√(θ_x² + θ_y² + θ_z²)
         # The 1/3 comes from averaging three rotations
         theta_sq_sum = theta_x ** 2 + theta_y ** 2 + theta_z ** 2
-        Theta = (1.0 / 3.0) * torch.sqrt(theta_sq_sum + 1e-8)
+
+        # Use dtype-aware epsilon for sqrt guard.
+        # FP16 min subnormal ≈ 6e-8, so 1e-8 rounds to 0 in FP16 causing
+        # sqrt(0) whose backward is inf.  1e-6 is safely representable in
+        # both FP16 and FP32.
+        Theta = (1.0 / 3.0) * torch.sqrt(theta_sq_sum + 1e-6)
 
         half_Theta = Theta / 2.0
 
@@ -205,8 +210,20 @@ class GeometricPositionEmbedding(nn.Module):
         sin_half_Theta = torch.sin(half_Theta)
 
         # scale = sin(Θ/2) / (3Θ) handles the normalization
-        # As Θ→0, this approaches 1/6 (L'Hopital's rule)
-        scale = sin_half_Theta / (3.0 * Theta + 1e-8)
+        # As Θ→0, this approaches 1/6 (L'Hôpital's rule)
+        #
+        # Use torch.where instead of adding epsilon to the denominator.
+        # In FP16 the old ``1e-8`` denominator guard rounded to 0, producing
+        # 0/0 = NaN for zero-coordinate tokens.  torch.where cleanly returns
+        # the analytic limit 1/6 when Θ is negligible, and avoids the
+        # division entirely — no NaN in forward *or* backward.
+        denom = 3.0 * Theta
+        scale = torch.where(
+            denom > 1e-4,
+            sin_half_Theta / denom,
+            # Analytic limit: sin(x/2)/(3x) → 1/6 as x→0
+            torch.full_like(denom, 1.0 / 6.0),
+        )
 
         qx = scale * theta_x
         qy = scale * theta_y
@@ -265,18 +282,28 @@ class GeometricPositionEmbedding(nn.Module):
         coordinates: torch.Tensor,
         batch_size: int,
         seq_len: int,
+        target_dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         """
-        Prepare coordinates: handle batch/seq_len mismatches, scale to FP32.
+        Prepare coordinates: handle batch/seq_len mismatches, scale, and cast.
+
+        Scaling is performed in FP32 because raw chip coordinates can exceed
+        FP16 range (e.g. 2382120 > 65504).  After scaling the values are small
+        enough for half-precision, so we cast to *target_dtype* immediately to
+        keep all downstream quaternion / Fourier math in the model's compute
+        dtype (FP16/BF16), which doubles throughput on tensor-cores.
 
         Args:
             coordinates: 3D coordinates (coord_batch, coord_seq, 3)
             batch_size: Expected batch size (from query/key)
             seq_len: Expected sequence length (from query/key)
+            target_dtype: Dtype for the returned tensor.  When None the result
+                stays in FP32 (backward-compatible default).
 
         Returns:
-            Scaled coordinates in FP32 (batch_size, seq_len, 3)
+            Scaled coordinates (batch_size, seq_len, 3) in *target_dtype*
         """
+        # --- scaling MUST happen in FP32 (raw coords can overflow FP16) ---
         coords = coordinates.float()
         coord_batch, coord_seq, _ = coords.shape
 
@@ -300,8 +327,14 @@ class GeometricPositionEmbedding(nn.Module):
                     f"Seq len mismatch: expected {seq_len}, coordinates has {coord_seq}"
                 )
 
-        # Per-axis learnable scaling in FP32: (B, T, 3) * (3,)
+        # Per-axis scaling in FP32: (B, T, 3) * (3,)
         coords = coords * torch.exp(self.log_axis_scale)
+
+        # Cast to model compute dtype — values are now O(1)~O(100), safe for
+        # FP16 (max 65504) and BF16 (max ~3.4e38).
+        if target_dtype is not None:
+            coords = coords.to(target_dtype)
+
         return coords
 
     def _coords_to_quaternion(
@@ -309,34 +342,40 @@ class GeometricPositionEmbedding(nn.Module):
         coordinates: torch.Tensor,
         batch_size: int,
         seq_len: int,
+        target_dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Convert 3D coordinates to quaternion components for rotation.
 
-        All computations in FP32 for numerical stability.
+        When *target_dtype* is given (e.g. torch.float16), scaling is performed
+        in FP32 for safety and all subsequent math (einsum, quaternion, rotation)
+        runs in *target_dtype* for tensor-core throughput.
 
         Args:
             coordinates: 3D coordinates (batch, seq_len, 3)
             batch_size: Expected batch size
             seq_len: Expected sequence length
+            target_dtype: Compute dtype for quaternion math.  None keeps FP32.
 
         Returns:
             Tuple of (w, qx, qy, qz), each (batch, 1, seq_len, num_subvectors)
             with head dimension already unsqueezed for broadcasting.
         """
-        coords = self._prepare_coords(coordinates, batch_size, seq_len)
+        coords = self._prepare_coords(
+            coordinates, batch_size, seq_len, target_dtype=target_dtype
+        )
 
         x_pos = coords[:, :, 0]  # (B, T)
         y_pos = coords[:, :, 1]
         z_pos = coords[:, :, 2]
 
-        # Compute phases for each sub-vector in FP32
-        inv_freq = self.inv_freq  # (num_subvectors,) in FP32
+        # Cast inv_freq to match coords so einsum stays in target_dtype
+        inv_freq = self.inv_freq.to(coords.dtype)  # (num_subvectors,)
         theta_x = torch.einsum('bt,f->btf', x_pos, inv_freq)  # (B, T, num_subvectors)
         theta_y = torch.einsum('bt,f->btf', y_pos, inv_freq)
         theta_z = torch.einsum('bt,f->btf', z_pos, inv_freq)
 
-        # Compute symmetric quaternion (in FP32)
+        # Compute symmetric quaternion in target_dtype
         w, qx, qy, qz = self.compute_quaternion(theta_x, theta_y, theta_z)
 
         # Expand for head broadcasting: (B, 1, T, num_subvectors)
@@ -354,18 +393,30 @@ class GeometricPositionEmbedding(nn.Module):
         """
         Apply quaternion rotation to vectors, handling head_dim padding.
 
+        All arithmetic runs in the dtype of *vectors* (typically FP16/BF16
+        during mixed-precision training).  Quaternion components are cast to
+        match if necessary.
+
         Args:
             vectors: (batch, num_heads, seq_len, head_dim)
             w, qx, qy, qz: Quaternion components (batch, 1, seq_len, num_subvectors)
             inverse: If True, apply inverse rotation (conjugate quaternion: negate qx,qy,qz)
 
         Returns:
-            Rotated vectors (batch, num_heads, seq_len, head_dim) in FP32
+            Rotated vectors (batch, num_heads, seq_len, head_dim)
         """
         batch_size, num_heads, seq_len, head_dim = vectors.shape
+        compute_dtype = vectors.dtype
 
         if inverse:
             qx, qy, qz = -qx, -qy, -qz
+
+        # Ensure quaternion components match vector dtype
+        if w.dtype != compute_dtype:
+            w = w.to(compute_dtype)
+            qx = qx.to(compute_dtype)
+            qy = qy.to(compute_dtype)
+            qz = qz.to(compute_dtype)
 
         if self.needs_padding:
             to_rotate = vectors[..., :self.effective_head_dim]
@@ -373,7 +424,7 @@ class GeometricPositionEmbedding(nn.Module):
         else:
             to_rotate = vectors
 
-        vecs_3d = to_rotate.float().view(
+        vecs_3d = to_rotate.view(
             batch_size, num_heads, seq_len, self.num_subvectors, 3
         )
         rotated = self.quaternion_rotate(vecs_3d, w, qx, qy, qz)
@@ -382,7 +433,7 @@ class GeometricPositionEmbedding(nn.Module):
         )
 
         if self.needs_padding:
-            rotated = torch.cat([rotated, remainder.float()], dim=-1)
+            rotated = torch.cat([rotated, remainder], dim=-1)
 
         return rotated
 
@@ -417,13 +468,13 @@ class GeometricPositionEmbedding(nn.Module):
         Returns:
             Tuple of (query_rotated, key_rotated) with same shapes as input
         """
-        input_dtype = query.dtype
+        compute_dtype = query.dtype
         batch_size_q, num_heads, query_len, _ = query.shape
         batch_size_k, _, key_len, _ = key.shape
 
-        # Compute quaternion for query coordinates
+        # Compute quaternion for query coordinates (in model compute dtype)
         w_q, qx_q, qy_q, qz_q = self._coords_to_quaternion(
-            query_coordinates, batch_size_q, query_len
+            query_coordinates, batch_size_q, query_len, target_dtype=compute_dtype
         )
 
         if key_coordinates is None:
@@ -432,14 +483,15 @@ class GeometricPositionEmbedding(nn.Module):
         else:
             # Cross-attention: separate quaternion for K
             w_k, qx_k, qy_k, qz_k = self._coords_to_quaternion(
-                key_coordinates, batch_size_k, key_len
+                key_coordinates, batch_size_k, key_len, target_dtype=compute_dtype
             )
 
         # Rotate Q with query quaternion, K with key quaternion
+        # _rotate_vectors now works in compute_dtype directly, no cast needed
         query_rotated = self._rotate_vectors(query, w_q, qx_q, qy_q, qz_q)
         key_rotated = self._rotate_vectors(key, w_k, qx_k, qy_k, qz_k)
 
-        return query_rotated.to(input_dtype), key_rotated.to(input_dtype)
+        return query_rotated, key_rotated
 
     def rotate_value(
         self,
@@ -465,13 +517,15 @@ class GeometricPositionEmbedding(nn.Module):
         Returns:
             Rotated value vectors (batch, num_heads, seq_len, head_dim)
         """
-        input_dtype = value.dtype
+        compute_dtype = value.dtype
         batch_size, num_heads, seq_len, _ = value.shape
 
-        w, qx, qy, qz = self._coords_to_quaternion(coordinates, batch_size, seq_len)
+        w, qx, qy, qz = self._coords_to_quaternion(
+            coordinates, batch_size, seq_len, target_dtype=compute_dtype
+        )
         rotated = self._rotate_vectors(value, w, qx, qy, qz, inverse=inverse)
 
-        return rotated.to(input_dtype)
+        return rotated
 
 
 class FactorizedGeoBias(nn.Module):
@@ -523,8 +577,11 @@ class FactorizedGeoBias(nn.Module):
 
     def _encode(self, coords: torch.Tensor) -> torch.Tensor:
         """Encode coordinates to Fourier features. Only O(B·T·fourier_dim)."""
-        coords_scaled = coords.float() * torch.exp(self.log_axis_scale)
-        freq_features = self.freq_proj(coords_scaled.to(self.freq_proj.weight.dtype))
+        # Scale in FP32 (raw coords may overflow FP16), then immediately cast
+        # to model weight dtype so freq_proj and sin/cos run in FP16/BF16.
+        weight_dtype = self.freq_proj.weight.dtype
+        coords_scaled = (coords.float() * torch.exp(self.log_axis_scale)).to(weight_dtype)
+        freq_features = self.freq_proj(coords_scaled)
         return torch.cat([freq_features.sin(), freq_features.cos()], dim=-1)
 
     def forward(
@@ -748,16 +805,19 @@ class LieAlgebraRelativeAttention(nn.Module):
             cos, sin = position_embeddings
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # Step 2: GQA expansion — expand K/V from num_kv_heads to num_heads via repetition
-        # Must be done BEFORE GeoPE since GeoPE expects Q and K to have the same num_heads
-        key = repeat_kv(key, self.num_key_value_groups)     # (B, num_heads, T, head_dim)
-        value = repeat_kv(value, self.num_key_value_groups) # (B, num_heads, T, head_dim)
-
-        # Step 3: Apply GeoPE (Geometric Position Embedding) for 3D spatial position
-        # Both Q and K now have num_heads, so GeoPE works correctly
-        # Self-attention: key_coordinates=None → same coords for Q and K
+        # Step 2: Apply GeoPE (Geometric Position Embedding) for 3D spatial position
+        # Done BEFORE GQA expansion so quaternion rotation operates on num_kv_heads
+        # keys instead of num_heads — saves num_key_value_groups× rotation compute.
+        # GeoPE quaternion is (B, 1, T, num_subvectors) and broadcasts over heads,
+        # so Q (num_heads) and K (num_kv_heads) can have different head counts.
         query_rot, key_rot = self.geo_pe(query, key, query_coordinates=coordinates)
-        
+
+        # Step 3: GQA expansion — expand K/V from num_kv_heads to num_heads
+        # Placed AFTER GeoPE rotation: repeat_kv(rotate(K)) ≡ rotate(repeat_kv(K))
+        # because the same quaternion broadcasts identically over repeated heads.
+        key_rot = repeat_kv(key_rot, self.num_key_value_groups)   # (B, num_heads, T, head_dim)
+        value = repeat_kv(value, self.num_key_value_groups)       # (B, num_heads, T, head_dim)
+
         # Step 4: Compute attention scores with rotated Q, K
         # Use self.scaling = query_pre_attn_scalar**-0.5 (matches T5Gemma, NOT head_dim**-0.5)
         attn_scores = torch.matmul(query_rot, key_rot.transpose(-2, -1)) * self.scaling
@@ -1218,13 +1278,13 @@ class CrossLARAAttention(nn.Module):
             batch_size, key_len, self.num_kv_heads, self.head_dim
         ).transpose(1, 2)  # (batch, num_kv_heads, key_len, head_dim)
 
-        # ── Step 2: GQA expansion ──
-        # Expand K/V from num_kv_heads to num_heads before GeoPE
-        key = repeat_kv(key, self.num_key_value_groups)     # (batch, num_heads, key_len, head_dim)
-        value = repeat_kv(value, self.num_key_value_groups) # (batch, num_heads, key_len, head_dim)
-
-        # ── Step 3: Level 2 — Dual-coordinate GeoPE on Q/K ──
-        # Q rotated by decoder coords, K rotated by encoder coords
+        # ── Step 2: Level 2 — Dual-coordinate GeoPE on Q/K ──
+        # Done BEFORE GQA expansion so quaternion rotation operates on
+        # num_kv_heads keys instead of num_heads — saves num_key_value_groups×
+        # rotation compute.  GeoPE quaternion is (B, 1, T, num_subvectors)
+        # and broadcasts over heads, so Q (num_heads) and K (num_kv_heads)
+        # can have different head counts.
+        #
         # Attention score decomposes via Rodrigues formula:
         #   ⟨R(p^d_i)q, R(p^e_j)k⟩ = ⟨q, R_rel k⟩
         # where R_rel = R(p^d_i)^{-1} R(p^e_j) encodes relative geometry
@@ -1233,6 +1293,27 @@ class CrossLARAAttention(nn.Module):
             query_coordinates=query_coordinates,
             key_coordinates=key_coordinates,
         )
+
+        # ── Step 3: GQA expansion + Level 3 value rotation ──
+        # GQA expansion is placed AFTER geo rotations:
+        #   repeat_kv(rotate(K)) ≡ rotate(repeat_kv(K))
+        # because the same quaternion broadcasts identically over repeated heads.
+        key_rot = repeat_kv(key_rot, self.num_key_value_groups)  # (batch, num_heads, key_len, head_dim)
+
+        # For value: rotate BEFORE GQA expansion when value_rotation is on,
+        # otherwise expand directly.  Both save num_key_value_groups× rotation ops.
+        if self.use_value_rotation:
+            # Encoder side: unrotate values to canonical frame (num_kv_heads)
+            value_canonical = self.geo_pe.rotate_value(
+                value, key_coordinates, inverse=True
+            )  # R(p^e_j)^{-1} v_j  — (batch, num_kv_heads, key_len, head_dim)
+
+            # GQA expand AFTER rotation
+            value_canonical = repeat_kv(value_canonical, self.num_key_value_groups)
+            # (batch, num_heads, key_len, head_dim)
+        else:
+            value = repeat_kv(value, self.num_key_value_groups)
+            # (batch, num_heads, key_len, head_dim)
 
         # ── Step 4: Attention scores ──
         attn_scores = torch.matmul(query_rot, key_rot.transpose(-2, -1)) * self.scaling
@@ -1263,22 +1344,14 @@ class CrossLARAAttention(nn.Module):
             training=True,
         )
 
-        # ── Step 9: Level 3 — Geometric value rotation ──
+        # ── Step 9: Level 3 — Geometric value aggregation ──
         # Factored form: o_i = R(p^d_i) · Σ_j α_ij · R(p^e_j)^{-1} · v_j
-        #
-        # Encoder side (precomputed):  ṽ_j = R(p^e_j)^{-1} v_j     — O(T_e · d)
-        # Standard aggregation:       c_i = Σ_j α_ij · ṽ_j          — O(T_d · T_e · d)
-        # Decoder side (post-agg):    o_i = R(p^d_i) · c_i           — O(T_d · d)
         #
         # Geometric Coincidence: when p^d_i = p^e_j, R(p^d)·R(p^e)^{-1} = I
         # → value passes through unchanged (pure semantic attention at pin positions)
         if self.use_value_rotation:
-            # Encoder side: unrotate values to canonical frame
-            value_canonical = self.geo_pe.rotate_value(
-                value, key_coordinates, inverse=True
-            )  # R(p^e_j)^{-1} v_j
-
             # Standard weighted aggregation in canonical frame
+            # (value_canonical already GQA-expanded above)
             context = torch.matmul(attn_probs, value_canonical)
             # (batch, num_heads, query_len, head_dim)
 

@@ -38,9 +38,9 @@
     },
     "training": {
         "paths": {
-            "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/split_dataset",
-            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_wope",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_training/model_wope/logs"
+            "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_training/split_dataset",
+            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_training/check_baseline",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_training/check_baseline/logs"
         },
         "model": {
             "hidden_size": 512,
@@ -56,8 +56,8 @@
                 "use_basic_fourier_pe": false,
                 "use_advanced_geo_pe": false,
                 "use_metal_layer_only_pe":false,
-                "use_geo_self_attn": true, 
-                "use_geo_cross_attn": true, 
+                "use_geo_self_attn": false, 
+                "use_geo_cross_attn": false, 
                 "enable_encoder_lara": false,       
                 "coord_scale": 1e-6, 
                 "coord_scale_z": 0.3, 
@@ -72,9 +72,9 @@
                 "max_metal_layers": 16,
                 "max_layer_delta": 10,
                 "pe_dropout": 0.1,
-                "self_attn_geometric_bias": true,
-                "cross_attn_geometric_bias": true,
-                "use_value_rotation": true,
+                "self_attn_geometric_bias": false,
+                "cross_attn_geometric_bias": false,
+                "use_value_rotation": false,
                 "bias_num_freqs": 16,
                 "bias_rank_per_head": 8,
                 "use_vq": false,
@@ -82,7 +82,7 @@
                 "vq_commitment_cost": 0.25,
                 "vq_ema_decay": 0.99, 
                 "vq_dead_code_threshold":2, 
-                "coord_noise_enabled": true,
+                "coord_noise_enabled": false,
                 "coord_noise_std_xy": 5000.0,
                 "coord_noise_std_z": 2.0,
                 "coord_noise_max_ratio": 0.8,
@@ -95,8 +95,8 @@
             "max_src_len": 128,
             "max_tgt_len": 256,
             "train_split_ratio": 0.9,
-            "num_train_epochs": 20,
-            "batch_size_per_device": 128,
+            "num_train_epochs": 40,
+            "batch_size_per_device": 148,
             "gradient_accumulation_steps": 1,
             "learning_rate": 2e-4,
             "weight_decay": 0.01,
@@ -122,10 +122,10 @@
     },
     "evaluation": {
         "paths": {
-            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_wope",
-            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_wope/metrics",
-            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_wope/plots",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_wope/logs"
+            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/check_baseline",
+            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/check_baseline/metrics",
+            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/check_baseline/plots",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/check_baseline/logs"
         },
         "generation": {
             "max_new_tokens": 512,
