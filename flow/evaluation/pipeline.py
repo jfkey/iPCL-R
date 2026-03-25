@@ -365,7 +365,10 @@ class EvaluationPipeline:
         """
         if scienceplots:
             plt.style.use(["science"])
-
+        
+        import matplotlib
+        matplotlib.rcParams['text.usetex'] = False
+        
         # PDF
         plot_PDF(
             {
