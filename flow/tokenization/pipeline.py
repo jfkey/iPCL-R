@@ -158,7 +158,7 @@ class TokenizationPipeline:
                 self.unified_tokenizer.remove_special_token(
                     self.unified_tokenizer.convert_source_to_directional_token(
                         driver, loads, overlap_info, connected_info
-                    )
+                    )[0]
                 )
                 for driver, loads, overlap_info, connected_info in zip(
                     batch_driver, batch_loads, batch_overlap_info, batch_connected_info
@@ -230,7 +230,7 @@ class TokenizationPipeline:
                     sample.get("overlap_info", {}),
                     sample.get("connected_info", {}),
                 )
-                source_text = (
+                source_text, _ = (
                     self.unified_tokenizer.convert_source_to_directional_token(
                         driver, loads, overlap_info, connected_info
                     )
@@ -302,7 +302,7 @@ class TokenizationPipeline:
                     sample.get("overlap_info", {}),
                     sample.get("connected_info", {}),
                 )
-                source_text = (
+                source_text, _ = (
                     self.unified_tokenizer.convert_source_to_directional_token(
                         driver, loads, overlap_info, connected_info
                     )
@@ -374,7 +374,7 @@ class TokenizationPipeline:
             batch_source_tokens = [
                 self.unified_tokenizer.convert_source_to_directional_token(
                     driver, loads, overlap_info, connected_info
-                )
+                )[0]
                 for driver, loads, overlap_info, connected_info in zip(
                     batch_driver, batch_loads, batch_overlap_info, batch_connected_info
                 )

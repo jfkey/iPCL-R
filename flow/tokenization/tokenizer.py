@@ -236,7 +236,7 @@ class UnifiedTokenizer:
         loads: List[str],
         overlap_info: List[Dict] = None,
         connected_info: List[Dict] = None,
-    ) -> str:
+    ) -> Tuple[str, List[str]]:
         """
         Build source sequence from net sample
 
@@ -247,17 +247,11 @@ class UnifiedTokenizer:
             connected_info: List of connected information dictionaries
 
         Returns:
-            Source sequence as a string
-
-        Example input:
-            "driver": "(x, y, m)",
-            "loads": ["(x1, y1, m1)", "(x2, y2, m2)", ...],
-            "overlap_info": [{"driver": "(x, y, m)", "loads": ["(x1, y1, m1)", ...]}, ...],
-            "connected_info": [{"driver": "(x, y, m)", "loads": ["(x1, y1, m1)", ...]}, ...],
-            ... (else fields as needed)
-
-        Example output:
-            "DRIVER_TOKEN R100 B2 LOAD_TOKEN R50 ..."
+            Tuple of (source_sequence, ordered_loads):
+            - source_sequence: Source token sequence as a string
+            - ordered_loads: Loads in the order used for RLOAD/ALOAD indexing
+              (after clockwise sort or shuffle), so that <RLOADn> corresponds
+              to ordered_loads[n-1].
         """
         # Add BOS token to start the sequence
         converted_tokens = [self.get_special_token("BOS_TOKEN")]
@@ -267,12 +261,9 @@ class UnifiedTokenizer:
             self.build_driver_tokens(driver, self.get_special_token("DRIVER_TOKEN"))
         )
 
-        # Add load information as sequence of direction tokens
-        converted_tokens.extend(
-            self.build_relative_loads_tokens(
-                driver, loads, self.get_special_token("LOAD_TOKEN")
-            )
-        )
+        # Add load information as indexed RLOAD/ALOAD token pairs
+        load_tokens, ordered_loads = self.build_indexed_loads_tokens(driver, loads)
+        converted_tokens.extend(load_tokens)
 
         # Add overlap information if required
         if (
@@ -295,7 +286,7 @@ class UnifiedTokenizer:
 
         # Apply text preprocessing if configured
         converted_tokens = self.apply_token_preprocessing(converted_tokens)
-        return " ".join(converted_tokens)
+        return " ".join(converted_tokens), ordered_loads
 
     def convert_relative_target_to_directional_token(
         self, relative_tree_seq: List[str]
@@ -767,6 +758,90 @@ class UnifiedTokenizer:
             )
             tokens.extend(direction_tokens)
         return tokens
+
+    def order_loads(self, driver: str, loads: List[str]) -> List[str]:
+        """Apply the same ordering to loads as used in token generation.
+
+        This ensures that external callers (e.g., coordinate extraction) can
+        obtain the same load order that build_indexed_loads_tokens uses.
+
+        Note: When use_coord_sorted_input is False, loads are shuffled randomly.
+        In that case the order is non-deterministic and this method should NOT
+        be called independently — use get_ordered_loads_and_tokens() instead.
+
+        Args:
+            driver: Driver coordinate as a string
+            loads: List of load coordinates as strings
+
+        Returns:
+            Ordered copy of loads
+        """
+        ordered = loads.copy()
+        if self.advanced_config.use_coord_sorted_input:
+            ordered = self.sort_coordinates_clockwise(driver, ordered)
+        else:
+            random.shuffle(ordered)
+        return ordered
+
+    def build_indexed_loads_tokens(
+        self, driver: str, loads: List[str]
+    ) -> Tuple[List[str], List[str]]:
+        """Build indexed load tokens: all RLOADs first, then all ALOADs.
+
+        Output format:
+          <RLOAD1> rel_tokens ... <RLOADn> rel_tokens <ALOAD1> abs_tokens ... <ALOADn> abs_tokens
+
+        Loads with index <= MAX_INDEXED_LOADS get unique tokens (<RLOAD1>, <ALOAD1>, etc.).
+        Loads beyond MAX_INDEXED_LOADS use generic <RLOAD> / <ALOAD> overflow tokens.
+
+        Args:
+            driver: Driver coordinate as a string
+            loads: List of load coordinates as strings
+
+        Returns:
+            Tuple of (tokens, ordered_loads):
+            - tokens: List of tokens [all RLOAD sections] + [all ALOAD sections]
+            - ordered_loads: The loads in the same order used for token generation
+        """
+        if not loads:
+            return [], []
+        if not isinstance(loads, list):
+            raise ValueError(f"Expected list of loads, got {type(loads)}")
+
+        processed_loads = self.order_loads(driver, loads)
+
+        from flow.utils.special_tokens import SpecialTokenManager
+
+        max_indexed = SpecialTokenManager.MAX_INDEXED_LOADS
+        driver_coord = self.parse_coord(driver)
+
+        rload_tokens = []
+        aload_tokens = []
+        for idx, load_str in enumerate(processed_loads):
+            load_idx = idx + 1  # 1-based
+            curr_coord = self.parse_coord(load_str)
+
+            # Determine token name: indexed or generic overflow
+            if load_idx <= max_indexed:
+                rload_tag = self.get_special_token(f"RLOAD{load_idx}_TOKEN")
+                aload_tag = self.get_special_token(f"ALOAD{load_idx}_TOKEN")
+            else:
+                rload_tag = self.get_special_token("RLOAD_TOKEN")
+                aload_tag = self.get_special_token("ALOAD_TOKEN")
+
+            # RLOAD: relative direction tokens (load - driver)
+            rload_tokens.append(rload_tag)
+            rload_tokens.extend(
+                self.relative_coordinate_to_direction_tokens(driver_coord, curr_coord)
+            )
+
+            # ALOAD: absolute direction tokens (from origin to load)
+            aload_tokens.append(aload_tag)
+            aload_tokens.extend(
+                self.coordinate_str_to_direction_tokens(curr_coord)
+            )
+
+        return rload_tokens + aload_tokens, processed_loads
 
     def build_overlap_tokens(self, overlap_info: List[Dict]) -> List[str]:
         """Build overlap information tokens"""

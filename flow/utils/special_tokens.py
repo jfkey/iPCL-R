@@ -40,6 +40,18 @@ class SpecialTokenManager:
     # Source information tokens (always included)
     SOURCE_TOKENS = {"DRIVER_TOKEN": "<DRIVER>", "LOAD_TOKEN": "<LOAD>"}
 
+    # Indexed load tokens: RLOAD (relative) and ALOAD (absolute), 1-MAX
+    # Loads beyond MAX_INDEXED_LOADS use generic <RLOAD> / <ALOAD> overflow tokens
+    MAX_INDEXED_LOADS = 20
+    INDEXED_LOAD_TOKENS = {
+        # Generic overflow tokens for loads beyond MAX_INDEXED_LOADS
+        "RLOAD_TOKEN": "<RLOAD>",
+        "ALOAD_TOKEN": "<ALOAD>",
+    }
+    for _i in range(1, MAX_INDEXED_LOADS + 1):
+        INDEXED_LOAD_TOKENS[f"RLOAD{_i}_TOKEN"] = f"<RLOAD{_i}>"
+        INDEXED_LOAD_TOKENS[f"ALOAD{_i}_TOKEN"] = f"<ALOAD{_i}>"
+
     # Tree structure tokens (always included)
     TREE_TOKENS = {
         "PUSH_TOKEN": "<PUSH>",
@@ -80,6 +92,7 @@ class SpecialTokenManager:
         tokens = []
         if self.config.use_source_info:
             tokens.extend(self.SOURCE_TOKENS.values())
+            tokens.extend(self.INDEXED_LOAD_TOKENS.values())
         if self.config.use_tree_structure:
             tokens.extend(self.TREE_TOKENS.values())
         if self.config.overlap_info_required:
@@ -101,6 +114,7 @@ class SpecialTokenManager:
         # Always include source tokens if enabled
         if self.config.use_source_info:
             tokens.extend(self.SOURCE_TOKENS.values())
+            tokens.extend(self.INDEXED_LOAD_TOKENS.values())
 
         # Always include tree tokens if enabled
         if self.config.use_tree_structure:
@@ -135,6 +149,8 @@ class SpecialTokenManager:
 
         if self.config.use_source_info:
             for name, token in self.SOURCE_TOKENS.items():
+                mapping[token] = name
+            for name, token in self.INDEXED_LOAD_TOKENS.items():
                 mapping[token] = name
 
         if self.config.use_tree_structure:
@@ -191,6 +207,7 @@ class SpecialTokenManager:
         all_tokens = {
             **self.CORE_TOKENS,
             **self.SOURCE_TOKENS,
+            **self.INDEXED_LOAD_TOKENS,
             **self.TREE_TOKENS,
             **self.OVERLAP_TOKENS,
             **self.CONNECTED_TOKENS,
@@ -203,6 +220,7 @@ class SpecialTokenManager:
 
         if self.config.use_source_info:
             result.update(self.SOURCE_TOKENS)
+            result.update(self.INDEXED_LOAD_TOKENS)
 
         if self.config.use_tree_structure:
             result.update(self.TREE_TOKENS)
