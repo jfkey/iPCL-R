@@ -79,23 +79,16 @@ def make_baseline_collator(tokenizer, max_src_len):
     return collate_fn
 
 
-def _extract_driver_position(src_abs_pos):
-    """Extract the first non-zero (x, y, m) from src_abs_pos."""
-    for pos in src_abs_pos:
-        if isinstance(pos, (list, tuple)) and len(pos) >= 3:
-            x, y, m = pos[0], pos[1], pos[2]
-            if x != 0 or y != 0 or m != 0:
-                return (x, y, m)
-    return (0, 0, 0)
-
-
 class GeoDataCollator:
-    """Collator that also pads encoder coordinate fields."""
+    """Collator that pads and scales encoder relative coordinate fields to FP16."""
 
-    def __init__(self, tokenizer, max_src_len, need_driver_positions=False):
+    def __init__(self, tokenizer, max_src_len, need_driver_positions=False,
+                 coord_scale=1e-6, coord_scale_z=0.3):
         self.tokenizer = tokenizer
         self.max_src_len = max_src_len
         self.need_driver_positions = need_driver_positions
+        self.coord_scale = coord_scale
+        self.coord_scale_z = coord_scale_z
 
     def __call__(self, batch):
         source_tokens = [item["source_tokens"] for item in batch]
@@ -111,24 +104,10 @@ class GeoDataCollator:
         batch_size = len(batch)
         padded_src_len = encs["input_ids"].shape[1]
 
-        encoder_abs_positions = torch.zeros(batch_size, padded_src_len, 3, dtype=torch.long)
-        encoder_rel_positions = torch.zeros(batch_size, padded_src_len, 3, dtype=torch.long)
-        driver_positions = []
+        # Pad in FP32 for safe scaling
+        encoder_rel_positions = torch.zeros(batch_size, padded_src_len, 3, dtype=torch.float32)
 
         for i, item in enumerate(batch):
-            if "src_abs_pos" in item:
-                src_abs = item["src_abs_pos"]
-                seq_len = min(len(src_abs), padded_src_len)
-                for j in range(seq_len):
-                    if isinstance(src_abs[j], (list, tuple)) and len(src_abs[j]) >= 3:
-                        encoder_abs_positions[i, j, 0] = src_abs[j][0]
-                        encoder_abs_positions[i, j, 1] = src_abs[j][1]
-                        encoder_abs_positions[i, j, 2] = src_abs[j][2]
-                if self.need_driver_positions:
-                    driver_positions.append(_extract_driver_position(src_abs))
-            elif self.need_driver_positions:
-                driver_positions.append((0, 0, 0))
-
             if "src_rel_pos" in item:
                 src_rel = item["src_rel_pos"]
                 seq_len = min(len(src_rel), padded_src_len)
@@ -138,14 +117,17 @@ class GeoDataCollator:
                         encoder_rel_positions[i, j, 1] = src_rel[j][1]
                         encoder_rel_positions[i, j, 2] = src_rel[j][2]
 
+        # Per-axis scaling and convert to FP16
+        encoder_rel_positions[:, :, 0] *= self.coord_scale
+        encoder_rel_positions[:, :, 1] *= self.coord_scale
+        encoder_rel_positions[:, :, 2] *= self.coord_scale_z
+        encoder_rel_positions = encoder_rel_positions.half()
+
         result = {
             "input_ids": encs["input_ids"],
             "attention_mask": encs["attention_mask"],
-            "encoder_abs_positions": encoder_abs_positions,
             "encoder_rel_positions": encoder_rel_positions,
         }
-        if self.need_driver_positions:
-            result["driver_positions"] = driver_positions
         return result
 
 
@@ -308,9 +290,7 @@ def run_evaluation(config: FlowConfig):
                 tokenizer=tokenizer,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                encoder_abs_positions=batch["encoder_abs_positions"],
                 encoder_rel_positions=batch["encoder_rel_positions"],
-                driver_positions=batch["driver_positions"],
                 generation_config=model_generation_config,
             )
         elif has_pe:
@@ -319,7 +299,6 @@ def run_evaluation(config: FlowConfig):
                 outputs = unwrapped_model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    encoder_abs_positions=batch["encoder_abs_positions"],
                     encoder_rel_positions=batch["encoder_rel_positions"],
                     generation_config=model_generation_config,
                 )
@@ -363,8 +342,7 @@ def run_evaluation(config: FlowConfig):
 
 def _generate_with_lara(
     model, tokenizer, input_ids, attention_mask,
-    encoder_abs_positions, encoder_rel_positions,
-    driver_positions, generation_config,
+    encoder_rel_positions, generation_config,
 ) -> List[str]:
     """Per-sample generation with LARA coordinate tracking."""
     batch_size = input_ids.shape[0]
@@ -379,9 +357,8 @@ def _generate_with_lara(
                 outputs = model.generate(
                     input_ids=input_ids[i:i+1],
                     attention_mask=attention_mask[i:i+1],
-                    encoder_abs_positions=encoder_abs_positions[i:i+1],
                     encoder_rel_positions=encoder_rel_positions[i:i+1],
-                    driver_pos=driver_positions[i],
+                    driver_pos=(0, 0, 0),  # Relative coords: driver is origin
                     use_coordinate_tracking=True,
                     generation_config=generation_config,
                 )
@@ -390,7 +367,6 @@ def _generate_with_lara(
                 outputs = model.generate(
                     input_ids=input_ids[i:i+1],
                     attention_mask=attention_mask[i:i+1],
-                    encoder_abs_positions=encoder_abs_positions[i:i+1],
                     encoder_rel_positions=encoder_rel_positions[i:i+1],
                     generation_config=generation_config,
                 )

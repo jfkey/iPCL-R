@@ -120,8 +120,8 @@ class GeometricPositionEmbedding(nn.Module):
         num_heads: int = 4,
         head_dim: int = 63,  # Must be divisible by 3
         base: float = 32.0,
-        coord_scale: float = 1e-4,
-        coord_scale_z: float = 0.3,
+        coord_scale: float = 1e-4,   # kept for interface compat, unused (scaling in collator)
+        coord_scale_z: float = 0.3,  # kept for interface compat, unused
     ):
         super().__init__()
 
@@ -130,12 +130,12 @@ class GeometricPositionEmbedding(nn.Module):
         self.head_dim = head_dim
         self.base = base
 
-        # Fixed per-axis scaling (not learnable).
-        # x,y use coord_scale (large chip coords ~2M), z (metal layer, range 0-20)
-        # uses coord_scale_z to bring it to a comparable magnitude.
+        # Coordinate scaling is now performed in the data collator (FP16).
+        # log_axis_scale is no longer used but kept as a zero buffer for
+        # checkpoint compatibility (loading old checkpoints won't break).
         self.register_buffer(
             'log_axis_scale',
-            torch.log(torch.tensor([coord_scale, coord_scale, coord_scale_z]))
+            torch.zeros(3)  # exp(0) = 1.0, no-op if ever accessed
         )
 
         # For 3D GeoPE, we partition head_dim into sub-vectors of size 3
@@ -285,26 +285,21 @@ class GeometricPositionEmbedding(nn.Module):
         target_dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         """
-        Prepare coordinates: handle batch/seq_len mismatches, scale, and cast.
+        Prepare coordinates: handle batch/seq_len mismatches and cast dtype.
 
-        Scaling is performed in FP32 because raw chip coordinates can exceed
-        FP16 range (e.g. 2382120 > 65504).  After scaling the values are small
-        enough for half-precision, so we cast to *target_dtype* immediately to
-        keep all downstream quaternion / Fourier math in the model's compute
-        dtype (FP16/BF16), which doubles throughput on tensor-cores.
+        Coordinates are pre-scaled in the data collator (FP16), so no scaling
+        is performed here. Only batch/seq_len alignment and dtype casting.
 
         Args:
-            coordinates: 3D coordinates (coord_batch, coord_seq, 3)
+            coordinates: Pre-scaled 3D coordinates (coord_batch, coord_seq, 3)
             batch_size: Expected batch size (from query/key)
             seq_len: Expected sequence length (from query/key)
-            target_dtype: Dtype for the returned tensor.  When None the result
-                stays in FP32 (backward-compatible default).
+            target_dtype: Dtype for the returned tensor.
 
         Returns:
-            Scaled coordinates (batch_size, seq_len, 3) in *target_dtype*
+            Coordinates (batch_size, seq_len, 3) in *target_dtype*
         """
-        # --- scaling MUST happen in FP32 (raw coords can overflow FP16) ---
-        coords = coordinates.float()
+        coords = coordinates
         coord_batch, coord_seq, _ = coords.shape
 
         # Handle batch dimension mismatch (beam search expands batch by num_beams)
@@ -327,12 +322,8 @@ class GeometricPositionEmbedding(nn.Module):
                     f"Seq len mismatch: expected {seq_len}, coordinates has {coord_seq}"
                 )
 
-        # Per-axis scaling in FP32: (B, T, 3) * (3,)
-        coords = coords * torch.exp(self.log_axis_scale)
-
-        # Cast to model compute dtype — values are now O(1)~O(100), safe for
-        # FP16 (max 65504) and BF16 (max ~3.4e38).
-        if target_dtype is not None:
+        # Cast to target dtype if needed
+        if target_dtype is not None and coords.dtype != target_dtype:
             coords = coords.to(target_dtype)
 
         return coords
@@ -552,18 +543,18 @@ class FactorizedGeoBias(nn.Module):
         num_heads: int,
         num_freqs: int = 16,
         rank_per_head: int = 8,
-        coord_scale: float = 1e-6,
-        coord_scale_z: float = 0.3,
+        coord_scale: float = 1e-6,   # kept for interface compat, unused (scaling in collator)
+        coord_scale_z: float = 0.3,  # kept for interface compat, unused
     ):
         super().__init__()
         self.num_heads = num_heads
         self.rank_per_head = rank_per_head
 
-        # Fixed per-axis scaling (not learnable).
-        # See GeometricPositionEmbedding for detailed rationale.
+        # Coordinate scaling is now performed in the data collator.
+        # Zero buffer kept for checkpoint compatibility.
         self.register_buffer(
             'log_axis_scale',
-            torch.log(torch.tensor([coord_scale, coord_scale, coord_scale_z]))
+            torch.zeros(3)
         )
         total_rank = num_heads * rank_per_head
 
@@ -577,11 +568,10 @@ class FactorizedGeoBias(nn.Module):
 
     def _encode(self, coords: torch.Tensor) -> torch.Tensor:
         """Encode coordinates to Fourier features. Only O(B·T·fourier_dim)."""
-        # Scale in FP32 (raw coords may overflow FP16), then immediately cast
-        # to model weight dtype so freq_proj and sin/cos run in FP16/BF16.
+        # Coordinates are pre-scaled FP16 from the data collator.
         weight_dtype = self.freq_proj.weight.dtype
-        coords_scaled = (coords.float() * torch.exp(self.log_axis_scale)).to(weight_dtype)
-        freq_features = self.freq_proj(coords_scaled)
+        coords_input = coords.to(weight_dtype)
+        freq_features = self.freq_proj(coords_input)
         return torch.cat([freq_features.sin(), freq_features.cos()], dim=-1)
 
     def forward(
@@ -1006,7 +996,7 @@ class T5GemmaLARAAttention(nn.Module):
         if coordinates is None:
             raise ValueError(
                 "T5GemmaLARAAttention requires 'coordinates' parameter. "
-                "Make sure to pass encoder_abs_positions through the model forward pass. "
+                "Make sure to pass coordinates through the model forward pass. "
                 f"Layer index: {self.layer_idx}"
             )
 

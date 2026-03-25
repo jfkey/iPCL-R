@@ -440,11 +440,19 @@ def extract_source_positions_from_raw_data(
     source_tokens: str,
 ) -> Tuple[List[Tuple[int, int, int]], List[Tuple[int, int, int]]]:
     """
-    Extract absolute and relative positions for source tokens from RAW DATA.
+    Extract dense absolute and relative positions for source tokens from RAW DATA.
 
-    This function extracts positions directly from the original driver/loads data,
-    NOT by computing from direction tokens. Position embeddings are only applied
-    to semantic tokens (<DRIVER>, <LOAD>), not direction tokens.
+    Position assignment strategy (dense — no direction token gets SPECIAL_POS):
+    - <DRIVER> token: driver's absolute position
+    - Direction tokens under <DRIVER>: inherit driver's absolute position
+    - <RLOADn> token: load's absolute position
+    - Direction tokens under <RLOADn>: cumulate from driver position
+      (gradual spatial path from driver towards load)
+    - <ALOADn> token: load's absolute position
+    - Direction tokens under <ALOADn>: inherit load's absolute position (not cumulative)
+    - <BOS>, <SRC_END>, etc.: SPECIAL_POS (0, 0, 0)
+
+    Relative positions: abs_pos - driver_pos for non-zero abs_pos, else (0, 0, 0).
 
     Args:
         driver_str: Driver coordinate string like "(2382120, 691600, 2)"
@@ -452,21 +460,7 @@ def extract_source_positions_from_raw_data(
         source_tokens: Source tokens string (used to find <DRIVER>/<LOAD> positions)
 
     Returns:
-        Tuple of (abs_positions, rel_positions):
-        - abs_positions: List of (x, y, m) for each token
-          - <DRIVER> token gets driver's absolute position
-          - <LOAD> tokens get load's absolute position
-          - Other tokens get SPECIAL_POS (0, 0, 0)
-        - rel_positions: List of (dx, dy, dm) for each token
-          - <DRIVER> token gets (0, 0, 0)
-          - <LOAD> tokens get (load - driver) relative position
-          - Other tokens get SPECIAL_POS (0, 0, 0)
-
-    Example:
-        >>> driver = "(2382120, 691600, 2)"
-        >>> loads = ["(2375890, 625200, 0)", "(2375890, 621600, 0)"]
-        >>> tokens = "<BOS> <DRIVER> R2000000 ... <LOAD> L6000 ... <LOAD> L6000 ..."
-        >>> abs_pos, rel_pos = extract_source_positions_from_raw_data(driver, loads, tokens)
+        Tuple of (abs_positions, rel_positions)
     """
     # Parse driver position
     driver_coord = parse_coordinate_string(driver_str)
@@ -483,7 +477,6 @@ def extract_source_positions_from_raw_data(
             load_coord = CoordinatePoint(0, 0, 0)
         load_pos = (load_coord.x, load_coord.y, load_coord.m)
         load_positions.append(load_pos)
-        # Calculate relative position: load - driver
         rel_pos = (
             load_coord.x - driver_coord.x,
             load_coord.y - driver_coord.y,
@@ -491,7 +484,7 @@ def extract_source_positions_from_raw_data(
         )
         load_relative_positions.append(rel_pos)
 
-    # Parse tokens and assign positions
+    # Parse tokens
     if isinstance(source_tokens, str):
         token_list = source_tokens.split()
     else:
@@ -499,75 +492,127 @@ def extract_source_positions_from_raw_data(
 
     abs_positions = []
     rel_positions = []
-    load_idx = 0
+    load_idx = 0  # For legacy <LOAD> tokens
 
-    # Patterns for indexed and generic RLOAD/ALOAD tokens
     import re
     from flow.utils.special_tokens import SpecialTokenManager
     rload_indexed_pattern = re.compile(r"^<RLOAD(\d+)>$")
     aload_indexed_pattern = re.compile(r"^<ALOAD(\d+)>$")
 
-    # Counter for generic overflow tokens (<RLOAD> / <ALOAD>)
-    # Overflow tokens correspond to loads beyond MAX_INDEXED_LOADS
     max_indexed = SpecialTokenManager.MAX_INDEXED_LOADS
     generic_rload_idx = max_indexed
     generic_aload_idx = max_indexed
 
+    # --- State for dense coordinate computation ---
+    current_section = None   # 'DRIVER', 'RLOAD', or 'ALOAD'
+    current_parent_abs = SPECIAL_POS  # abs pos of current section's parent token
+    rload_cumulator = [0, 0, 0]       # running sum for RLOAD direction tokens
+
+    def _append_pos(abs_pos):
+        """Append abs position and derive rel position (abs - driver)."""
+        abs_positions.append(abs_pos)
+        if abs_pos != SPECIAL_POS:
+            rel_positions.append((
+                abs_pos[0] - driver_pos[0],
+                abs_pos[1] - driver_pos[1],
+                abs_pos[2] - driver_pos[2],
+            ))
+        else:
+            rel_positions.append(SPECIAL_POS)
+
+    def _enter_rload(load_abs):
+        nonlocal current_section, current_parent_abs, rload_cumulator
+        current_section = 'RLOAD'
+        current_parent_abs = load_abs
+        rload_cumulator = list(driver_pos)  # cumulate starting from driver
+
+    def _enter_aload(load_abs):
+        nonlocal current_section, current_parent_abs
+        current_section = 'ALOAD'
+        current_parent_abs = load_abs
+
     for token in token_list:
         token_stripped = token.strip()
 
+        # ---- Special section-opening tokens ----
         if token_stripped == "<DRIVER>":
-            abs_positions.append(driver_pos)
-            rel_positions.append((0, 0, 0))
+            current_section = 'DRIVER'
+            current_parent_abs = driver_pos
+            _append_pos(driver_pos)
+
         elif token_stripped == "<LOAD>":
-            # Legacy LOAD token
+            # Legacy <LOAD> token — treat like RLOAD
             if load_idx < len(load_positions):
-                abs_positions.append(load_positions[load_idx])
-                rel_positions.append(load_relative_positions[load_idx])
+                _enter_rload(load_positions[load_idx])
+                _append_pos(load_positions[load_idx])
                 load_idx += 1
             else:
-                abs_positions.append(SPECIAL_POS)
-                rel_positions.append(SPECIAL_POS)
+                current_section = None
+                _append_pos(SPECIAL_POS)
+
         elif token_stripped == "<RLOAD>":
-            # Generic overflow RLOAD: assign next available load sequentially
+            # Generic overflow RLOAD
             if generic_rload_idx < len(load_positions):
-                abs_positions.append(load_positions[generic_rload_idx])
-                rel_positions.append(load_relative_positions[generic_rload_idx])
+                _enter_rload(load_positions[generic_rload_idx])
+                _append_pos(load_positions[generic_rload_idx])
                 generic_rload_idx += 1
             else:
-                abs_positions.append(SPECIAL_POS)
-                rel_positions.append(SPECIAL_POS)
+                current_section = None
+                _append_pos(SPECIAL_POS)
+
         elif token_stripped == "<ALOAD>":
-            # Generic overflow ALOAD: assign next available load sequentially
+            # Generic overflow ALOAD
             if generic_aload_idx < len(load_positions):
-                abs_positions.append(load_positions[generic_aload_idx])
-                rel_positions.append(load_relative_positions[generic_aload_idx])
+                _enter_aload(load_positions[generic_aload_idx])
+                _append_pos(load_positions[generic_aload_idx])
                 generic_aload_idx += 1
             else:
-                abs_positions.append(SPECIAL_POS)
-                rel_positions.append(SPECIAL_POS)
+                current_section = None
+                _append_pos(SPECIAL_POS)
+
         else:
             rload_match = rload_indexed_pattern.match(token_stripped)
             aload_match = aload_indexed_pattern.match(token_stripped)
+
             if rload_match:
                 idx = int(rload_match.group(1)) - 1
                 if idx < len(load_positions):
-                    abs_positions.append(load_positions[idx])
-                    rel_positions.append(load_relative_positions[idx])
+                    _enter_rload(load_positions[idx])
+                    _append_pos(load_positions[idx])
                 else:
-                    abs_positions.append(SPECIAL_POS)
-                    rel_positions.append(SPECIAL_POS)
+                    current_section = None
+                    _append_pos(SPECIAL_POS)
+
             elif aload_match:
                 idx = int(aload_match.group(1)) - 1
                 if idx < len(load_positions):
-                    abs_positions.append(load_positions[idx])
-                    rel_positions.append(load_relative_positions[idx])
+                    _enter_aload(load_positions[idx])
+                    _append_pos(load_positions[idx])
                 else:
-                    abs_positions.append(SPECIAL_POS)
-                    rel_positions.append(SPECIAL_POS)
+                    current_section = None
+                    _append_pos(SPECIAL_POS)
+
+            elif is_direction_token(token_stripped):
+                # Direction token: strategy depends on current section
+                if current_section == 'DRIVER':
+                    # Inherit driver position
+                    _append_pos(driver_pos)
+                elif current_section == 'RLOAD':
+                    # Cumulate from driver towards load
+                    movement = parse_direction_token(token_stripped)
+                    if movement:
+                        rload_cumulator[0] += movement[0]
+                        rload_cumulator[1] += movement[1]
+                        rload_cumulator[2] += movement[2]
+                    _append_pos(tuple(rload_cumulator))
+                elif current_section == 'ALOAD':
+                    # Inherit load position (not cumulative)
+                    _append_pos(current_parent_abs)
+                else:
+                    _append_pos(SPECIAL_POS)
             else:
-                abs_positions.append(SPECIAL_POS)
-                rel_positions.append(SPECIAL_POS)
+                # Other special tokens (<BOS>, <SRC_END>, etc.)
+                _append_pos(SPECIAL_POS)
 
     return abs_positions, rel_positions
 

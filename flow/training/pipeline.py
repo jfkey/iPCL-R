@@ -159,18 +159,15 @@ class TrainingPipeline:
  
 
         # Check if pre-computed positions are available in the dataset
-        # New format: src_abs_pos, src_rel_pos, tgt_coords
         has_precomputed_positions = (
-            "src_abs_pos" in dataset.column_names
-            and "src_rel_pos" in dataset.column_names
-            and "tgt_coords" in dataset.column_names
+            "src_rel_pos" in dataset.column_names
+            and "relative_tgt_coords" in dataset.column_names
         )
 
         if use_geo and has_precomputed_positions:
             logging.info("Using pre-computed positions from tokenization pipeline:")
-            logging.info("  - src_abs_pos: Absolute positions for <DRIVER>/<LOAD> tokens")
             logging.info("  - src_rel_pos: Relative positions (load - driver) for <LOAD> tokens")
-            logging.info("  - tgt_coords: Cumulative absolute positions for target tokens")
+            logging.info("  - relative_tgt_coords: Relative cumulative positions for target tokens")
         elif use_geo and not has_precomputed_positions:
             logging.warning(
                 "Geometry-aware mode enabled but dataset lacks pre-computed positions. "
@@ -204,27 +201,22 @@ class TrainingPipeline:
 
             # Load pre-computed positions for geometry-aware training
             if use_geo and has_precomputed_positions:
-                src_abs_pos_batch = []
                 src_rel_pos_batch = []
-                tgt_coords_batch = []
+                rel_tgt_coords_batch = []
 
-                for src_abs, src_rel, tgt_coords in zip(
-                    batch["src_abs_pos"],
+                for src_rel, rel_tgt in zip(
                     batch["src_rel_pos"],
-                    batch["tgt_coords"],
+                    batch["relative_tgt_coords"],
                 ):
                     # Truncate positions to match tokenized lengths
-                    src_abs = src_abs[:self.hyperparameters_config.max_src_len]
                     src_rel = src_rel[:self.hyperparameters_config.max_src_len]
-                    tgt_coords = tgt_coords[:self.hyperparameters_config.max_tgt_len]
+                    rel_tgt = rel_tgt[:self.hyperparameters_config.max_tgt_len]
 
-                    src_abs_pos_batch.append(src_abs)
                     src_rel_pos_batch.append(src_rel)
-                    tgt_coords_batch.append(tgt_coords)
+                    rel_tgt_coords_batch.append(rel_tgt)
 
-                batch["src_abs_pos"] = src_abs_pos_batch
                 batch["src_rel_pos"] = src_rel_pos_batch
-                batch["tgt_coords"] = tgt_coords_batch
+                batch["relative_tgt_coords"] = rel_tgt_coords_batch
 
             return batch
 
@@ -232,7 +224,7 @@ class TrainingPipeline:
             # Keep source_tokens, target_tokens, and pre-computed positions if available
             cols_to_keep = ["source_tokens", "target_tokens"]
             if use_geo and has_precomputed_positions:
-                cols_to_keep.extend(["src_abs_pos", "src_rel_pos", "tgt_coords"])
+                cols_to_keep.extend(["src_rel_pos", "relative_tgt_coords"])
 
             cols_to_remove = [c for c in dataset.column_names if c not in cols_to_keep]
             tokenized_dataset = dataset.map(
@@ -599,7 +591,9 @@ class TrainingPipeline:
         # Initialize data collator (Geo-aware or standard)
         if use_geo:
             data_collator = GeoDataCollatorForSeq2Seq(
-                tokenizer, model, pad_to_multiple_of=8, padding=True
+                tokenizer, model, pad_to_multiple_of=8, padding=True,
+                coord_scale=getattr(geo_cfg, 'coord_scale', 1e-6),
+                coord_scale_z=getattr(geo_cfg, 'coord_scale_z', 0.3),
             )
             logging.info("Using GeoDataCollatorForSeq2Seq for coordinate handling")
         else:

@@ -681,16 +681,9 @@ class GeoT5GemmaDecoder(T5GemmaDecoder):
             decoder_coordinates = kwargs.pop('decoder_coordinates')
         if encoder_coordinates is None and 'encoder_coordinates' in kwargs:
             encoder_coordinates = kwargs.pop('encoder_coordinates')
-        # Also check for encoder_abs_positions (alternative name)
-        if encoder_coordinates is None and 'encoder_abs_positions' in kwargs:
-            encoder_coordinates = kwargs.pop('encoder_abs_positions')
-        """
-        Decoder forward with coordinate support.
-
-        Args:
-            decoder_coordinates: (batch, seq_len, 3)
-            encoder_coordinates: (batch, src_len, 3)
-        """
+        # Also check for encoder_rel_positions (alternative name)
+        if encoder_coordinates is None and 'encoder_rel_positions' in kwargs:
+            encoder_coordinates = kwargs.pop('encoder_rel_positions')
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -856,10 +849,16 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
     │  Other tokens      │  Zero (no position embedding)                       │
     └─────────────────────────────────────────────────────────────────────────┘
 
-    The model accepts additional inputs:
-    - encoder_abs_positions: Absolute 3D coordinates (batch, src_len, 3)
+    The model accepts additional inputs (all pre-scaled FP16 from data collator):
     - encoder_rel_positions: Relative 3D coordinates (batch, src_len, 3)
-    - decoder_coordinates: 3D coordinates for decoder tokens (batch, tgt_len, 3)
+      Used by cross-attention GeoPE (src_rel_pos: load - driver)
+    - decoder_coordinates: Relative 3D coordinates for decoder tokens (batch, tgt_len, 3)
+      Used by decoder self-attention GeoPE and cross-attention GeoPE (relative_tgt_coords)
+
+    Attention design:
+    - Encoder self-attn: RoPE only (no GeoPE)
+    - Decoder self-attn: RoPE + GeoPE (using decoder_coordinates)
+    - Cross-attn: GeoPE (encoder=encoder_rel_positions, decoder=decoder_coordinates)
 
     Args:
         config: T5GemmaConfig for the base model
@@ -868,17 +867,16 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
     Example:
         >>> from transformers import T5GemmaConfig
         >>> config = T5GemmaConfig(hidden_size=256, num_hidden_layers=4)
-        >>> geo_config = GeoConfig(use_advanced_geo_pe=True)
+        >>> geo_config = GeoConfig(use_geo_self_attn=True, use_geo_cross_attn=True)
         >>> model = GeoT5GemmaForConditionalGeneration(config, geo_config)
         >>>
-        >>> # Forward pass with coordinates
+        >>> # Forward pass with pre-scaled FP16 coordinates
         >>> outputs = model(
         ...     input_ids=input_ids,
         ...     attention_mask=attention_mask,
-        ...     encoder_abs_positions=encoder_abs_pos,  # (batch, src_len, 3)
-        ...     encoder_rel_positions=encoder_rel_pos,  # (batch, src_len, 3)
+        ...     encoder_rel_positions=encoder_rel_pos,  # (batch, src_len, 3) FP16
         ...     labels=labels,
-        ...     decoder_coordinates=decoder_coords,     # (batch, tgt_len, 3)
+        ...     decoder_coordinates=decoder_coords,     # (batch, tgt_len, 3) FP16
         ... )
     """
 
@@ -1064,12 +1062,11 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
     def _shift_decoder_coordinates(
         self,
         decoder_coordinates: torch.Tensor,
-        encoder_abs_positions: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """
         Shift decoder_coordinates right by 1 to prevent data leakage.
 
-        Problem: tgt_coords[t] is the position AFTER executing target_tokens[t],
+        Problem: relative_tgt_coords[t] is the position AFTER executing target_tokens[t],
         which is aligned with labels[t]. During autoregressive decoding at position t,
         the model should not see the coordinate resulting from labels[t] — that would
         leak the answer (coords[t] - coords[t-1] directly reveals labels[t]).
@@ -1077,31 +1074,22 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         Solution: Shift right so that decoder_coordinates[t] = position BEFORE
         predicting labels[t], i.e., the position after all previously decoded tokens.
 
+        Since coordinates are relative to driver, the starting position is (0, 0, 0).
+
         Before shift (data leakage):
-            target_tokens:      T2,     <PUSH>, D30000, D3000, ...
-            tgt_coords:         [A],    [B],    [C],    [D],   ...
-            decoder_input:      <pad>,  T2,     <PUSH>, D30000, ...
             decoder_coordinates:[A],    [B],    [C],    [D],   ...  ← coords[t] leaks labels[t]
 
         After shift (correct):
-            decoder_input:      <pad>,  T2,     <PUSH>, D30000, ...
-            decoder_coordinates:[drv],  [A],    [B],    [C],   ...  ← coords[t] = current position
+            decoder_coordinates:[0,0,0],[A],    [B],    [C],   ...  ← coords[t] = current position
         """
-        # Work in FP32 to prevent overflow (chip coords can be >65504, FP16 max)
-        # Extract driver starting position from encoder_abs_positions
-        # Source format: "<BOS> <DRIVER> ..." → driver is at index 1
-        if encoder_abs_positions is not None:
-            driver_pos = encoder_abs_positions[:, 1:2, :].float()  # (batch, 1, 3)
-        else:
-            driver_pos = torch.zeros(
-                decoder_coordinates.shape[0], 1, 3,
-                dtype=torch.float32, device=decoder_coordinates.device
-            )
-
-
-        # Shift right: prepend driver starting position, drop last coordinate
-        # Keep in FP32 — downstream LARA modules call .float() internally
-        shifted = torch.cat([driver_pos, decoder_coordinates[:, :-1, :].float()], dim=1)
+        # Prepend (0,0,0) as driver position in relative space, drop last coordinate
+        batch_size = decoder_coordinates.shape[0]
+        zero_start = torch.zeros(
+            batch_size, 1, 3,
+            dtype=decoder_coordinates.dtype,
+            device=decoder_coordinates.device,
+        )
+        shifted = torch.cat([zero_start, decoder_coordinates[:, :-1, :]], dim=1)
         return shifted
 
     def _apply_coordinate_noise(
@@ -1216,70 +1204,40 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        # Geometry-Aware Position Embedding inputs (Recommended)
-        encoder_abs_positions: Optional[torch.Tensor] = None,
+        # Coordinate inputs (pre-scaled FP16 from data collator)
         encoder_rel_positions: Optional[torch.Tensor] = None,
         decoder_coordinates: Optional[torch.Tensor] = None,
-        # Legacy input (for backward compatibility with simple Fourier PE)
+        # Legacy parameters (kept for interface compat, not actively used)
+        encoder_abs_positions: Optional[torch.Tensor] = None,
         encoder_coordinates: Optional[torch.Tensor] = None,
         # Accept additional kwargs for compatibility with newer transformers versions
-        # (e.g., cache_position added in transformers >= 4.43.0)
         **kwargs,
     ) -> Union[Tuple[torch.Tensor], Seq2SeqLMOutput]:
         """
-        Forward pass with geometry-aware position embeddings.
+        Forward pass with geometry-aware attention.
 
-        This extends the base T5Gemma forward pass by:
-        1. Computing token embeddings from input_ids
-        2. Adding position embeddings based on coordinates:
-           - Geometry-Aware PE: Uses abs_positions + rel_positions
-           - Simple Fourier PE: Uses encoder_coordinates only
-        3. Passing enhanced embeddings to encoder/decoder
+        Coordinate handling:
+        - Encoder self-attn: RoPE only (no GeoPE)
+        - Decoder self-attn: RoPE + GeoPE (using decoder_coordinates / relative_tgt_coords)
+        - Cross-attn: GeoPE (encoder=encoder_rel_positions / src_rel_pos,
+                             decoder=decoder_coordinates / relative_tgt_coords)
 
-        Position Embedding Design (Geometry-Aware PE):
-        ┌─────────────────────────────────────────────────────────────────────┐
-        │  Token Type        │  Position Embedding                            │
-        │  ──────────────────┼──────────────────────────────────────────────  │
-        │  <DRIVER>          │  GeoPE(abs_pos, rel_pos=(0,0,0))               │
-        │  <LOAD_i>          │  GeoPE(abs_pos, rel_pos=(load - driver))       │
-        │  Other tokens      │  Zero PE (abs_pos=(0,0,0), rel_pos=(0,0,0))    │
-        └─────────────────────────────────────────────────────────────────────┘
+        All coordinates are pre-scaled FP16 from the data collator.
 
-        New Args:
-            encoder_abs_positions: Absolute 3D positions (batch, src_len, 3)
-                - <DRIVER>: driver's (x, y, m)
-                - <LOAD>: load's (x, y, m)
-                - Others: (0, 0, 0)
-            encoder_rel_positions: Relative 3D positions (batch, src_len, 3)
-                - <DRIVER>: (0, 0, 0)
-                - <LOAD>: (load - driver) = (Δx, Δy, Δm)
-                - Others: (0, 0, 0)
-            decoder_coordinates: Cumulative 3D positions for decoder (batch, tgt_len, 3)
-            encoder_coordinates: Legacy input for simple Fourier PE (batch, src_len, 3)
+        Args:
+            encoder_rel_positions: Pre-scaled relative positions (batch, src_len, 3) FP16
+            decoder_coordinates: Pre-scaled relative target positions (batch, tgt_len, 3) FP16
+            encoder_abs_positions: Legacy, unused
+            encoder_coordinates: Legacy, unused
 
         Returns:
             Seq2SeqLMOutput with loss, logits, and other outputs
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # Handle legacy encoder_coordinates input
-        # If encoder_abs_positions not provided but encoder_coordinates is,
-        # use encoder_coordinates as abs_positions (backward compatibility)
-        if encoder_abs_positions is None and encoder_coordinates is not None:
-            encoder_abs_positions = encoder_coordinates
-
         # Get token embeddings if not provided
         if inputs_embeds is None and input_ids is not None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
-
-        # Add position embeddings to encoder inputs
-        if inputs_embeds is not None:
-            inputs_embeds = self._add_encoder_geometric_embeddings(
-                inputs_embeds,
-                encoder_abs_positions,
-                encoder_rel_positions,
-                attention_mask,
-            )
 
         # Get decoder token embeddings if needed
         if decoder_inputs_embeds is None and decoder_input_ids is not None:
@@ -1293,29 +1251,17 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 decoder_attention_mask,
             )
 
-        # === KEY CHANGE: Handle encoder call with coordinates ===
-        # If encoder_outputs not cached, call encoder explicitly
+        # === Encoder call ===
+        # Encoder self-attn uses RoPE only (no GeoPE).
         encoder = self.get_encoder()
         if encoder_outputs is None:
-            if isinstance(encoder, GeoT5GemmaEncoder):
-                # GeoT5GemmaEncoder - pass coordinates for LARA
-                encoder_outputs = encoder(
-                    input_ids=None,  # Already have inputs_embeds
-                    attention_mask=attention_mask,
-                    inputs_embeds=inputs_embeds,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                    coordinates=encoder_abs_positions,  # Pass coordinates to LARA layers
-                )
-            else:
-                # Standard encoder
-                encoder_outputs = encoder(
-                    input_ids=None,
-                    attention_mask=attention_mask,
-                    inputs_embeds=inputs_embeds,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                )
+            encoder_outputs = encoder(
+                input_ids=None,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
         
         # === KEY FIX: Call decoder explicitly if using GeoT5GemmaDecoder ===
         # The base class forward doesn't pass decoder_coordinates through,
@@ -1334,11 +1280,11 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 ) 
 
             # Shift decoder_coordinates to prevent data leakage during training.
-            # tgt_coords[t] = position after target_tokens[t] (aligned with labels[t]).
+            # relative_tgt_coords[t] = position after target_tokens[t] (aligned with labels[t]).
             # After shift: decoder_coordinates[t] = position before predicting labels[t].
             if decoder_coordinates is not None and labels is not None:
                 decoder_coordinates = self._shift_decoder_coordinates(
-                    decoder_coordinates, encoder_abs_positions
+                    decoder_coordinates
                 )
 
             # Apply coordinate noise during training to bridge train-test gap.
@@ -1370,7 +1316,7 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 decoder_coordinates=decoder_coordinates,  # Pass shifted decoder coords to LARA
-                encoder_coordinates=encoder_abs_positions,  # Pass encoder coords for cross-LARA
+                encoder_coordinates=encoder_rel_positions,  # Pass encoder rel coords for cross-LARA
             )
  
             # Compute logits and loss
@@ -1456,9 +1402,8 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                         and update coordinates incrementally
 
         Coordinate inputs handled:
-        - encoder_abs_positions: Absolute positions for encoder (static)
-        - encoder_rel_positions: Relative positions for encoder (static)
-        - decoder_coordinates: Cumulative positions for decoder (dynamic)
+        - encoder_rel_positions: Relative positions for encoder (static, pre-scaled FP16)
+        - decoder_coordinates: Relative positions for decoder (dynamic)
         - _coordinate_tracker: InferenceCoordinateTracker instance (inference only)
         """
         # Get base preparation
@@ -1475,12 +1420,8 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         )
 
         # Pass through encoder coordinate information (static during generation)
-        if "encoder_abs_positions" in kwargs:
-            model_inputs["encoder_abs_positions"] = kwargs["encoder_abs_positions"]
         if "encoder_rel_positions" in kwargs:
             model_inputs["encoder_rel_positions"] = kwargs["encoder_rel_positions"]
-        if "encoder_coordinates" in kwargs:
-            model_inputs["encoder_coordinates"] = kwargs["encoder_coordinates"]
 
         # Handle decoder coordinates
         if "decoder_coordinates" in kwargs:
@@ -1511,7 +1452,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
     def generate(
         self,
         input_ids=None,
-        encoder_abs_positions=None,
         encoder_rel_positions=None,
         driver_pos=(0, 0, 0),
         use_coordinate_tracking=True,
@@ -1522,22 +1462,13 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
 
         Args:
             input_ids: Encoder input token IDs
-            encoder_abs_positions: Encoder absolute positions
-            encoder_rel_positions: Encoder relative positions
-            driver_pos: Starting position for decoder (driver coordinate)
+            encoder_rel_positions: Encoder relative positions (pre-scaled FP16)
+            driver_pos: Starting position for decoder (relative to driver, typically (0,0,0))
             use_coordinate_tracking: Whether to use real-time coordinate tracking
             **kwargs: Additional arguments for parent generate()
 
         Returns:
             Generated token IDs
-
-        Example:
-            >>> outputs = model.generate(
-            ...     input_ids=input_ids,
-            ...     encoder_abs_positions=encoder_abs_pos,
-            ...     driver_pos=(2382120, 691600, 2),
-            ...     max_length=512,
-            ... )
         """
         # Check if LARA is enabled for decoder
         decoder = self.get_decoder()
@@ -1557,8 +1488,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             self._coordinate_tracker = None
 
         # Add encoder positions to kwargs
-        if encoder_abs_positions is not None:
-            kwargs['encoder_abs_positions'] = encoder_abs_positions
         if encoder_rel_positions is not None:
             kwargs['encoder_rel_positions'] = encoder_rel_positions
 

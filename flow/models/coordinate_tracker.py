@@ -221,8 +221,7 @@ def generate_with_coordinate_tracking(
     model,
     tokenizer,
     input_ids: torch.Tensor,
-    encoder_abs_positions: torch.Tensor,
-    encoder_rel_positions: Optional[torch.Tensor] = None,
+    encoder_rel_positions: torch.Tensor,
     driver_pos: Tuple[int, int, int] = (0, 0, 0),
     max_length: int = 512,
     **generate_kwargs
@@ -237,9 +236,8 @@ def generate_with_coordinate_tracking(
         model: GeoT5GemmaForConditionalGeneration model
         tokenizer: Tokenizer for decoding token IDs
         input_ids: Encoder input token IDs (batch, src_len)
-        encoder_abs_positions: Encoder absolute positions (batch, src_len, 3)
-        encoder_rel_positions: Encoder relative positions (batch, src_len, 3)
-        driver_pos: Starting position for decoder path
+        encoder_rel_positions: Pre-scaled encoder relative positions (batch, src_len, 3) FP16
+        driver_pos: Starting position for decoder path (relative, typically (0,0,0))
         max_length: Maximum generation length
         **generate_kwargs: Additional arguments for model.generate()
 
@@ -247,15 +245,6 @@ def generate_with_coordinate_tracking(
         Tuple of (generated_ids, decoder_coordinates)
         - generated_ids: (batch, gen_len) tensor
         - decoder_coordinates: List of (x, y, z) coordinates
-
-    Example:
-        >>> from transformers import AutoTokenizer
-        >>> tokenizer = AutoTokenizer.from_pretrained(...)
-        >>> model = GeoT5GemmaForConditionalGeneration(...)
-        >>> driver_pos = (2382120, 691600, 2)
-        >>> generated_ids, coords = generate_with_coordinate_tracking(
-        ...     model, tokenizer, input_ids, encoder_abs_pos, driver_pos=driver_pos
-        ... )
     """
     device = input_ids.device
     batch_size = input_ids.shape[0]
@@ -264,19 +253,10 @@ def generate_with_coordinate_tracking(
     tracker = InferenceCoordinateTracker(driver_pos=driver_pos)
 
     # Prepare encoder outputs (compute once, reuse for all decoder steps)
-    # Import here to avoid circular import
-    from .geo_t5gemma import GeoT5GemmaEncoder
-
+    # Encoder self-attn uses RoPE only (no GeoPE), no coordinates needed.
     with torch.no_grad():
         encoder = model.get_encoder()
-        if isinstance(encoder, GeoT5GemmaEncoder):
-            encoder_outputs = encoder(
-                input_ids=input_ids,
-                coordinates=encoder_abs_positions,
-            )
-        else:
-            # Standard encoder
-            encoder_outputs = encoder(input_ids=input_ids)
+        encoder_outputs = encoder(input_ids=input_ids)
 
     # Initialize decoder input with BOS token
     decoder_input_ids = torch.tensor(
@@ -299,7 +279,7 @@ def generate_with_coordinate_tracking(
                 encoder_outputs=encoder_outputs,
                 decoder_input_ids=decoder_input_ids,
                 decoder_coordinates=decoder_coords,
-                encoder_abs_positions=encoder_abs_positions,
+                encoder_rel_positions=encoder_rel_positions,
             )
 
         # Get next token logits
