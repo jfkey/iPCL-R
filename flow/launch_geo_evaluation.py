@@ -54,8 +54,6 @@ def detect_geo_mode(model: GeoT5GemmaForConditionalGeneration):
     geo = model.geo_config
     has_pe = (
         geo.use_advanced_geo_pe
-        or geo.use_basic_fourier_pe
-        or geo.use_metal_layer_only_pe
     )
     has_lara = geo.use_geo_self_attn or geo.use_geo_cross_attn
     return has_pe, has_lara

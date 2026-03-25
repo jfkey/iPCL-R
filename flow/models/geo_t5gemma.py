@@ -42,7 +42,6 @@ from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput, Base
 from .position_embedding import (
     FourierPositionEmbedding,
     GeometryAwarePositionEmbedding,
-    GeometryAwarePositionEmbeddingTMP,
     GeoPEConfig,
 )
 from .geometric_attention import (
@@ -70,8 +69,7 @@ class GeoConfig:
     - Other tokens: Zero position embedding
 
     Attributes:
-        use_basic_fourier_pe: Whether to use simple Fourier Position Embedding
-        use_advanced_geo_pe: Whether to use advanced Geometry-Aware PE (overrides use_basic_fourier_pe)
+        use_advanced_geo_pe: Whether to use advanced Geometry-Aware PE
         use_geo_self_attn: Whether to use LARA geometric attention
         coord_scale: Scaling factor for coordinates (chip coords are large)
         num_frequencies: Number of frequency bands for Fourier embedding
@@ -93,12 +91,9 @@ class GeoConfig:
     """
 
     # General settings
-    use_basic_fourier_pe: bool = False  # Simple 3D Fourier (deprecated)
     use_advanced_geo_pe: bool = True  # Advanced Geometry-Aware PE (recommended)
-    use_metal_layer_only_pe: bool = False  # Only Metal Layer PE (for testing metal layer effects)
     use_geo_self_attn: bool = False  # Enable LARA for decoder self-attention
     use_geo_cross_attn: bool = False  # Enable LARA for cross-attention
-    enable_encoder_lara: bool = False  # Enable LARA for encoder (usually not recommended)
     coord_scale: float = 1e-5  # Smaller scale for large chip coordinates (x, y axes)
     coord_scale_z: float = 0.3  # Scale for z-axis (metal layer, range 0-20)
 
@@ -133,23 +128,13 @@ class GeoConfig:
     coord_noise_warmup_steps: int = 5000    # Ramp noise from 0 to max_ratio over this many steps
     coord_noise_cumulative: bool = True     # Use cumulative noise (simulates inference error drift)
 
-    # Vector Quantization settings (Information Bottleneck)
-    use_vq: bool = False  # Whether to apply VQ to position embeddings
-    vq_codebook_size: int = 256  # Number of codebook entries (K), info: log2(K) bits
-    vq_commitment_cost: float = 0.25  # β for commitment loss
-    vq_ema_decay: float = 0.99  # EMA decay for codebook updates
-    vq_dead_code_threshold: int = 2  # Usage threshold for dead code revival
-
     @classmethod
     def disabled(cls) -> "GeoConfig":
         """Create GeoConfig with all features disabled (pure baseline)."""
         return cls(
-            use_basic_fourier_pe=False,
             use_advanced_geo_pe=False,
-            use_metal_layer_only_pe=False,
             use_geo_self_attn=False,
             use_geo_cross_attn=False,
-            enable_encoder_lara=False,
         )
 
     @classmethod
@@ -916,18 +901,9 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         # Initialize base model
         super().__init__(config)
 
-        # Replace encoder/decoder with Geo versions if LARA is enabled.
+        # Replace decoder with Geo version if LARA is enabled.
         # GeoT5GemmaDecoder is needed when EITHER self-attn OR cross-attn uses LARA.
         if self.geo_config.use_geo_self_attn or self.geo_config.use_geo_cross_attn:
-            # Encoder: only replace if explicitly enabled
-            # (by default we don't use LARA in encoder due to sparse coordinates)
-            enable_encoder_lara = config.geometric_config.get('enable_encoder_lara', False)
-            if enable_encoder_lara:
-                self.model.encoder = GeoT5GemmaEncoder(config)
-                # Initialize new encoder modules with T5Gemma weight init strategy
-                # (super().__init__ already called post_init, so new modules aren't covered)
-                self.model.encoder.apply(self._init_weights)
-
             # Decoder: replace whenever any decoder LARA variant is enabled
             self.model.decoder = GeoT5GemmaDecoder(config)
             # Initialize new decoder modules with T5Gemma weight init strategy.
@@ -962,66 +938,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 max_sequence_length=self.geo_config.max_sequence_length,
             )
 
-        # Option 1.5: Metal Layer Only Position Embedding (For Testing)
-        # Only uses Metal Layer encoding to test its isolated effect
-        elif self.geo_config.use_metal_layer_only_pe:
-            geope_config = self.geo_config.to_geope_config(config.hidden_size)
-            self.encoder_geo_pe = GeometryAwarePositionEmbeddingTMP(geope_config)
-            # Decoder uses simple Fourier since it only has cumulative positions
-            self.decoder_fourier_pe = FourierPositionEmbedding(
-                hidden_size=config.hidden_size,
-                num_frequencies=self.geo_config.num_frequencies,
-                max_wavelength=self.geo_config.max_wavelength,
-                min_wavelength=self.geo_config.min_wavelength,
-                coord_scale=self.geo_config.coord_scale,
-                learnable_coefficients=self.geo_config.learnable_fourier_coefficients,
-                separate_basis=self.geo_config.separate_sin_cos_basis,
-                floor_freq_ratio=self.geo_config.floor_freq_ratio,
-                max_sequence_length=self.geo_config.max_sequence_length,
-            )
-
-        # Option 2: Simple Fourier Position Embedding (Alternative)
-        elif self.geo_config.use_basic_fourier_pe:
-            self.encoder_fourier_pe = FourierPositionEmbedding(
-                hidden_size=config.hidden_size,
-                num_frequencies=self.geo_config.num_frequencies,
-                max_wavelength=self.geo_config.max_wavelength,
-                min_wavelength=self.geo_config.min_wavelength,
-                coord_scale=self.geo_config.coord_scale,
-                learnable_coefficients=self.geo_config.learnable_fourier_coefficients,
-                separate_basis=self.geo_config.separate_sin_cos_basis,
-                floor_freq_ratio=self.geo_config.floor_freq_ratio,
-                max_sequence_length=self.geo_config.max_sequence_length,
-            )
-            self.decoder_fourier_pe = FourierPositionEmbedding(
-                hidden_size=config.hidden_size,
-                num_frequencies=self.geo_config.num_frequencies,
-                max_wavelength=self.geo_config.max_wavelength,
-                min_wavelength=self.geo_config.min_wavelength,
-                coord_scale=self.geo_config.coord_scale,
-                learnable_coefficients=self.geo_config.learnable_fourier_coefficients,
-                separate_basis=self.geo_config.separate_sin_cos_basis,
-                floor_freq_ratio=self.geo_config.floor_freq_ratio,
-                max_sequence_length=self.geo_config.max_sequence_length,
-            )
-
-        # Vector Quantization module (information bottleneck for PE)
-        self.encoder_pe_vq = None
-        if self.geo_config.use_vq and (
-            self.encoder_geo_pe is not None or self.encoder_fourier_pe is not None
-        ):
-            from .vq import VectorQuantizer
-            self.encoder_pe_vq = VectorQuantizer(
-                hidden_size=config.hidden_size,
-                codebook_size=self.geo_config.vq_codebook_size,
-                commitment_cost=self.geo_config.vq_commitment_cost,
-                ema_decay=self.geo_config.vq_ema_decay,
-                dead_code_threshold=self.geo_config.vq_dead_code_threshold,
-            )
-
-        # Initialize VQ loss accumulator
-        self._vq_loss = None
-
         # Coordinate noise step counter for warmup scheduling.
         # Uses register_buffer so it persists across checkpoints and device moves.
         self.register_buffer(
@@ -1039,7 +955,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             self.decoder_geo_pe,
             self.encoder_fourier_pe,
             self.decoder_fourier_pe,
-            self.encoder_pe_vq,
         ]:
             if module is not None:
                 module.apply(self._init_weights)
@@ -1101,11 +1016,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             ).unsqueeze(-1).to(geo_embeds.dtype)  # (B, T, 1)
             geo_embeds = geo_embeds * has_coords
 
-            # Apply VQ if enabled (information bottleneck)
-            if self.encoder_pe_vq is not None:
-                geo_embeds, vq_loss, _ = self.encoder_pe_vq(geo_embeds, attention_mask)
-                self._vq_loss = vq_loss  # Store for adding to main loss
-
             return inputs_embeds + geo_embeds
 
         # Case 2: Simple Fourier Position Embedding
@@ -1119,11 +1029,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             # Mask out geo PE for tokens without real coordinates
             has_coords = (abs_positions.abs().sum(dim=-1) > 0).unsqueeze(-1).to(geo_embeds.dtype)
             geo_embeds = geo_embeds * has_coords
-
-            # Apply VQ if enabled (information bottleneck)
-            if self.encoder_pe_vq is not None:
-                geo_embeds, vq_loss, _ = self.encoder_pe_vq(geo_embeds, attention_mask)
-                self._vq_loss = vq_loss  # Store for adding to main loss
 
             return inputs_embeds + geo_embeds
 
@@ -1487,11 +1392,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 # logits to FP32 before computing cross-entropy for numerical stability.
                 loss = self.loss_function(lm_logits, labels, self.config.vocab_size, **kwargs )
 
-                # Add VQ loss if applicable
-                if self._vq_loss is not None:
-                    loss = loss + self._vq_loss
-                    self._vq_loss = None  # Reset
-
             if not return_dict:
                 output = (lm_logits,) + decoder_outputs[1:]
                 return ((loss,) + output) if loss is not None else output
@@ -1528,17 +1428,6 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             return_dict=return_dict,
             **kwargs,  # Pass through additional args like cache_position
         )
-
-        # Add VQ loss if applicable
-        if self._vq_loss is not None:
-            if return_dict and output.loss is not None:
-                # Modify the dataclass output
-                output.loss = output.loss + self._vq_loss
-            elif not return_dict and isinstance(output, tuple) and len(output) > 0:
-                # Modify tuple output (loss is first element if present)
-                if isinstance(output[0], torch.Tensor) and output[0].dim() == 0:
-                    output = (output[0] + self._vq_loss,) + output[1:]
-            self._vq_loss = None  # Reset
 
         return output
 

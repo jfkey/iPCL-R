@@ -215,18 +215,14 @@ class GeometricEmbeddingConfig:
     - Other tokens: Zero position embedding
 
     LARA (Lie Algebra Relative Attention) Configuration:
-    - Encoder: Standard Attention (enable_encoder_lara=False, default)
     - Decoder Self-Attention: LARA (use_geo_self_attn=True)
     - Cross-Attention: LARA (use_geo_cross_attn=True)
     """
 
     # Enable flags
-    use_basic_fourier_pe: bool = False  # Simple 3D Fourier PE (deprecated)
     use_advanced_geo_pe: bool = True  # Advanced Geometry-Aware PE (recommended)
-    use_metal_layer_only_pe: bool = False  # Metal Layer Only PE (for ablation study)
     use_geo_self_attn: bool = False  # LARA for Decoder Self-Attention
     use_geo_cross_attn: bool = False  # LARA for Cross-Attention
-    enable_encoder_lara: bool = False  # LARA for Encoder (usually not recommended)
 
     # Coordinate scaling
     coord_scale: float = 1e-5  # Scale for large chip coordinates (x, y axes)
@@ -255,13 +251,6 @@ class GeometricEmbeddingConfig:
     use_value_rotation: bool = True         # Value rotation for cross-attention
     bias_num_freqs: int = 16               # Fourier frequency bands for factorized geo bias
     bias_rank_per_head: int = 8            # Rank per head for factorized geo bias
-
-    # Vector Quantization (VQ) parameters
-    use_vq: bool = False  # Enable Vector Quantization
-    vq_codebook_size: int = 1024  # Size of VQ codebook
-    vq_commitment_cost: float = 0.25  # Commitment cost for VQ
-    vq_ema_decay: float = 0.99  # EMA decay rate for VQ codebook updates
-    vq_dead_code_threshold: int = 2  # Usage threshold for dead code revival
 
     # Coordinate Noise Injection (bridges train-test gap for LARA)
     # During training, decoder coords are perfect (from GT); during inference, they

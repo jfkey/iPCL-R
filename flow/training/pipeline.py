@@ -114,11 +114,8 @@ class TrainingPipeline:
         geo_cfg = getattr(self.model_config, 'geometric_config', None)
         use_geo = geo_cfg is not None and (
             getattr(geo_cfg, 'use_advanced_geo_pe', False) or
-            getattr(geo_cfg, 'use_basic_fourier_pe', False) or
-            getattr(geo_cfg, 'use_metal_layer_only_pe', False) or
             getattr(geo_cfg, 'use_geo_self_attn', False) or
-            getattr(geo_cfg, 'use_geo_cross_attn', False) or
-            getattr(geo_cfg, 'enable_encoder_lara', False)
+            getattr(geo_cfg, 'use_geo_cross_attn', False)
         )
         split_dataset_dir = Path(self.paths_config.split_dataset_dir)
 
@@ -366,10 +363,8 @@ class TrainingPipeline:
             geo_config = self.model_config.geometric_config
             geo_config_dict = GeoConfig(
                 use_advanced_geo_pe=getattr(geo_config, 'use_advanced_geo_pe', False),
-                use_basic_fourier_pe=getattr(geo_config, 'use_basic_fourier_pe', False),
                 use_geo_self_attn=getattr(geo_config, 'use_geo_self_attn', False),
                 use_geo_cross_attn=getattr(geo_config, 'use_geo_cross_attn', False),
-                enable_encoder_lara=getattr(geo_config, 'enable_encoder_lara', False),
                 coord_scale=getattr(geo_config, 'coord_scale', 1e-5),
                 coord_scale_z=getattr(geo_config, 'coord_scale_z', 0.3),
                 num_frequencies=getattr(geo_config, 'num_frequencies', 32),
@@ -388,12 +383,6 @@ class TrainingPipeline:
                 use_value_rotation=getattr(geo_config, 'use_value_rotation', True),
                 bias_num_freqs=getattr(geo_config, 'bias_num_freqs', 16),
                 bias_rank_per_head=getattr(geo_config, 'bias_rank_per_head', 8),
-                use_vq=getattr(geo_config, 'use_vq', False),
-                vq_codebook_size=getattr(geo_config, 'vq_codebook_size', 1024),
-                vq_commitment_cost=getattr(geo_config, 'vq_commitment_cost', 0.25),
-                vq_ema_decay=getattr(geo_config, 'vq_ema_decay', 0.99),
-                vq_dead_code_threshold=getattr(geo_config, 'vq_dead_code_threshold', 2),
-                use_metal_layer_only_pe=getattr(geo_config, 'use_metal_layer_only_pe', False),
                 coord_noise_enabled=getattr(geo_config, 'coord_noise_enabled', False),
                 coord_noise_std_xy=getattr(geo_config, 'coord_noise_std_xy', 500.0),
                 coord_noise_std_z=getattr(geo_config, 'coord_noise_std_z', 1.0),
@@ -410,16 +399,10 @@ class TrainingPipeline:
         active_features = []
         if geo_config_dict.use_advanced_geo_pe:
             active_features.append("Geometry-Aware PE")
-        elif geo_config_dict.use_metal_layer_only_pe:
-            active_features.append("Metal-Layer-Only PE")
-        elif geo_config_dict.use_basic_fourier_pe:
-            active_features.append("Basic Fourier PE")
         if geo_config_dict.use_geo_self_attn:
             active_features.append("LARA Self-Attn")
         if geo_config_dict.use_geo_cross_attn:
             active_features.append("LARA Cross-Attn")
-        if geo_config_dict.enable_encoder_lara:
-            active_features.append("Encoder LARA")
         if geo_config_dict.coord_noise_enabled:
             active_features.append("Coord Noise")
 
@@ -446,11 +429,8 @@ class TrainingPipeline:
         geo_cfg = getattr(self.model_config, 'geometric_config', None)
         use_geo = geo_cfg is not None and (
             getattr(geo_cfg, 'use_advanced_geo_pe', False) or
-            getattr(geo_cfg, 'use_basic_fourier_pe', False) or
-            getattr(geo_cfg, 'use_metal_layer_only_pe', False) or
             getattr(geo_cfg, 'use_geo_self_attn', False) or
-            getattr(geo_cfg, 'use_geo_cross_attn', False) or
-            getattr(geo_cfg, 'enable_encoder_lara', False)
+            getattr(geo_cfg, 'use_geo_cross_attn', False)
         )
 
         args = Seq2SeqTrainingArguments(
@@ -612,11 +592,8 @@ class TrainingPipeline:
         geo_cfg = getattr(self.model_config, 'geometric_config', None)
         use_geo = geo_cfg is not None and (
             getattr(geo_cfg, 'use_advanced_geo_pe', False) or
-            getattr(geo_cfg, 'use_basic_fourier_pe', False) or
-            getattr(geo_cfg, 'use_metal_layer_only_pe', False) or
             getattr(geo_cfg, 'use_geo_self_attn', False) or
-            getattr(geo_cfg, 'use_geo_cross_attn', False) or
-            getattr(geo_cfg, 'enable_encoder_lara', False)
+            getattr(geo_cfg, 'use_geo_cross_attn', False)
         )
 
         # Initialize data collator (Geo-aware or standard)
