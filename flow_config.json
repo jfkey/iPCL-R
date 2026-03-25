@@ -24,7 +24,7 @@
             "save_metadata": true
         },
         "performance": {
-            "num_workers": 16,
+            "num_workers": 32,
             "batch_size": 1000
         },
         "advanced": {
@@ -38,7 +38,7 @@
     },
     "training": {
         "paths": {
-            "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_training/split_dataset",
+            "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_training/split_dataset_geo",
             "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_training/recheck_baseline",
             "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_training/recheck_baseline/logs"
         },
@@ -54,10 +54,10 @@
             "dropout_rate": 0.1,
             "geometric_config": {
                 "use_advanced_geo_pe": false,
-                "use_geo_self_attn": false,
-                "use_geo_cross_attn": false,
+                "use_geo_self_attn": true,
+                "use_geo_cross_attn": true,
                 "coord_scale": 1e-3,
-                "coord_scale_z": 0.3, 
+                "coord_scale_z": 2.0, 
                 "num_frequencies": 32,
                 "num_harmonics": 8,
                 "max_wavelength": 10000.0,
@@ -90,12 +90,12 @@
             "num_train_epochs": 40,
             "batch_size_per_device": 148,
             "gradient_accumulation_steps": 1,
-            "learning_rate": 2e-4,
-            "weight_decay": 0.01,
-            "warmup_ratio": 0.1,
-            "max_grad_norm": 5.0,
-            "optimizer_type": "adamw",
-            "scheduler_type": "cosine",
+            "learning_rate": 1e-4,
+            "weight_decay": 0.005,
+            "warmup_ratio": 0.05,
+            "max_grad_norm": 1.0,
+            "optimizer_type": "adafactor",
+            "scheduler_type": "adafactor",
             "eval_strategy": "epoch",
             "save_strategy": "epoch",
             "early_stopping_patience": 3,

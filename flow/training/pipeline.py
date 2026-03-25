@@ -592,8 +592,8 @@ class TrainingPipeline:
         if use_geo:
             data_collator = GeoDataCollatorForSeq2Seq(
                 tokenizer, model, pad_to_multiple_of=8, padding=True,
-                coord_scale=getattr(geo_cfg, 'coord_scale', 1e-6),
-                coord_scale_z=getattr(geo_cfg, 'coord_scale_z', 0.3),
+                coord_scale=getattr(geo_cfg, 'coord_scale', 1e-3),
+                coord_scale_z=getattr(geo_cfg, 'coord_scale_z', 1.0),
             )
             logging.info("Using GeoDataCollatorForSeq2Seq for coordinate handling")
         else:

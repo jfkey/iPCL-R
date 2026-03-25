@@ -119,7 +119,7 @@ class GeometricPositionEmbedding(nn.Module):
         hidden_size: int = 256,
         num_heads: int = 4,
         head_dim: int = 63,  # Must be divisible by 3
-        base: float = 32.0,
+        base: float = 128.0,
         coord_scale: float = 1e-4,   # kept for interface compat, unused (scaling in collator)
         coord_scale_z: float = 0.3,  # kept for interface compat, unused
     ):
