@@ -1117,11 +1117,16 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         Warmup schedule: noise probability ramps linearly from 0 to max_ratio
         over coord_noise_warmup_steps, so early training is stable.
 
+        Note: coord_noise_std_xy/z must be in SCALED coordinate space (i.e. after
+        coord_scale is applied by the data collator). E.g. if raw coords are O(10000)
+        and coord_scale=1e-3, use std_xy=5.0, not 5000.
+
         Args:
-            decoder_coordinates: Shifted coordinates (batch, seq_len, 3) in FP32
+            decoder_coordinates: Shifted coordinates (batch, seq_len, 3) in FP16.
+                After _shift_decoder_coordinates, position 0 is (0,0,0).
 
         Returns:
-            Noised coordinates (same shape and dtype)
+            Noised coordinates (same shape and dtype as input)
         """
         if not self.training or not self.geo_config.coord_noise_enabled:
             return decoder_coordinates
@@ -1140,47 +1145,52 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         if noise_ratio <= 0:
             return decoder_coordinates
 
+        orig_dtype = decoder_coordinates.dtype
         batch_size, seq_len, _ = decoder_coordinates.shape
         device = decoder_coordinates.device
 
-        # Per-position mask: each position independently decides whether to be noised
-        noise_mask = (
-            torch.rand(batch_size, seq_len, 1, device=device) < noise_ratio
-        ).float()
-
-        # Build per-axis noise scale: [std_xy, std_xy, std_z]
+        # Build per-axis noise scale in FP16: [std_xy, std_xy, std_z]
+        # These values must already be in scaled coordinate space.
         noise_scale = torch.tensor(
             [self.geo_config.coord_noise_std_xy,
              self.geo_config.coord_noise_std_xy,
              self.geo_config.coord_noise_std_z],
-            device=device, dtype=torch.float32,
+            device=device, dtype=orig_dtype,
         )
 
         if self.geo_config.coord_noise_cumulative:
+            # Per-sample mask: entire sequence is either noised or not.
+            # This matches inference behavior where every position has
+            # accumulated prediction error — no position is selectively clean.
+            sample_mask = (
+                torch.rand(batch_size, 1, 1, device=device) < noise_ratio
+            ).to(orig_dtype)
+
             # Cumulative noise: small per-step perturbations that drift over time.
-            # This better simulates inference error accumulation where each wrong
-            # prediction adds a persistent offset to all subsequent coordinates.
-            #
             # step_noise[t] ~ N(0, scale/sqrt(seq_len))  per step
             # cumulative[t] = sum(step_noise[0:t])
             # E[||cumulative[t]||] ~ scale * sqrt(t/seq_len)
-            #
             # At t=seq_len: E[||noise||] ~ scale (matches configured std)
-            # At t=1: E[||noise||] ~ scale/sqrt(seq_len) (small, just started)
             per_step_scale = noise_scale / max(seq_len, 1) ** 0.5
             step_noise = torch.randn(
-                batch_size, seq_len, 3, device=device, dtype=torch.float32
+                batch_size, seq_len, 3, device=device, dtype=orig_dtype
             ) * per_step_scale
-            # Position 0 (driver position) should stay clean — zero out its noise
+            # Position 0 is (0,0,0) after shift — keep it clean as the
+            # known starting point for relative coordinate accumulation.
             step_noise[:, 0, :] = 0.0
             cumulative_noise = torch.cumsum(step_noise, dim=1)
-            noised = decoder_coordinates + cumulative_noise * noise_mask
+            noised = decoder_coordinates + cumulative_noise * sample_mask
         else:
+            # Per-position mask for uniform mode (no cumulative discontinuity issue)
+            noise_mask = (
+                torch.rand(batch_size, seq_len, 1, device=device) < noise_ratio
+            ).to(orig_dtype)
+
             # Uniform noise: independent Gaussian at each position
             noise = torch.randn(
-                batch_size, seq_len, 3, device=device, dtype=torch.float32
+                batch_size, seq_len, 3, device=device, dtype=orig_dtype
             ) * noise_scale
-            # Keep position 0 (driver position) clean
+            # Position 0 is (0,0,0) after shift — keep it clean
             noise[:, 0, :] = 0.0
             noised = decoder_coordinates + noise * noise_mask
 
