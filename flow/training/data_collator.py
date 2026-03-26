@@ -54,13 +54,13 @@ class GeoDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         label_pad_token_id: Token ID to pad labels with (-100 for loss ignore)
         return_tensors: Output tensor type ('pt' for PyTorch)
         coord_pad_value: Value to pad coordinates with (default 0)
-        coord_scale: Scaling factor for x,y axes (default 1e-6)
-        coord_scale_z: Scaling factor for z axis / metal layer (default 0.3)
+        coord_scale: Scaling factor for x,y axes (default 1e-3)
+        coord_scale_z: Scaling factor for z axis / metal layer (default 1.0)
     """
 
     coord_pad_value: int = 0
-    coord_scale: float = 1e-6
-    coord_scale_z: float = 0.3
+    coord_scale: float = 1e-3
+    coord_scale_z: float = 1.0
 
     def __call__(self, features: List[Dict[str, Any]], return_tensors=None) -> Dict[str, Any]:
         # Extract coordinate fields before parent collator (it doesn't know them)

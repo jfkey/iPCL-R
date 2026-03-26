@@ -1440,11 +1440,18 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
                 self._coordinate_tracker.update(last_token_str)
                 self._last_decoder_length = decoder_input_ids.shape[1]
 
-            # Get current coordinates from tracker
+            # Get current coordinates from tracker (raw integers, relative to driver)
             decoder_coords = self._coordinate_tracker.get_batch_coords_tensor(
                 batch_size=decoder_input_ids.shape[0],
                 device=decoder_input_ids.device
             )
+            # Scale to match training-time collator: coord_scale for x,y; coord_scale_z for z
+            # Then convert to FP16 (model was trained with pre-scaled FP16 from GeoDataCollatorForSeq2Seq)
+            decoder_coords = decoder_coords.float()
+            decoder_coords[:, :, 0] *= self.geo_config.coord_scale
+            decoder_coords[:, :, 1] *= self.geo_config.coord_scale
+            decoder_coords[:, :, 2] *= self.geo_config.coord_scale_z
+            decoder_coords = decoder_coords.half()
             model_inputs["decoder_coordinates"] = decoder_coords
 
         return model_inputs

@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass, field, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # =============================================================================
 #                              DATASET CONFIGURATION
@@ -460,6 +460,7 @@ class EvaluationStageConfig:
     metrics: EvaluationMetrics = field(default_factory=EvaluationMetrics)
     performance: EvaluationPerformance = field(default_factory=EvaluationPerformance)
     output: EvaluationOutput = field(default_factory=EvaluationOutput)
+    eval_designs: Optional[List[str]] = None  # None = all designs; list = filter to these
     log_level: str = "INFO"
 
     def _dataclass_to_dict(self, obj: Any) -> Any:
@@ -506,6 +507,7 @@ class EvaluationStageConfig:
                 metrics=metrics,
                 performance=performance,
                 output=output,
+                eval_designs=config_dict.get("eval_designs", None),
                 log_level=config_dict.get("log_level", "INFO"),
             )
         except Exception as e:
