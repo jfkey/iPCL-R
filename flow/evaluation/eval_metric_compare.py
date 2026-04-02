@@ -17,6 +17,18 @@ Usage:
              ourwo_v=/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_wope_wo_v/metrics/evaluation_metrics.csv \
         --output /mnt/local_data1/liujunfeng/exp/Large-GeoPE/eval_compare.csv
 
+        
+        python -m flow.evaluation.eval_metric_compare \
+        --csv  baselineMedium=/mnt/local_data1/liweiguo/experiments/model_size_comparison/work_dir/Medium-DecimalWordLevel/stage_evaluation/metrics/evaluation_metrics.csv \
+             baselineLarge=/mnt/local_data1/liweiguo/experiments/model_size_comparison/work_dir/Large-DecimalWordLevel/stage_evaluation/metrics/evaluation_metrics.csv \
+             newBaseline=/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/check_baseline_from40/metrics/evaluation_metrics.csv \
+             newslefcross=/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/recheck_geope_cross_epoch_80/metrics/evaluation_metrics.csv \
+             newslefcrossnoise=/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/recheck_geope_cross_noise_epoch_80/metrics/evaluation_metrics.csv \
+             newslefcross2=/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/recheck_geope_cross_epoch_96/metrics/evaluation_metrics.csv \
+             newslefcrossnoise2=/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/recheck_geope_cross_noise_epoch_96/metrics/evaluation_metrics.csv \
+             
+             
+             
     # Or use glob pattern:
     python -m flow.evaluation.eval_metric_compare \
         --glob "/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/*/metrics/evaluation_metrics.csv" \

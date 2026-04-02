@@ -302,17 +302,16 @@ class GeoT5GemmaEncoder(T5GemmaEncoder):
             padding_idx=self._full_config.pad_token_id,
         )
 
-        # Create custom encoder layers with optional LARA support
+        # Create custom encoder layers — encoder self-attn uses RoPE only (no GeoPE/LARA).
+        # GeoPE rotation is reserved for decoder self-attention.
         geo_config_dict = getattr(self._full_config, 'geometric_config', {})
-        enable_geo_attn = geo_config_dict.get('use_geo_self_attn', False)
 
-        # Pass encoder_config to layers (not the full config)
         self.layers = nn.ModuleList([
             GeoT5GemmaEncoderLayer(
-                encoder_config,  # Pass encoder_config, not full config
+                encoder_config,
                 layer_idx=layer_idx,
-                use_geo_self_attn=enable_geo_attn,
-                geo_config_dict=geo_config_dict,  # Pass geo_config_dict
+                use_geo_self_attn=False,  # Encoder: RoPE only, no GeoPE rotation
+                geo_config_dict=geo_config_dict,
             )
             for layer_idx in range(encoder_config.num_hidden_layers)
         ])
@@ -621,15 +620,23 @@ class GeoT5GemmaDecoder(T5GemmaDecoder):
         enable_geo_self_attn = geo_config_dict.get('use_geo_self_attn', False)
         enable_geo_cross_attn = geo_config_dict.get('use_geo_cross_attn', False)
 
+        # GeoPE strategy for decoder self-attention:
+        # - First N/2 layers: RoPE only (local routing precision)
+        # - Last N/2 layers: RoPE + GeoPE (global spatial navigation)
+        num_layers = decoder_config.num_hidden_layers
+        geo_self_attn_start_layer = num_layers // 2
+
         self.layers = nn.ModuleList([
             GeoT5GemmaDecoderLayer(
                 decoder_config,
                 layer_idx=layer_idx,
-                enable_geometric_self_attention=enable_geo_self_attn,
+                enable_geometric_self_attention=(
+                    enable_geo_self_attn and layer_idx >= geo_self_attn_start_layer
+                ),
                 use_geo_cross_attn=enable_geo_cross_attn,
                 geo_config_dict=geo_config_dict,
             )
-            for layer_idx in range(decoder_config.num_hidden_layers)
+            for layer_idx in range(num_layers)
         ])
 
         # Use 'norm' to match standard T5GemmaDecoder attribute name
@@ -992,22 +999,14 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
         if self.encoder_geo_pe is not None:
             if abs_positions is None or rel_positions is None:
                 return inputs_embeds
-            # GeometryAwarePositionEmbedding expects (abs_pos, rel_pos)
-            # Note: Module handles dtype internally for fp16 compatibility
             geo_embeds = self.encoder_geo_pe(
                 abs_positions,
                 rel_positions,
                 attention_mask
             )
-            # Ensure dtype matches inputs_embeds (critical for fp16 training)
             if geo_embeds.dtype != inputs_embeds.dtype:
                 geo_embeds = geo_embeds.to(inputs_embeds.dtype)
 
-            # Mask out geo PE for tokens without real coordinates.
-            # Tokens with abs_pos=(0,0,0) AND rel_pos=(0,0,0) are non-positioned
-            # (e.g., token <Drive> ). Their Fourier/embedding outputs are
-            # non-zero artifacts (cos(0)=1, direction_embed(0)≠0) that add noise.
-            # Only DRIVER/LOAD tokens with real coordinates should receive geo PE.
             has_coords = (
                 (abs_positions.abs().sum(dim=-1) > 0) |
                 (rel_positions.abs().sum(dim=-1) > 0)
