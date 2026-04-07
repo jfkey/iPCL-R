@@ -82,11 +82,20 @@ class UnifiedTokenizer:
 
         # Traditional tokenizer will be initialized later (composition, not inheritance)
         self.tokenizer = None
+        # BPE merger (only used for DecimalBPE algorithm)
+        self.bpe_merger = None
 
         # Algrithm setting
         self.use_decimal_decomposition = (
             self.workflow_config.tokenizer_algorithm
-            == TokenizationAlgorithm.DECIMAL_WORD_LEVEL.value
+            in (
+                TokenizationAlgorithm.DECIMAL_WORD_LEVEL.value,
+                TokenizationAlgorithm.DECIMAL_BPE.value,
+            )
+        )
+        self.use_decimal_bpe = (
+            self.workflow_config.tokenizer_algorithm
+            == TokenizationAlgorithm.DECIMAL_BPE.value
         )
         self.use_concatenation = (
             self.workflow_config.tokenizer_algorithm
@@ -156,6 +165,11 @@ class UnifiedTokenizer:
             == TokenizationAlgorithm.DECIMAL_WORD_LEVEL.value
         ):
             self.tokenizer = self.build_word_level_tokenizer(training_texts)
+        elif (
+            self.workflow_config.tokenizer_algorithm
+            == TokenizationAlgorithm.DECIMAL_BPE.value
+        ):
+            self.tokenizer = self.build_decimal_bpe_tokenizer(training_texts)
         elif (
             self.workflow_config.tokenizer_algorithm
             == TokenizationAlgorithm.CONCAT_BPE.value
@@ -374,6 +388,10 @@ class UnifiedTokenizer:
         return " ".join(text.split())
 
     def seg_tokens(self, tokens: Union[str, List[str]]) -> Union[str, List[str]]:
+        if self.use_decimal_bpe and self.bpe_merger is not None:
+            if isinstance(tokens, str):
+                tokens = tokens.split()
+            return self.bpe_merger.expand_sequence(tokens)
         return self.token_preprocessor.segment_concatenated_tokens(tokens=tokens)
 
     def apply_token_preprocessing(self, tokens: Union[str, List[str]]) -> List[str]:
@@ -600,6 +618,11 @@ class UnifiedTokenizer:
         config_file = save_path / "unified_tokenizer.json"
         self._save_config_to_file(config_file)
 
+        # Save BPE merger if present (DecimalBPE)
+        if self.bpe_merger is not None:
+            bpe_merger_file = save_path / "bpe_merger.json"
+            self.bpe_merger.save(str(bpe_merger_file))
+
         logging.info(f"Tokenizer and config saved to {save_directory}")
 
     @classmethod
@@ -652,9 +675,20 @@ class UnifiedTokenizer:
             instance.tokenizer = PreTrainedTokenizerFast.from_pretrained(
                 str(model_path)
             )
-            return instance
         except Exception as e:
             raise ValueError(f"Failed to load tokenizer from {model_path}: {e}")
+
+        # Load BPE merger if present (DecimalBPE)
+        bpe_merger_file = model_path / "bpe_merger.json"
+        if bpe_merger_file.exists():
+            from flow.tokenization.bpe_merger import BPEMerger
+
+            instance.bpe_merger = BPEMerger.load(str(bpe_merger_file))
+            logging.info(
+                f"Loaded BPE merger with {len(instance.bpe_merger.merges)} merges"
+            )
+
+        return instance
 
     # === Helper Methods ===
     def get_special_token(self, token_name: str) -> str:
@@ -969,6 +1003,107 @@ class UnifiedTokenizer:
         hf_tokenizer.add_tokens(additional_special_tokens, special_tokens=False)
 
         return hf_tokenizer
+
+    def build_decimal_bpe_tokenizer(
+        self, training_texts: List[str]
+    ) -> PreTrainedTokenizerFast:
+        """Build DecimalBPE tokenizer: DecimalWordLevel base + BPE merges.
+
+        1. Parse training texts into DecimalWordLevel token sequences.
+        2. Learn BPE merges (special tokens act as boundaries).
+        3. Build a word-level tokenizer on the merged vocabulary.
+        """
+        from flow.tokenization.bpe_merger import BPEMerger
+
+        logging.info("Building DecimalBPE tokenizer")
+
+        special_tokens_dict = self.special_token_manager.get_special_tokens_dict()
+        special_tokens = self.special_token_manager.get_all_special_tokens()
+        special_tokens_set = set(special_tokens)
+
+        # Parse texts into token sequences
+        sequences = [text.split() for text in training_texts]
+
+        # Determine number of merges from target vocab size
+        base_vocab = set()
+        for seq in sequences:
+            base_vocab.update(seq)
+        base_vocab_size = len(base_vocab - special_tokens_set)
+        target_size = self.workflow_config.target_vocab_size
+        if target_size > 0:
+            num_merges = max(0, target_size - base_vocab_size - len(special_tokens_set))
+        else:
+            num_merges = 500
+        logging.info(
+            f"Base vocab: {base_vocab_size} tokens, "
+            f"target: {target_size}, planned merges: {num_merges}"
+        )
+
+        # Learn BPE merges (modifies sequences in-place)
+        self.bpe_merger = BPEMerger(
+            special_tokens=special_tokens_set, num_merges=num_merges
+        )
+        self.bpe_merger.learn(sequences)
+
+        # Collect final vocabulary: base tokens + ALL intermediate merged tokens.
+        # Base tokens handle edge cases near special-token boundaries.
+        # Intermediate merged tokens (e.g. R100_R80 before it gets merged further
+        # with B2 to R100_R80_B2) must exist in the vocab because they can appear
+        # as final tokens when special tokens block the next merge.
+        merged_vocab = set(base_vocab)  # start with original base vocab
+        for a, b in self.bpe_merger.merges:
+            merged_vocab.add(f"{a}{BPEMerger.MERGE_SEPARATOR}{b}")
+        for seq in sequences:
+            merged_vocab.update(seq)
+        data_tokens = sorted(merged_vocab - special_tokens_set)
+
+        # Build word-level tokenizer on merged vocabulary
+        final_vocab_map = {}
+        for idx, token in enumerate(data_tokens):
+            final_vocab_map[token] = idx
+        start_idx = len(data_tokens)
+        for idx, token in enumerate(special_tokens):
+            final_vocab_map[token] = start_idx + idx
+
+        tokenizer = Tokenizer(
+            models.WordLevel(
+                vocab=final_vocab_map, unk_token=special_tokens_dict["unk_token"]
+            )
+        )
+        tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+
+        hf_tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer,
+            bos_token=special_tokens_dict["bos_token"],
+            eos_token=special_tokens_dict["eos_token"],
+            pad_token=special_tokens_dict["pad_token"],
+            unk_token=special_tokens_dict["unk_token"],
+            model_max_length=self.workflow_config.max_sequence_length,
+        )
+
+        core_special_tokens = self.special_token_manager.get_core_special_tokens()
+        additional_special_tokens = (
+            self.special_token_manager.get_additional_special_tokens()
+        )
+        hf_tokenizer.add_tokens(core_special_tokens, special_tokens=True)
+        hf_tokenizer.add_tokens(additional_special_tokens, special_tokens=False)
+
+        logging.info(
+            f"DecimalBPE tokenizer built: {len(final_vocab_map)} tokens "
+            f"({len(data_tokens)} data + {len(special_tokens)} special)"
+        )
+        return hf_tokenizer
+
+    def merge_text(self, text: str) -> str:
+        """Apply BPE merges to a space-separated text string.
+
+        Only effective when bpe_merger is loaded (DecimalBPE mode).
+        """
+        if self.bpe_merger is None:
+            return text
+        tokens = text.split()
+        merged = self.bpe_merger.apply(tokens)
+        return " ".join(merged)
 
     def build_bpe_tokenizer(
         self, training_texts: List[str], vocab_size: int

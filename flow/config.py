@@ -81,6 +81,7 @@ class TokenizationAlgorithm(Enum):
     CONCAT_BPE = "Concat-BPE"  # Concatenated Byte Pair Encoding
     SEG_BBPE = "Seg-BBPE"  # Segmented Byte-level BPE
     CONCAT_BBPE = "Concat-BBPE"  # Concatenated Byte-level BPE
+    DECIMAL_BPE = "DecimalBPE"  # DecimalWordLevel base tokens + BPE merges
 
 
 @dataclass

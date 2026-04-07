@@ -1,3 +1,4 @@
+from .bpe_merger import BPEMerger
 from .pipeline import TokenizationPipeline
 from .tokenizer import Node, UnifiedTokenizer
 from .coordinate_utils import (
@@ -15,6 +16,7 @@ from .coordinate_utils import (
 )
 
 __all__ = [
+    "BPEMerger",
     "Node",
     "UnifiedTokenizer",
     "TokenizationPipeline",

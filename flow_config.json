@@ -13,12 +13,12 @@
     },
     "tokenization": {
         "paths": {
-            "token_dataset_dir": "/mnt/local_data1/liujunfeng/exp/universal_token_update/token_dataset",
-            "tokenizer_save_dir": "/mnt/local_data1/liujunfeng/exp/universal_token_update/tokenizer",
-            "output_metadata_path": "/mnt/local_data1/liujunfeng/exp/universal_token_update/output_metadata.json"
+            "token_dataset_dir": "/mnt/local_data1/liujunfeng/exp/token_decimal_bpe/token_dataset",
+            "tokenizer_save_dir": "/mnt/local_data1/liujunfeng/exp/token_decimal_bpe/tokenizer",
+            "output_metadata_path": "/mnt/local_data1/liujunfeng/exp/token_decimal_bpe/output_metadata.json"
         },
         "workflow": {
-            "tokenizer_algorithm": "DecimalWordLevel",
+            "tokenizer_algorithm": "DecimalBPE",
             "target_vocab_size": 1000,
             "max_sequence_length": 512,
             "save_metadata": true
@@ -38,9 +38,9 @@
     },
     "training": {
         "paths": {
-            "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_training/split_dataset_geo",
-            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_training/recheck_baseline",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_training/recheck_baseline/logs"
+            "split_dataset_dir": "/mnt/local_data1/liujunfeng/exp/Medium-BPE/stage_training/split_dataset_geo",
+            "model_save_dir": "/mnt/local_data1/liujunfeng/exp/Medium-BPE/stage_training/baseline",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-BPE/stage_training/baseline/logs"
         },
         "model": {
             "hidden_size": 512,
@@ -70,8 +70,8 @@
                 "max_layer_delta": 10,
                 "pe_dropout": 0.1,
                 "self_attn_geometric_bias": false,
-                "cross_attn_geometric_bias": false,
-                "use_value_rotation": false,
+                "cross_attn_geometric_bias": true,
+                "use_value_rotation": true,
                 "bias_num_freqs": 16,
                 "bias_rank_per_head": 8,
                 "coord_noise_enabled": false,
@@ -114,10 +114,10 @@
     },
     "evaluation": {
         "paths": {
-            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/recheck_baseline",
-            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/recheck_baseline/metrics",
-            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/recheck_baseline/plots",
-            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/recheck_baseline/logs"
+            "output_dir": "/mnt/local_data1/liujunfeng/exp/Medium-BPE/stage_evaluation/baseline",
+            "metrics_dir": "/mnt/local_data1/liujunfeng/exp/Medium-BPE/stage_evaluation/baseline/metrics",
+            "plots_dir": "/mnt/local_data1/liujunfeng/exp/Medium-BPE/stage_evaluation/baseline/plots",
+            "logging_dir": "/mnt/local_data1/liujunfeng/exp/Medium-BPE/stage_evaluation/baseline/logs"
         },
         "generation": {
             "max_new_tokens": 512,

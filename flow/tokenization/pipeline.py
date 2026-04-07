@@ -22,7 +22,7 @@ import pyarrow.compute as pc
 from datasets import Dataset, Sequence, Value
 from tqdm import tqdm
 
-from flow.config import FlowConfig
+from flow.config import FlowConfig, TokenizationAlgorithm
 from flow.utils import load_corpus_dataset
 
 from .tokenizer import UnifiedTokenizer
@@ -72,6 +72,14 @@ class TokenizationPipeline:
 
         # Step 4: Train tokenizer using existing interface
         self.train_tokenizer(corpus_dataset)
+
+        # Step 4b: For DecimalBPE, apply merges to text columns so that
+        #          print_sample_sequence and save_metadata see merged tokens.
+        if (
+            self.workflow_config.tokenizer_algorithm
+            == TokenizationAlgorithm.DECIMAL_BPE.value
+        ):
+            corpus_dataset = self._apply_bpe_to_text_columns(corpus_dataset)
 
         # Step 5: Print token sequences of first 3 training samples
         self.print_sample_sequence(corpus_dataset)
@@ -225,6 +233,36 @@ class TokenizationPipeline:
         logging.info(f"Vocabulary size: {len(tokenizer.get_vocab())}")
 
         return tokenizer
+
+    def _apply_bpe_to_text_columns(self, corpus_dataset: Dataset) -> Dataset:
+        """Apply BPE merges to source_text / target_text / text columns.
+
+        Called only for DecimalBPE so that downstream steps
+        (print_sample_sequence, save_metadata) see the merged vocabulary.
+        """
+        bpe_merger = self.unified_tokenizer.bpe_merger
+        logging.info("Applying BPE merges to text columns")
+
+        def merge_texts(batch):
+            batch["source_text"] = [
+                " ".join(bpe_merger.apply(t.split())) for t in batch["source_text"]
+            ]
+            batch["target_text"] = [
+                " ".join(bpe_merger.apply(t.split())) for t in batch["target_text"]
+            ]
+            batch["text"] = [
+                f"{s} {t}"
+                for s, t in zip(batch["source_text"], batch["target_text"])
+            ]
+            return batch
+
+        corpus_dataset = corpus_dataset.map(
+            merge_texts,
+            batched=True,
+            num_proc=self.performance_config.num_workers,
+            desc="Applying BPE merges to text columns",
+        )
+        return corpus_dataset
 
     def print_debug_sample(self, corpus_dataset: Dataset):
         """Print token sequences of first 3 training samples (source and target)"""
@@ -471,7 +509,32 @@ class TokenizationPipeline:
                     batch_tgt_coords.append(tgt_coords)
                     batch_relative_tgt_coords.append([SPECIAL_POS] * tgt_len)
 
-                # 3. Compute per-sample min/max coordinates for aggregation
+                # 3. Apply BPE merges to tokens and coordinates (DecimalBPE only)
+                if self.unified_tokenizer.use_decimal_bpe and self.unified_tokenizer.bpe_merger is not None:
+                    bpe = self.unified_tokenizer.bpe_merger
+
+                    # Merge source tokens + coordinates
+                    src_tok_list = source_tokens.split()
+                    src_tok_list, src_abs_pos, src_rel_pos = bpe.merge_with_coordinates(
+                        src_tok_list, src_abs_pos, src_rel_pos
+                    )
+                    source_tokens = " ".join(src_tok_list)
+                    # Update stored values
+                    batch_source_tokens[-1] = source_tokens
+                    batch_src_abs_pos[-1] = src_abs_pos
+                    batch_src_rel_pos[-1] = src_rel_pos
+
+                    # Merge target tokens + coordinates
+                    tgt_tok_list = target_tokens.split()
+                    tgt_tok_list, tgt_coords, rel_tgt_coords = bpe.merge_with_coordinates(
+                        tgt_tok_list, tgt_coords, rel_tgt_coords
+                    )
+                    target_tokens = " ".join(tgt_tok_list)
+                    batch_target_tokens[-1] = target_tokens
+                    batch_tgt_coords[-1] = tgt_coords
+                    batch_relative_tgt_coords[-1] = rel_tgt_coords
+
+                # 4. Compute per-sample min/max coordinates for aggregation
                 # src_abs_pos stats
                 src_xs = [p[0] for p in src_abs_pos if isinstance(p, (list, tuple)) and len(p) >= 3]
                 src_ys = [p[1] for p in src_abs_pos if isinstance(p, (list, tuple)) and len(p) >= 3]
