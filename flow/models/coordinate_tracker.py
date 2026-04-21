@@ -65,12 +65,21 @@ class InferenceCoordinateTracker:
     # Regex pattern for direction tokens: R500, U200, T2, etc.
     DIRECTION_PATTERN = re.compile(r'^([RLUDTB])(\d+)$')
 
-    def __init__(self, driver_pos: Tuple[int, int, int] = (0, 0, 0)):
+    def __init__(
+        self,
+        driver_pos: Tuple[int, int, int] = (0, 0, 0),
+        bpe_merger=None,
+    ):
         """
         Initialize tracker at driver position.
 
         Args:
             driver_pos: Starting position (x, y, z) - typically the driver coordinate
+            bpe_merger: Optional BPEMerger for DecimalBPE. When provided, merged
+                tokens like ``R200_D300`` are expanded and their cumulative delta
+                is applied in one shot — a single history entry is recorded per
+                merged token so history_coords stays 1:1 with the decoder
+                sequence.
         """
         self.current_pos = list(driver_pos)  # [x, y, z]
         self.stack = []  # Stack for <PUSH>/<POP> operations
@@ -78,6 +87,9 @@ class InferenceCoordinateTracker:
 
         # Store driver position for reference
         self.driver_pos = driver_pos
+
+        # Optional DecimalBPE merger (handles merged tokens like R200_D300)
+        self.bpe_merger = bpe_merger
 
     def reset(self, driver_pos: Tuple[int, int, int] = (0, 0, 0)):
         """Reset tracker to a new starting position."""
@@ -127,6 +139,22 @@ class InferenceCoordinateTracker:
                 self.current_pos[2] += delta[2]
             coord = tuple(self.current_pos)
 
+        elif self._is_merged_bpe_token(token_stripped):
+            # DecimalBPE merged token (e.g. "R200_D300_T2"):
+            # expand to base tokens and apply each delta cumulatively; only one
+            # coordinate (the final cumulative position) is recorded so that
+            # history_coords stays 1:1 with the generated decoder tokens.
+            for base_tok in self.bpe_merger.expand_token(token_stripped):
+                base_delta = self._parse_direction_token(base_tok)
+                if base_delta:
+                    self.current_pos[0] += base_delta[0]
+                    self.current_pos[1] += base_delta[1]
+                    self.current_pos[2] += base_delta[2]
+                # Non-direction base tokens shouldn't appear inside a merged
+                # token (special tokens are BPE boundaries), but if one slips
+                # through we treat it as a zero-delta no-op.
+            coord = tuple(self.current_pos)
+
         else:
             # Unknown/special token: inherit current position
             coord = tuple(self.current_pos)
@@ -138,6 +166,22 @@ class InferenceCoordinateTracker:
     def _is_direction_token(self, token: str) -> bool:
         """Check if token is a direction token (R500, U200, etc.)."""
         return bool(self.DIRECTION_PATTERN.match(token))
+
+    def _is_merged_bpe_token(self, token: str) -> bool:
+        """Check if token is a DecimalBPE merged token (e.g. ``R200_D300``).
+
+        A merged token must (a) contain the BPE merge separator, (b) not be a
+        special token (special tokens are BPE boundaries and never merged),
+        and (c) have a BPEMerger available to expand it.
+        """
+        if self.bpe_merger is None:
+            return False
+        sep = getattr(self.bpe_merger, "MERGE_SEPARATOR", "_")
+        if sep not in token:
+            return False
+        if token in getattr(self.bpe_merger, "special_tokens", set()):
+            return False
+        return True
 
     def _parse_direction_token(self, token: str) -> Optional[Tuple[int, int, int]]:
         """
@@ -224,6 +268,7 @@ def generate_with_coordinate_tracking(
     encoder_rel_positions: torch.Tensor,
     driver_pos: Tuple[int, int, int] = (0, 0, 0),
     max_length: int = 512,
+    bpe_merger=None,
     **generate_kwargs
 ) -> Tuple[torch.Tensor, List[Tuple[int, int, int]]]:
     """
@@ -250,7 +295,7 @@ def generate_with_coordinate_tracking(
     batch_size = input_ids.shape[0]
 
     # Initialize coordinate tracker
-    tracker = InferenceCoordinateTracker(driver_pos=driver_pos)
+    tracker = InferenceCoordinateTracker(driver_pos=driver_pos, bpe_merger=bpe_merger)
 
     # Prepare encoder outputs (compute once, reuse for all decoder steps)
     # Encoder self-attn uses RoPE only (no GeoPE), no coordinates needed.

@@ -190,7 +190,16 @@ def load_components(config: FlowConfig):
             logging.error(f"Failed to load model from {model_path}: {e}")
             raise e
 
-    return dataset, tokenizer, model
+    # DecimalBPE merger (None for other tokenizer algorithms). Needed at
+    # inference time so the LARA coordinate tracker can expand merged tokens
+    # like "R200_D300" into cumulative deltas.
+    bpe_merger = getattr(unified_tokenizer, "bpe_merger", None)
+    if bpe_merger is not None:
+        logging.info(
+            f"DecimalBPE merger loaded with {len(bpe_merger.merges)} merges"
+        )
+
+    return dataset, tokenizer, model, bpe_merger
 
 
 # =============================================================================
@@ -200,18 +209,26 @@ def load_components(config: FlowConfig):
 def _generate_with_lara(
     model, tokenizer, input_ids, attention_mask,
     encoder_rel_positions, generation_config,
+    bpe_merger=None,
 ) -> List[str]:
     """Per-sample generation with LARA coordinate tracking.
 
     LARA needs decoder coordinates updated at each step. The model's
     prepare_inputs_for_generation handles coordinate tracking and scaling
     via InferenceCoordinateTracker + geo_config scale values.
+
+    When ``bpe_merger`` is provided (DecimalBPE), merged tokens such as
+    ``R200_D300`` are expanded by the tracker so the cumulative delta is
+    applied at each step.
     """
     batch_size = input_ids.shape[0]
     predictions = []
 
     # Set tokenizer for coordinate tracking (used by prepare_inputs_for_generation)
     model._tokenizer = tokenizer
+    # Attach BPE merger (None for non-BPE algorithms) so the tracker created
+    # inside model.generate() can expand merged tokens correctly.
+    model._bpe_merger = bpe_merger
 
     for i in range(batch_size):
         with torch.no_grad():
@@ -273,7 +290,7 @@ def run_evaluation(config: FlowConfig):
 
     # Load components
     with PartialState().main_process_first():
-        dataset, tokenizer, model = load_components(config)
+        dataset, tokenizer, model, bpe_merger = load_components(config)
 
     # Detect geo mode from loaded model
     has_pe, has_lara = detect_geo_mode(model)
@@ -357,6 +374,7 @@ def run_evaluation(config: FlowConfig):
                 attention_mask=attention_mask,
                 encoder_rel_positions=batch["encoder_rel_positions"],
                 generation_config=model_generation_config,
+                bpe_merger=bpe_merger,
             )
         elif has_pe:
             # PE only: standard batch generate, but pass coordinates

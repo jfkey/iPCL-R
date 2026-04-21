@@ -13,11 +13,56 @@
 
 import argparse
 import logging
+import os
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 
-from accelerate import Accelerator
+import torch
+
+from accelerate import Accelerator, InitProcessGroupKwargs
+
+
+def _pin_process_to_local_gpu() -> None:
+    """
+    Force each distributed rank's default CUDA device to its own local GPU
+    *before* anything else allocates on cuda:0.
+
+    During `trainer.train(resume_from_checkpoint=...)`, HF Trainer calls
+    `torch.load(...)` on optimizer / scheduler / RNG state files. Those
+    tensors were serialized with their original device (often cuda:0), so
+    without an explicit map_location every rank reconstructs them on the
+    physical cuda:0 -> 16 * ~310MiB piled on GPU 0 -> OOM on resume.
+
+    Setting the current device here makes torch.load default to the current
+    device for tensors that were saved on a CUDA device, avoiding the pileup.
+    """
+    if not torch.cuda.is_available():
+        return
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+    if local_rank < torch.cuda.device_count():
+        torch.cuda.set_device(local_rank)
+
+
+def _patch_torch_load_for_resume() -> None:
+    """
+    Wrap torch.load so any call without an explicit map_location defaults to
+    CPU. This prevents every rank's checkpoint deserialization from landing
+    on physical cuda:0 (tensors were serialized with their original device,
+    usually cuda:0) during resume_from_checkpoint. Optimizer state tensors
+    are later moved to the correct GPU automatically by
+    optimizer.load_state_dict based on the parameter's device; RNG states
+    are expected to stay on CPU as ByteTensor.
+    """
+    _orig_load = torch.load
+
+    def _load(*args, **kwargs):
+        if "map_location" not in kwargs:
+            kwargs["map_location"] = "cpu"
+        return _orig_load(*args, **kwargs)
+
+    torch.load = _load
 
 from flow.config import FlowConfig
 from flow.training import TrainingPipeline
@@ -35,7 +80,17 @@ def main():
     args = parser.parse_args()
 
     try:
-        accelerator = Accelerator()
+        # Pin this rank to its GPU and make torch.load default to that GPU so
+        # resume_from_checkpoint doesn't pile every rank's checkpoint tensors
+        # onto physical cuda:0 (which caused OOM on resume).
+        _pin_process_to_local_gpu()
+        _patch_torch_load_for_resume()
+
+        # Increase NCCL timeout to 60 min for first-run dataset preprocessing
+        # (dataset.map inside main_process_first can exceed the 10 min default)
+        accelerator = Accelerator(
+            kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(minutes=60))]
+        )
         # Load FlowConfig from JSON file
         logging.info(f"🔧 Loading configuration from: {args.flow_config}")
         flow_config = FlowConfig.from_config_file(Path(args.flow_config))

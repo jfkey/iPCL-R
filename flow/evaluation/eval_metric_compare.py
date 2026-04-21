@@ -17,6 +17,10 @@ Usage:
              ourwo_v=/mnt/local_data1/liujunfeng/exp/Medium-GeoPE/stage_evaluation/model_wope_wo_v/metrics/evaluation_metrics.csv \
         --output /mnt/local_data1/liujunfeng/exp/Large-GeoPE/eval_compare.csv
 
+        python -m flow.evaluation.eval_metric_compare \
+                --csv  ourwo_v=/mnt/local_data1/liujunfeng/exp/Medium-Refine/stage_evaluation/recheck_geope_cross_noise_epoch_8/metrics/evaluation_metrics.csv \
+                    bpe=/mnt/local_data1/liujunfeng/exp/Medium-BPE/stage_evaluation/baseline_epoch_8/metrics/evaluation_metrics.csv 
+        
         
         python -m flow.evaluation.eval_metric_compare \
         --csv  baselineMedium=/mnt/local_data1/liweiguo/experiments/model_size_comparison/work_dir/Medium-DecimalWordLevel/stage_evaluation/metrics/evaluation_metrics.csv \

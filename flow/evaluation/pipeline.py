@@ -648,6 +648,7 @@ def convert_prediction_to_routing(
 
     cleaned_preds: List[str] = []
     cleaned_targets: List[str] = []
+    expanded_preds: List[str] = []
     pred_tree_seqs: List[Any] = []
 
     for preds, targets in zip(preds_list, targets_list):
@@ -661,6 +662,13 @@ def convert_prediction_to_routing(
         target_str = " ".join(target_tokens)
         cleaned_targets.append(target_str)
 
+        # Expanded predictions: for DecimalBPE, split merged tokens back to
+        # base tokens so they can be fairly compared against base-token
+        # target_tokens. For other algorithms seg_tokens is a no-op / generic
+        # segmenter, so this stays compatible.
+        expanded_tokens = unified_tokenizer.seg_tokens(pred_tokens) if pred_tokens else []
+        expanded_preds.append(" ".join(expanded_tokens))
+
         if not pred_str:
             pred_tree_seqs.append(["(0, 0, 0)"])
         else:
@@ -668,6 +676,7 @@ def convert_prediction_to_routing(
 
     batch["predictions"] = cleaned_preds
     batch["target_tokens"] = cleaned_targets
+    batch["predictions_expanded"] = expanded_preds
     batch["prediction_tree_seq"] = pred_tree_seqs
 
     return batch
@@ -712,9 +721,16 @@ def add_post_opt_metrics(
 def calculate_batch_nlp_metrics(
     batch: Dict[str, List[Any]], tokenizer
 ) -> Dict[str, List[float]]:
-    """Calculate NLP metrics for a batch."""
+    """Calculate NLP metrics for a batch.
+
+    Uses ``predictions_expanded`` (base-token granularity) so that ROUGE/BLEU/
+    exact_match are comparable against the base-token ``target_tokens``. For
+    non-BPE algorithms ``predictions_expanded`` is equivalent to ``predictions``
+    (``seg_tokens`` is a no-op / generic segmenter), so this stays backwards
+    compatible.
+    """
     batch_target_tokens = batch["target_tokens"]
-    batch_predictions = batch["predictions"]
+    batch_predictions = batch.get("predictions_expanded", batch["predictions"])
 
     if not batch_target_tokens or not batch_predictions:
         return {

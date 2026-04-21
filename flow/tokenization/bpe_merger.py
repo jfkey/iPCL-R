@@ -7,15 +7,92 @@
 @Desc    :   BPE merger that learns and applies byte-pair merges on top of
              DecimalWordLevel token sequences. Special tokens act as merge
              boundaries and are never merged.
+
+Optimized with:
+  - Token -> int mapping for faster hashing/comparison
+  - Incremental pair counting (only update affected sequences per merge step)
+  - Parallel initial pair counting via multiprocessing
 """
 
 import json
 import logging
-from collections import Counter
+import multiprocessing
+import os
+import time
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
 from flow.tokenization.coordinate_utils import parse_direction_token
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers for multiprocessing (must be top-level for pickling)
+# ---------------------------------------------------------------------------
+_BPE_SHARED_SEQS = None
+_BPE_SHARED_SPECIAL = None
+
+
+def _bpe_count_chunk(args):
+    """Count pairs and build per-pair sequence lists for a chunk."""
+    start, end = args
+    seqs = _BPE_SHARED_SEQS
+    special_ids = _BPE_SHARED_SPECIAL
+    counts = {}
+    pair_seqs = {}
+    for seq_idx in range(start, end):
+        seq = seqs[seq_idx]
+        prev = -1
+        for tok in seq:
+            if tok in special_ids:
+                prev = -1
+                continue
+            if prev >= 0:
+                pair = (prev, tok)
+                counts[pair] = counts.get(pair, 0) + 1
+                if pair in pair_seqs:
+                    pair_seqs[pair].append(seq_idx)
+                else:
+                    pair_seqs[pair] = [seq_idx]
+            prev = tok
+    return counts, pair_seqs
+
+
+def _bpe_seq_pairs(seq, special_ids):
+    """Return {pair: count} for adjacent non-special pairs in *seq*."""
+    counts = {}
+    prev = -1
+    for tok in seq:
+        if tok in special_ids:
+            prev = -1
+            continue
+        if prev >= 0:
+            pair = (prev, tok)
+            counts[pair] = counts.get(pair, 0) + 1
+        prev = tok
+    return counts
+
+
+def _bpe_apply_merge(seq, a, b, merged_id, special_ids):
+    """Apply a single merge (a,b)->merged_id to an int sequence."""
+    n = len(seq)
+    if n < 2:
+        return seq
+    new_seq = []
+    i = 0
+    while i < n:
+        if (
+            i < n - 1
+            and seq[i] == a
+            and seq[i + 1] == b
+            and a not in special_ids
+            and b not in special_ids
+        ):
+            new_seq.append(merged_id)
+            i += 2
+        else:
+            new_seq.append(seq[i])
+            i += 1
+    return new_seq
 
 
 class BPEMerger:
@@ -33,61 +110,180 @@ class BPEMerger:
         self.merges: List[Tuple[str, str]] = []
         self.token_deltas: Dict[str, Tuple[int, int, int]] = {}
 
+    # ------------------------------------------------------------------
+    # Learning
+    # ------------------------------------------------------------------
+
     def learn(self, sequences: List[List[str]]) -> None:
         """Learn BPE merge rules from token sequences.
 
-        Modifies sequences in-place by applying each merge as it is learned.
+        Optimized with int-mapped tokens, incremental pair counting,
+        and parallel initial counting.
 
-        Args:
-            sequences: List of token sequences (lists of strings).
-                       Modified in-place to contain merged tokens.
+        Modifies *sequences* in-place to contain merged tokens.
         """
         logging.info(
             f"Learning BPE merges: up to {self.num_merges} merges "
             f"from {len(sequences)} sequences"
         )
+        t0 = time.time()
 
+        # --- Step 1: Token -> int mapping ---
+        token2id: Dict[str, int] = {}
+        id2token: List[str] = []
+
+        def get_id(tok: str) -> int:
+            tid = token2id.get(tok)
+            if tid is None:
+                tid = len(id2token)
+                token2id[tok] = tid
+                id2token.append(tok)
+            return tid
+
+        special_ids = frozenset(get_id(st) for st in self.special_tokens)
+
+        # --- Step 2: Convert sequences to int lists ---
+        int_seqs: List[List[int]] = [
+            [get_id(tok) for tok in seq] for seq in sequences
+        ]
+        logging.info(
+            f"Token mapping: {len(id2token)} unique tokens ({time.time()-t0:.1f}s)"
+        )
+
+        # --- Step 3: Parallel initial pair counting + inverted index ---
+        t1 = time.time()
+        pair_counts, pair_to_seqs = self._initial_count(int_seqs, special_ids)
+        logging.info(
+            f"Initial counting: {len(pair_counts)} unique pairs "
+            f"({time.time()-t1:.1f}s)"
+        )
+
+        # --- Step 4: Incremental merge loop ---
+        t2 = time.time()
         for step in range(self.num_merges):
-            # Count adjacent non-special pairs
-            pair_counts = Counter()
-            for seq in sequences:
-                prev = None
-                for tok in seq:
-                    if tok in self.special_tokens:
-                        prev = None
-                        continue
-                    if prev is not None:
-                        pair_counts[(prev, tok)] += 1
-                    prev = tok
-
             if not pair_counts:
                 logging.info(f"No more pairs to merge after {step} merges")
                 break
 
-            best_pair, count = pair_counts.most_common(1)[0]
+            # Find best pair
+            best_pair = max(pair_counts, key=pair_counts.__getitem__)
+            count = pair_counts[best_pair]
+
             if count < 2:
                 logging.info(
-                    f"Stopping BPE: best pair count {count} < 2 after {step} merges"
+                    f"Stopping BPE: best pair count {count} < 2 "
+                    f"after {step} merges"
                 )
                 break
 
-            merged = f"{best_pair[0]}{self.MERGE_SEPARATOR}{best_pair[1]}"
-            self.merges.append(best_pair)
+            a, b = best_pair
+            a_str, b_str = id2token[a], id2token[b]
+            merged_str = f"{a_str}{self.MERGE_SEPARATOR}{b_str}"
+            merged_id = get_id(merged_str)
+            self.merges.append((a_str, b_str))
 
-            # Apply merge to all sequences
-            for i in range(len(sequences)):
-                sequences[i] = self._apply_single_merge(
-                    sequences[i], best_pair, merged
-                )
+            # Pop best pair from global state
+            affected = pair_to_seqs.pop(best_pair, set())
+            del pair_counts[best_pair]
 
-            if (step + 1) % 100 == 0:
+            # Incrementally update only affected sequences
+            for seq_idx in affected:
+                seq = int_seqs[seq_idx]
+
+                # Pair snapshot before merge
+                old_pc = _bpe_seq_pairs(seq, special_ids)
+
+                # Apply merge
+                new_seq = _bpe_apply_merge(seq, a, b, merged_id, special_ids)
+                int_seqs[seq_idx] = new_seq
+
+                # Pair snapshot after merge
+                new_pc = _bpe_seq_pairs(new_seq, special_ids)
+
+                # Diff → update global pair_counts and inverted index
+                all_pairs = set(old_pc)
+                all_pairs.update(new_pc)
+                for p in all_pairs:
+                    if p == best_pair:
+                        continue
+                    old_c = old_pc.get(p, 0)
+                    new_c = new_pc.get(p, 0)
+                    if old_c == new_c:
+                        continue
+
+                    new_global = pair_counts.get(p, 0) + (new_c - old_c)
+                    if new_global <= 0:
+                        pair_counts.pop(p, None)
+                    else:
+                        pair_counts[p] = new_global
+
+                    # Inverted index bookkeeping
+                    if new_c > 0 and old_c == 0:
+                        if p in pair_to_seqs:
+                            pair_to_seqs[p].add(seq_idx)
+                        else:
+                            pair_to_seqs[p] = {seq_idx}
+                    elif new_c == 0 and old_c > 0:
+                        s = pair_to_seqs.get(p)
+                        if s is not None:
+                            s.discard(seq_idx)
+                            if not s:
+                                del pair_to_seqs[p]
+
+            if (step + 1) % 50 == 0 or step == 0:
+                elapsed = time.time() - t2
                 logging.info(
-                    f"  BPE merge {step + 1}/{self.num_merges}: "
-                    f"{best_pair[0]} + {best_pair[1]} -> {merged} (count={count})"
+                    f"  BPE merge {step+1}/{self.num_merges}: "
+                    f"{a_str} + {b_str} -> {merged_str} "
+                    f"(count={count}, affected={len(affected)}, "
+                    f"elapsed={elapsed:.1f}s)"
                 )
 
-        logging.info(f"Learned {len(self.merges)} BPE merges")
+        # --- Step 5: Write back to string sequences (in-place) ---
+        for i, seq in enumerate(int_seqs):
+            sequences[i] = [id2token[tid] for tid in seq]
+
+        total = time.time() - t0
+        logging.info(f"Learned {len(self.merges)} BPE merges in {total:.1f}s")
         self._build_token_deltas()
+
+    @staticmethod
+    def _initial_count(int_seqs, special_ids):
+        """Parallel initial pair counting + inverted index construction."""
+        global _BPE_SHARED_SEQS, _BPE_SHARED_SPECIAL
+        _BPE_SHARED_SEQS = int_seqs
+        _BPE_SHARED_SPECIAL = special_ids
+
+        n_workers = min(os.cpu_count() or 1, 32)
+        chunk_size = max(1, (len(int_seqs) + n_workers - 1) // n_workers)
+        chunk_args = [
+            (i, min(i + chunk_size, len(int_seqs)))
+            for i in range(0, len(int_seqs), chunk_size)
+        ]
+
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Pool(n_workers) as pool:
+            results = pool.map(_bpe_count_chunk, chunk_args)
+
+        _BPE_SHARED_SEQS = None
+        _BPE_SHARED_SPECIAL = None
+
+        # Merge worker results
+        pair_counts: Dict[tuple, int] = {}
+        pair_to_seqs: Dict[tuple, set] = {}
+        for chunk_counts, chunk_ps in results:
+            for pair, count in chunk_counts.items():
+                pair_counts[pair] = pair_counts.get(pair, 0) + count
+            for pair, idx_list in chunk_ps.items():
+                if pair in pair_to_seqs:
+                    pair_to_seqs[pair].update(idx_list)
+                else:
+                    pair_to_seqs[pair] = set(idx_list)
+        return pair_counts, pair_to_seqs
+
+    # ------------------------------------------------------------------
+    # Applying merges (inference time)
+    # ------------------------------------------------------------------
 
     def _apply_single_merge(
         self, seq: List[str], pair: Tuple[str, str], merged: str

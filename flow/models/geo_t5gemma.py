@@ -526,15 +526,28 @@ class GeoT5GemmaDecoderLayer(T5GemmaDecoderLayer):
         hidden_states = self.pre_self_attn_layernorm(hidden_states)
   
         # Pass coordinates to self-attention if it's LARA
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
-            past_key_value=past_key_value,
-            coordinates=decoder_coordinates,  # Pass decoder coords
-            output_attentions=output_attentions,
-            **kwargs
-        )
+        if isinstance(self.self_attn, T5GemmaLARAAttention):
+            # LARA returns 3 values: (output, weights, present_key_value)
+            hidden_states, self_attn_weights, present_key_value = self.self_attn(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                coordinates=decoder_coordinates,
+                output_attentions=output_attentions,
+                **kwargs
+            )
+        else:
+            # Base T5GemmaSelfAttention returns 2 values: (output, weights)
+            hidden_states, self_attn_weights = self.self_attn(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                **kwargs
+            )
+            present_key_value = None
  
         hidden_states = self.post_self_attn_layernorm(hidden_states)
         hidden_states = residual + self.dropout(hidden_states)
@@ -1492,7 +1505,14 @@ class GeoT5GemmaForConditionalGeneration(T5GemmaForConditionalGeneration):
             # Initialize coordinate tracker for inference
             from .coordinate_tracker import InferenceCoordinateTracker
 
-            self._coordinate_tracker = InferenceCoordinateTracker(driver_pos=driver_pos)
+            # DecimalBPE: if a BPEMerger is attached to the model, pass it to
+            # the tracker so merged tokens (e.g. "R200_D300") produce the
+            # correct cumulative delta at each generation step.
+            bpe_merger = getattr(self, "_bpe_merger", None)
+            self._coordinate_tracker = InferenceCoordinateTracker(
+                driver_pos=driver_pos,
+                bpe_merger=bpe_merger,
+            )
             self._last_decoder_length = 1  # BOS token
 
             # Store tokenizer for token decoding
