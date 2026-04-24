@@ -24,8 +24,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import (
     GenerationConfig,
+    LlamaForCausalLM,
     PreTrainedTokenizerFast,
-    T5GemmaForConditionalGeneration,
 )
 
 from flow.config import FlowConfig
@@ -36,7 +36,7 @@ from flow.utils import load_corpus_dataset, setup_logging
 
 def load_components(
     config: FlowConfig,
-) -> Union[Dataset, PreTrainedTokenizerFast, T5GemmaForConditionalGeneration]:
+) -> Union[Dataset, PreTrainedTokenizerFast, LlamaForCausalLM]:
     """Load evaluation dataset, tokenizer, and model from config"""
 
     # Dataset
@@ -67,12 +67,15 @@ def load_components(
         config.tokenization.paths.tokenizer_save_dir
     )
     tokenizer = unified_tokenizer.tokenizer
+    # Decoder-only batch inference requires left-padding so generated tokens
+    # land at the right end of every sequence in the batch.
+    tokenizer.padding_side = "left"
     logging.info(
         f"Tokenizer loaded from {config.tokenization.paths.tokenizer_save_dir}"
     )
 
     try:
-        model = T5GemmaForConditionalGeneration.from_pretrained(
+        model = LlamaForCausalLM.from_pretrained(
             config.training.paths.model_save_dir
         ).eval()
         logging.info(f"Model loaded from {config.training.paths.model_save_dir}")
@@ -83,9 +86,7 @@ def load_components(
         if checkpoints:
             last_checkpoint = max(checkpoints, key=lambda x: int(x.name.split("-")[-1]))
             logging.info(f"Loading model from last checkpoint: {last_checkpoint}")
-            model = T5GemmaForConditionalGeneration.from_pretrained(
-                last_checkpoint
-            ).eval()
+            model = LlamaForCausalLM.from_pretrained(last_checkpoint).eval()
         else:
             logging.error(
                 f"Failed to load model from {config.training.paths.model_save_dir}"
@@ -125,14 +126,14 @@ def run_evaluation(config: FlowConfig):
         logging.info("✅ Components loaded successfully")
 
     def collect_fn(batch):
-        """Custom collate function to handle variable-length sequences"""
+        """Collate source tokens into left-padded batch (padding_side set on tokenizer)"""
         source_tokens = [item["source_tokens"] for item in batch]
         encs = tokenizer(
             source_tokens,
             return_tensors="pt",
             add_special_tokens=False,
             truncation=True,
-            padding="max_length",
+            padding=True,
             max_length=training_hyperparameters_config.max_src_len,
         )
         return encs
@@ -161,7 +162,6 @@ def run_evaluation(config: FlowConfig):
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,
-        decoder_start_token_id=tokenizer.bos_token_id,
     )
 
     logging.info("🎯 Generation parameters:")
@@ -191,7 +191,9 @@ def run_evaluation(config: FlowConfig):
                 generation_config=model_generation_config,
             )
 
-            preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            # Strip the input prefix: decoder-only output includes the prompt tokens
+            input_len = input_ids.shape[1]
+            preds = tokenizer.batch_decode(outputs[:, input_len:], skip_special_tokens=True)
 
             gathered_preds = accelerator.gather_for_metrics(preds)
 

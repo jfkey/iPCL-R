@@ -209,9 +209,11 @@ class TrainingModel:
     num_key_value_heads: int = 2
     head_dim: int = 64
     # suggest: num_attention_heads * head_dim = hidden_size
-    max_position_embeddings: int = 512
-    sliding_window: int = 256
-    dropout_rate: float = 0.1
+    # For decoder-only: must be >= max_src_len + max_tgt_len (concatenated sequence length)
+    max_position_embeddings: int = 1024
+    rope_theta: float = 500000.0
+    rms_norm_eps: float = 1e-5
+    attention_dropout: float = 0.0
 
 
 @dataclass

@@ -26,12 +26,11 @@ from torch.optim import AdamW
 from transformers import (
     DataCollatorForSeq2Seq,
     EarlyStoppingCallback,
+    LlamaConfig,
+    LlamaForCausalLM,
     PreTrainedTokenizerFast,
-    Seq2SeqTrainer,
-    Seq2SeqTrainingArguments,
-    T5GemmaConfig,
-    T5GemmaForConditionalGeneration,
-    T5GemmaModuleConfig,
+    Trainer,
+    TrainingArguments,
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
     set_seed,
@@ -72,7 +71,7 @@ class TrainingPipeline:
         train_dataset, eval_dataset = self._load_or_create_dataset()
 
         # Initialize model
-        self.model = self._initialize_T5Gemma_model(self.tokenizer)
+        self.model = self._initialize_llama_model(self.tokenizer)
 
         # Setup training arguments
         training_args = self._setup_training_arguments()
@@ -135,40 +134,55 @@ class TrainingPipeline:
                 f"Splitting dataset (ratio: {self.hyperparameters_config.train_split_ratio})"
             )
 
-        # Truncate dataset
+        # Build decoder-only sequences: [source | target]
+        # Loss is only computed on target tokens; source positions are masked to -100.
+        max_src = self.hyperparameters_config.max_src_len
+        max_tgt = self.hyperparameters_config.max_tgt_len
+
         def tokenize_sample(batch):
-            source_encs = self.tokenizer(
+            src_encs = self.tokenizer(
                 batch["source_tokens"],
                 truncation=True,
-                max_length=self.hyperparameters_config.max_src_len,
+                max_length=max_src,
                 add_special_tokens=False,
             )
-            labels = self.tokenizer(
-                text_target=batch["target_tokens"],
+            tgt_encs = self.tokenizer(
+                batch["target_tokens"],
                 truncation=True,
-                max_length=self.hyperparameters_config.max_tgt_len,
+                max_length=max_tgt,
                 add_special_tokens=False,
             )
 
-            # Convert pad_token to -100 for labels
-            labels["input_ids"] = [
-                (tok if tok != self.tokenizer.pad_token_id else -100)
-                for tok in labels["input_ids"]
-            ]
+            all_input_ids = []
+            all_attention_mask = []
+            all_labels = []
+            for src_ids, tgt_ids in zip(src_encs["input_ids"], tgt_encs["input_ids"]):
+                input_ids = src_ids + tgt_ids
+                attention_mask = [1] * len(input_ids)
+                # mask source positions so loss is only computed on target
+                labels = [-100] * len(src_ids) + tgt_ids
+                all_input_ids.append(input_ids)
+                all_attention_mask.append(attention_mask)
+                all_labels.append(labels)
 
-            batch["input_ids"] = source_encs["input_ids"]
-            batch["attention_mask"] = source_encs["attention_mask"]
-            batch["labels"] = labels["input_ids"]
-
+            batch["input_ids"] = all_input_ids
+            batch["attention_mask"] = all_attention_mask
+            batch["labels"] = all_labels
             return batch
 
         with PartialState().main_process_first():
+            # load_from_cache_file=False: avoid HF datasets' fingerprint-based cache.
+            # The input token_dataset may have stale cache-*.arrow files from a previous
+            # tokenize_sample (e.g. the T5-Gemma encoder-decoder version that produced
+            # input_ids=source-only, labels=target-only). Fingerprint collisions would
+            # silently replay the old format and break decoder-only shape invariants.
             tokenized_dataset = dataset.map(
                 tokenize_sample,
                 batched=True,
                 num_proc=self.performance_config.num_workers,
                 remove_columns=dataset.column_names,
                 desc="Tokenizing dataset",
+                load_from_cache_file=False,
             )
 
         # Create train/eval split
@@ -198,75 +212,47 @@ class TrainingPipeline:
 
         return train_dataset, eval_dataset
 
-    def _initialize_T5Gemma_model(
+    def _initialize_llama_model(
         self, tokenizer: PreTrainedTokenizerFast
-    ) -> T5GemmaForConditionalGeneration:
-        """Initialize model with configuration matching the original version"""
-        logging.info("Initializing model for net routing generation")
+    ) -> LlamaForCausalLM:
+        """Initialize Llama 3 decoder-only model from config"""
+        logging.info("Initializing Llama model for net routing generation")
         logging.info("vocab size: %s", len(tokenizer.get_vocab()))
 
-        encoder_config = T5GemmaModuleConfig(
-            hidden_size=self.model_config.hidden_size,
-            intermediate_size=self.model_config.intermediate_size,
-            num_hidden_layers=self.model_config.num_hidden_layers,
-            num_attention_heads=self.model_config.num_attention_heads,
-            num_key_value_heads=self.model_config.num_key_value_heads,
-            head_dim=self.model_config.head_dim,
-            max_position_embeddings=self.model_config.max_position_embeddings,
-            sliding_window=self.model_config.sliding_window,
-            tie_word_embeddings=True,
-            bos_token_id=tokenizer.bos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-            decoder_start_token_id=tokenizer.bos_token_id,
-            attn_implementation="eager",
-            use_cache=True,
+        # Concatenated [source | target] sequence must fit in position embeddings
+        max_seq_len = (
+            self.hyperparameters_config.max_src_len
+            + self.hyperparameters_config.max_tgt_len
+        )
+        assert self.model_config.max_position_embeddings >= max_seq_len, (
+            f"max_position_embeddings ({self.model_config.max_position_embeddings}) "
+            f"must be >= max_src_len + max_tgt_len ({max_seq_len}) for decoder-only"
         )
 
-        decoder_config = T5GemmaModuleConfig(
-            hidden_size=self.model_config.hidden_size,
-            intermediate_size=self.model_config.intermediate_size,
-            num_hidden_layers=self.model_config.num_hidden_layers,
-            num_attention_heads=self.model_config.num_attention_heads,
-            num_key_value_heads=self.model_config.num_key_value_heads,
-            head_dim=self.model_config.head_dim,
-            max_position_embeddings=self.model_config.max_position_embeddings,
-            sliding_window=self.model_config.sliding_window,
-            tie_word_embeddings=True,
-            bos_token_id=tokenizer.bos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-            decoder_start_token_id=tokenizer.bos_token_id,
-            attn_implementation="eager",
-            use_cache=True,
-        )
-
-        # Create model configuration matching the original version exactly
-        config = T5GemmaConfig(
-            encoder=encoder_config,
-            decoder=decoder_config,
-            hidden_size=self.model_config.hidden_size,
-            query_pre_attn_scalar=self.model_config.hidden_size,
-            is_encoder_decoder=True,
-            dropout_rate=self.model_config.dropout_rate,
-            tie_word_embeddings=True,
+        config = LlamaConfig(
             vocab_size=len(tokenizer.get_vocab()),
+            hidden_size=self.model_config.hidden_size,
+            intermediate_size=self.model_config.intermediate_size,
+            num_hidden_layers=self.model_config.num_hidden_layers,
+            num_attention_heads=self.model_config.num_attention_heads,
+            num_key_value_heads=self.model_config.num_key_value_heads,
+            head_dim=self.model_config.head_dim,
+            max_position_embeddings=self.model_config.max_position_embeddings,
+            rope_theta=self.model_config.rope_theta,
+            rms_norm_eps=self.model_config.rms_norm_eps,
+            attention_dropout=self.model_config.attention_dropout,
             bos_token_id=tokenizer.bos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
-            decoder_start_token_id=tokenizer.bos_token_id,
-            attn_implementation="eager",
+            tie_word_embeddings=True,
             use_cache=True,
         )
 
-        # Create model
-        model = T5GemmaForConditionalGeneration(config)
+        model = LlamaForCausalLM(config)
 
-        # Log model information
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         unit, scale = ("B", 1e9) if total_params >= 1e9 else ("M", 1e6)
-
         logging.info(
             f"Model Parameters | Total: {total_params / scale:.2f}{unit} | "
             f"Trainable: {trainable_params / scale:.2f}{unit}"
@@ -274,9 +260,9 @@ class TrainingPipeline:
 
         return model
 
-    def _setup_training_arguments(self) -> Seq2SeqTrainingArguments:
+    def _setup_training_arguments(self) -> TrainingArguments:
         """Setup training arguments for the model"""
-        args = Seq2SeqTrainingArguments(
+        args = TrainingArguments(
             output_dir=self.paths_config.model_save_dir,
             overwrite_output_dir=True,
             # Training hyperparameters
@@ -398,10 +384,9 @@ class TrainingPipeline:
         tokenizer: PreTrainedTokenizerFast,
         train_dataset: Dataset,
         eval_dataset: Dataset,
-        training_args: Seq2SeqTrainingArguments,
-    ) -> Seq2SeqTrainer:
-        """Initialize the Seq2Seq trainer (following original approach)"""
-        # Callbacks
+        training_args: TrainingArguments,
+    ) -> Trainer:
+        """Initialize the causal LM trainer"""
         callbacks = []
         if self.hyperparameters_config.early_stopping_patience > 0:
             callbacks.append(
@@ -410,17 +395,23 @@ class TrainingPipeline:
                 )
             )
 
-        # Initialize trainer
         optimizer, scheduler = self._get_optimizer_and_scheduler(
             model, len(train_dataset)
         )
 
-        # Initialize data collator
+        # DataCollatorForSeq2Seq preserves prefix-LM labels set by tokenize_sample:
+        # pads input_ids with pad_token_id and labels with -100 (label_pad_token_id).
+        # Using DataCollatorForLanguageModeling(mlm=False) would overwrite our labels
+        # with a clone of input_ids, destroying the source-position masking.
         data_collator = DataCollatorForSeq2Seq(
-            tokenizer, model, pad_to_multiple_of=8, padding=True
+            tokenizer,
+            model=model,
+            padding=True,
+            pad_to_multiple_of=8,
+            label_pad_token_id=-100,
         )
 
-        trainer = Seq2SeqTrainer(
+        trainer = Trainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
@@ -430,10 +421,10 @@ class TrainingPipeline:
             callbacks=callbacks,
         )
 
-        logging.info("Seq2Seq trainer initialized")
+        logging.info("Causal LM trainer initialized")
         return trainer
 
-    def _train_model(self, trainer: Seq2SeqTrainer) -> Dict[str, Any]:
+    def _train_model(self, trainer: Trainer) -> Dict[str, Any]:
         """Train the model"""
         logging.info("Starting model training")
 
