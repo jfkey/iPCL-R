@@ -67,7 +67,7 @@
             "max_grad_norm": 5.0,
             "optimizer_type": "adamw",
             "scheduler_type": "cosine",
-            "eval_strategy": "epoch",
+            "eval_strategy": "no",
             "save_strategy": "epoch",
             "early_stopping_patience": 3,
             "logging_strategy": "steps",

@@ -244,6 +244,12 @@ class TrainingPipeline:
             bos_token_id=tokenizer.bos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
+            # tie_word_embeddings=True is safe in this pipeline because we disable
+            # load_best_model_at_end (see _setup_training_arguments). The DDP-unsafe
+            # tie_weights() path is only triggered by Trainer's _load_best_model when
+            # safetensors loads with missing 'lm_head.weight'; with that disabled, no
+            # tie_weights() runs on a DDP-wrapped model, and existing checkpoints
+            # (which lack lm_head.weight) remain resume-compatible.
             tie_word_embeddings=True,
             use_cache=True,
         )
@@ -262,6 +268,16 @@ class TrainingPipeline:
 
     def _setup_training_arguments(self) -> TrainingArguments:
         """Setup training arguments for the model"""
+        # load_best_model_at_end requires in-Trainer eval. When eval_strategy="no"
+        # (e.g. when an external eval loop like run_eval_loop.sh runs evaluation),
+        # disable best-model tracking — it's redundant AND the post-training reload
+        # is the root cause of the NumelIn=1 NCCL hang: with tie_word_embeddings=True
+        # safetensors omits lm_head.weight, so _load_best_model triggers tie_weights()
+        # on the DDP-wrapped model, which desynchronizes ranks (16 ranks each mmap'ing
+        # the same 189MB safetensors + a DDP-fragile re-pointing of lm_head). With
+        # this disabled, no tie_weights runs on a DDP model and old tied-weight
+        # checkpoints remain resume-compatible.
+        eval_enabled = self.hyperparameters_config.eval_strategy != "no"
         args = TrainingArguments(
             output_dir=self.paths_config.model_save_dir,
             overwrite_output_dir=True,
@@ -275,9 +291,9 @@ class TrainingPipeline:
             # Evaluation and saving
             eval_strategy=self.hyperparameters_config.eval_strategy,
             save_strategy=self.hyperparameters_config.save_strategy,
-            load_best_model_at_end=True,
-            metric_for_best_model="eval_loss",
-            greater_is_better=False,
+            load_best_model_at_end=eval_enabled,
+            metric_for_best_model="eval_loss" if eval_enabled else None,
+            greater_is_better=False if eval_enabled else None,
             # Logging
             logging_dir=os.path.join(
                 self.paths_config.logging_dir,
@@ -295,7 +311,11 @@ class TrainingPipeline:
             seed=self.hyperparameters_config.seed,
         )
 
-        logging.info("Training arguments configured.")
+        logging.info(
+            f"Training arguments configured "
+            f"(eval_strategy={args.eval_strategy}, "
+            f"load_best_model_at_end={args.load_best_model_at_end})"
+        )
         return args
 
     def _get_optimizer_and_scheduler(
@@ -388,7 +408,12 @@ class TrainingPipeline:
     ) -> Trainer:
         """Initialize the causal LM trainer"""
         callbacks = []
-        if self.hyperparameters_config.early_stopping_patience > 0:
+        # EarlyStoppingCallback requires metric_for_best_model + load_best_model_at_end,
+        # both of which are gated on eval being enabled. Skip the callback when
+        # eval_strategy="no" (e.g. external eval loop) — early stopping is meaningless
+        # without an eval metric to track.
+        eval_enabled = self.hyperparameters_config.eval_strategy != "no"
+        if eval_enabled and self.hyperparameters_config.early_stopping_patience > 0:
             callbacks.append(
                 EarlyStoppingCallback(
                     early_stopping_patience=self.hyperparameters_config.early_stopping_patience
